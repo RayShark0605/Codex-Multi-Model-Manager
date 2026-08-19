@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Tomlyn" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Catalogs\deepseek-models.official-snapshot.json" />
+    <EmbeddedResource Include="Catalogs\deepseek-models.official-snapshot.provenance.json" />
+  </ItemGroup>
+</Project>

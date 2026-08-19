@@ -1,0 +1,7 @@
+{
+  "source": "https://cdn.deepseek.com/api-docs/codex-deepseek-setup-en.ps1",
+  "downloadedAt": "2026-08-18T16:08:00+08:00",
+  "scriptSha256": "239C5E7E4A24A5216CF03756CC66D7459C748A46D1D4BF084418D2B58EF54A36",
+  "catalogSha256": "B459A6E438D6A9939D01FD0DBB4693F165ED732BC8E4FD58D7145D9D94BD49A4",
+  "note": "Extracted from the official PowerShell script without executing it."
+}

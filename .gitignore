@@ -1,0 +1,17 @@
+.vs/
+.idea/
+.vscode/
+.dotnet-home/
+.appdata/
+.localappdata/
+.packages/
+**/bin/
+**/obj/
+artifacts/*
+!artifacts/.gitkeep
+TestResults/
+*.user
+*.suo
+*.tmp
+*.bak
+*.log
