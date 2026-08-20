@@ -12,6 +12,7 @@ namespace CodexModelManager.Core.Providers;
 public sealed class CodexInstructionHierarchyProbe : ICodexInstructionHierarchyProbe
 {
     private const int MaximumErrorBodyBytes = 64 * 1024;
+    private static readonly CodexInstructionProbeStepResult NotRun = new(false, null);
     private readonly HttpClient httpClient;
     private readonly Uri endpoint;
     private readonly Func<string?>? tokenProvider;
@@ -46,109 +47,94 @@ public sealed class CodexInstructionHierarchyProbe : ICodexInstructionHierarchyP
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(modelId);
         DateTimeOffset checkedAt = DateTimeOffset.Now;
+        CodexInstructionProbeStepResult control = NotRun;
+        CodexInstructionProbeStepResult leadingDeveloper = NotRun;
+        CodexInstructionProbeStepResult conversationControl = NotRun;
+        CodexInstructionProbeStepResult continuationDeveloper = NotRun;
+
         try
         {
-            using HttpResponseMessage control = await SendAsync(CreateProbeBody(modelId, includeDeveloper: false), cancellationToken).ConfigureAwait(false);
-            if (!control.IsSuccessStatusCode)
+            ProbeHttpResult controlHttp = await SendAsync(CreateProbeBody(modelId, ProbeShape.Control), cancellationToken).ConfigureAwait(false);
+            control = controlHttp.Step;
+            if (!control.Passed)
             {
-                string body = await ReadLimitedBodyAsync(control.Content, cancellationToken).ConfigureAwait(false);
-                string failureCode = ClassifyFailure(control.StatusCode, body, isControl: true);
-                return new CodexInstructionHierarchyProbeResult(
-                    false,
-                    false,
-                    (int)control.StatusCode,
-                    null,
-                    failureCode,
-                    DescribeFailure(failureCode, (int)control.StatusCode),
-                    checkedAt);
+                string failureCode = ClassifyFailure(controlHttp.StatusCode, controlHttp.Body, ProbeShape.Control);
+                return Result(control, leadingDeveloper, conversationControl, continuationDeveloper, failureCode, DescribeFailure(failureCode, control.HttpStatus), checkedAt);
             }
 
-            string controlBody = await ReadLimitedBodyAsync(control.Content, cancellationToken).ConfigureAwait(false);
-            if (!HasOutputArray(controlBody))
+            ProbeHttpResult leadingHttp = await SendAsync(CreateProbeBody(modelId, ProbeShape.LeadingDeveloper), cancellationToken).ConfigureAwait(false);
+            leadingDeveloper = leadingHttp.Step;
+            if (!leadingDeveloper.Passed)
             {
-                return new CodexInstructionHierarchyProbeResult(
-                    false,
-                    false,
-                    (int)control.StatusCode,
-                    null,
-                    CompatibilityFailureCodes.ResponsesControlFailed,
-                    "普通 Responses control 返回成功状态，但响应缺少有效 output 数组。",
-                    checkedAt);
+                string failureCode = ClassifyFailure(leadingHttp.StatusCode, leadingHttp.Body, ProbeShape.LeadingDeveloper);
+                return Result(control, leadingDeveloper, conversationControl, continuationDeveloper, failureCode, DescribeFailure(failureCode, leadingDeveloper.HttpStatus), checkedAt);
             }
 
-            using HttpResponseMessage hierarchy = await SendAsync(CreateProbeBody(modelId, includeDeveloper: true), cancellationToken).ConfigureAwait(false);
-            if (hierarchy.IsSuccessStatusCode)
+            ProbeHttpResult conversationHttp = await SendAsync(CreateProbeBody(modelId, ProbeShape.ConversationControl), cancellationToken).ConfigureAwait(false);
+            conversationControl = conversationHttp.Step;
+            if (!conversationControl.Passed)
             {
-                string successfulHierarchyBody = await ReadLimitedBodyAsync(hierarchy.Content, cancellationToken).ConfigureAwait(false);
-                if (!HasOutputArray(successfulHierarchyBody))
-                {
-                    return new CodexInstructionHierarchyProbeResult(
-                        true,
-                        false,
-                        (int)control.StatusCode,
-                        (int)hierarchy.StatusCode,
-                        CompatibilityFailureCodes.OtherProviderError,
-                        "Codex-shaped Responses 返回成功状态，但响应缺少有效 output 数组。",
-                        checkedAt);
-                }
-
-                return new CodexInstructionHierarchyProbeResult(
-                    true,
-                    true,
-                    (int)control.StatusCode,
-                    (int)hierarchy.StatusCode,
-                    null,
-                    "普通 Responses 与 Codex instructions/developer/user 指令层级请求均成功。",
-                    checkedAt);
+                string failureCode = ClassifyFailure(conversationHttp.StatusCode, conversationHttp.Body, ProbeShape.ConversationControl);
+                return Result(control, leadingDeveloper, conversationControl, continuationDeveloper, failureCode, DescribeFailure(failureCode, conversationControl.HttpStatus), checkedAt);
             }
 
-            string hierarchyBody = await ReadLimitedBodyAsync(hierarchy.Content, cancellationToken).ConfigureAwait(false);
-            string hierarchyFailure = ClassifyFailure(hierarchy.StatusCode, hierarchyBody, isControl: false);
-            return new CodexInstructionHierarchyProbeResult(
-                true,
-                false,
-                (int)control.StatusCode,
-                (int)hierarchy.StatusCode,
-                hierarchyFailure,
-                DescribeFailure(hierarchyFailure, (int)hierarchy.StatusCode),
+            ProbeHttpResult continuationHttp = await SendAsync(CreateProbeBody(modelId, ProbeShape.ContinuationDeveloper), cancellationToken).ConfigureAwait(false);
+            continuationDeveloper = continuationHttp.Step;
+            if (!continuationDeveloper.Passed)
+            {
+                string failureCode = ClassifyFailure(continuationHttp.StatusCode, continuationHttp.Body, ProbeShape.ContinuationDeveloper);
+                return Result(control, leadingDeveloper, conversationControl, continuationDeveloper, failureCode, DescribeFailure(failureCode, continuationDeveloper.HttpStatus), checkedAt);
+            }
+
+            return Result(
+                control,
+                leadingDeveloper,
+                conversationControl,
+                continuationDeveloper,
+                null,
+                "普通 Responses、前导 developer、多轮 conversation control 与后置 developer 请求均成功。",
                 checkedAt);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            return new CodexInstructionHierarchyProbeResult(
-                false,
-                false,
-                null,
-                null,
-                CompatibilityFailureCodes.Timeout,
-                "Codex 指令层级预检超时。",
-                checkedAt);
+            return Result(control, leadingDeveloper, conversationControl, continuationDeveloper, CompatibilityFailureCodes.Timeout, "Codex 指令层级预检超时。", checkedAt);
         }
         catch (HttpRequestException)
         {
-            return new CodexInstructionHierarchyProbeResult(
-                false,
-                false,
-                null,
-                null,
-                CompatibilityFailureCodes.OtherProviderError,
-                "无法连接 LM Studio Responses endpoint。",
-                checkedAt);
+            return Result(control, leadingDeveloper, conversationControl, continuationDeveloper, CompatibilityFailureCodes.OtherProviderError, "无法连接 LM Studio Responses endpoint。", checkedAt);
         }
     }
 
-    internal static object CreateProbeBody(string modelId, bool includeDeveloper)
+    internal static object CreateProbeBody(string modelId, ProbeShape shape)
     {
-        object[] input = includeDeveloper
-            ?
+        object[] input = shape switch
+        {
+            ProbeShape.Control =>
+            [
+                new { role = "user", content = "Reply with exactly CMM_ROLE_OK." },
+            ],
+            ProbeShape.LeadingDeveloper =>
             [
                 new { role = "developer", content = "Preserve this harmless compatibility marker: CMM_DEVELOPER_OK." },
                 new { role = "user", content = "Reply with exactly CMM_ROLE_OK." },
-            ]
-            :
+            ],
+            ProbeShape.ConversationControl =>
             [
+                new { role = "developer", content = "Preserve this harmless compatibility marker: CMM_DEVELOPER_OK." },
+                new { role = "user", content = "First harmless conversation turn." },
+                new { role = "assistant", content = "First harmless conversation turn acknowledged." },
                 new { role = "user", content = "Reply with exactly CMM_ROLE_OK." },
-            ];
+            ],
+            ProbeShape.ContinuationDeveloper =>
+            [
+                new { role = "developer", content = "Preserve this harmless compatibility marker: CMM_DEVELOPER_OK." },
+                new { role = "user", content = "First harmless conversation turn." },
+                new { role = "assistant", content = "First harmless conversation turn acknowledged." },
+                new { role = "developer", content = "Apply this harmless continuation marker: CMM_CONTINUATION_OK." },
+                new { role = "user", content = "Reply with exactly CMM_ROLE_OK." },
+            ],
+            _ => throw new ArgumentOutOfRangeException(nameof(shape)),
+        };
 
         return new
         {
@@ -160,7 +146,7 @@ public sealed class CodexInstructionHierarchyProbe : ICodexInstructionHierarchyP
         };
     }
 
-    private async Task<HttpResponseMessage> SendAsync<T>(T body, CancellationToken cancellationToken)
+    private async Task<ProbeHttpResult> SendAsync<T>(T body, CancellationToken cancellationToken)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(requestTimeout);
@@ -175,19 +161,49 @@ public sealed class CodexInstructionHierarchyProbe : ICodexInstructionHierarchyP
         }
 
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-        return await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
+        using HttpResponseMessage response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
+        string bodyText = await ReadLimitedBodyAsync(response.Content, cancellationToken).ConfigureAwait(false);
+        bool passed = response.IsSuccessStatusCode && HasOutputArray(bodyText);
+        return new ProbeHttpResult(new CodexInstructionProbeStepResult(passed, (int)response.StatusCode), response.StatusCode, bodyText);
     }
 
-    private static string ClassifyFailure(HttpStatusCode statusCode, string body, bool isControl)
+    private static CodexInstructionHierarchyProbeResult Result(
+        CodexInstructionProbeStepResult control,
+        CodexInstructionProbeStepResult leadingDeveloper,
+        CodexInstructionProbeStepResult conversationControl,
+        CodexInstructionProbeStepResult continuationDeveloper,
+        string? failureCode,
+        string detail,
+        DateTimeOffset checkedAt) => new(
+            control,
+            leadingDeveloper,
+            conversationControl,
+            continuationDeveloper,
+            failureCode,
+            detail,
+            checkedAt);
+
+    private static string ClassifyFailure(HttpStatusCode statusCode, string body, ProbeShape shape)
     {
         if (statusCode == HttpStatusCode.Unauthorized)
         {
             return CompatibilityFailureCodes.AuthenticationRequired;
         }
 
-        if (isControl)
+        if (shape == ProbeShape.Control)
         {
             return CompatibilityFailureCodes.ResponsesControlFailed;
+        }
+
+        if (shape == ProbeShape.ConversationControl)
+        {
+            return CompatibilityFailureCodes.ResponsesConversationControlFailed;
+        }
+
+        if (shape == ProbeShape.ContinuationDeveloper &&
+            body.Contains("System and developer messages must precede conversation messages.", StringComparison.OrdinalIgnoreCase))
+        {
+            return CompatibilityFailureCodes.LmStudioChatTemplateContinuationInstructionOrder;
         }
 
         if (body.Contains("System message must be at the beginning", StringComparison.OrdinalIgnoreCase))
@@ -209,17 +225,23 @@ public sealed class CodexInstructionHierarchyProbe : ICodexInstructionHierarchyP
     private static string DescribeFailure(string failureCode, int? httpStatus) => failureCode switch
     {
         CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder =>
-            "模型 Prompt Template 拒绝 Codex 的第二条 system/developer 指令；需要应用兼容模板并重载模型。",
+            "模型 Prompt Template 拒绝 Codex 的第二条前导 system/developer 指令；需要应用兼容模板并重载模型。",
         CompatibilityFailureCodes.LmStudioChatTemplateDeveloperRole =>
             "模型 Prompt Template 不支持 Codex developer 指令角色；需要应用兼容模板并重载模型。",
+        CompatibilityFailureCodes.LmStudioChatTemplateContinuationInstructionOrder =>
+            "旧版运行时 Prompt Template 拒绝多轮对话中的后置 developer 指令；需要升级为 interleaved-instructions v3。",
         CompatibilityFailureCodes.AuthenticationRequired =>
             "LM Studio 返回 HTTP 401，需要有效的 API Token。",
         CompatibilityFailureCodes.ResponsesControlFailed =>
-            $"普通 Responses control 请求失败（HTTP {httpStatus?.ToString(CultureInfo.InvariantCulture) ?? "未知"}）。",
+            $"普通 Responses control 请求失败（HTTP {FormatStatus(httpStatus)}）。",
+        CompatibilityFailureCodes.ResponsesConversationControlFailed =>
+            $"不含后置 developer 的多轮 conversation control 请求失败（HTTP {FormatStatus(httpStatus)}）；该错误不允许自动套用模板修补。",
         CompatibilityFailureCodes.Timeout =>
             "Codex 指令层级预检超时。",
-        _ => $"Codex-shaped Responses 请求失败（HTTP {httpStatus?.ToString(CultureInfo.InvariantCulture) ?? "未知"}）。",
+        _ => $"Codex-shaped Responses 请求失败（HTTP {FormatStatus(httpStatus)}）。",
     };
+
+    private static string FormatStatus(int? status) => status?.ToString(CultureInfo.InvariantCulture) ?? "未知";
 
     private static bool HasOutputArray(string body)
     {
@@ -253,4 +275,17 @@ public sealed class CodexInstructionHierarchyProbe : ICodexInstructionHierarchyP
 
         return Encoding.UTF8.GetString(buffer.GetBuffer(), 0, checked((int)buffer.Length));
     }
+
+    internal enum ProbeShape
+    {
+        Control,
+        LeadingDeveloper,
+        ConversationControl,
+        ContinuationDeveloper
+    }
+
+    private sealed record ProbeHttpResult(
+        CodexInstructionProbeStepResult Step,
+        HttpStatusCode StatusCode,
+        string Body);
 }

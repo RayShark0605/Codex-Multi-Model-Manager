@@ -1,6 +1,6 @@
 # Official Compatibility Notes
 
-核对日期：2026-08-18。优先级为官方文档/当前源码 > 官方脚本 > 官方 issue。
+核对日期：2026-08-20。优先级为官方文档/当前源码 > 官方脚本 > 官方 issue。
 
 ## Codex Provider 与认证
 
@@ -55,12 +55,18 @@
 - Codex model ID 使用 loaded instance `id`；实际 context 使用 `loaded_instances[].config.context_length`。
 - fallback API 缺失的能力保持 `Unknown`，不会从模型名字推断。
 - LM Studio 可以要求认证，localhost 也不能假设永远无 Token。
-- LM Studio 支持按模型覆盖 Prompt Template。管理器只导出精确匹配源模板的兼容版本，不写 LM Studio 内部配置；用户应用并重载后仍需用真实 Responses 差分验证。
-- 本机实物说明不能把“Qwen 模板”当成单一格式：Qwen3.6 的已审计源模板 SHA 为 `E84F32A23FDDA27689F868AA4A1A5621F41133E51A48D7F3EFCBEA2839574259`，Qwen3.8 Q6_K/Q8_0 为 `C3CF9E34ABF4F9E36C2D72165AA9C132D3E2A725B6C2586AAA3A8AF9D7A81041` 且带额外 `reasoning_instructions`。修补器按宏、tools/system 区、主循环和拒绝分支的精确结构匹配两个变体，不按 SHA 或模型名放行。
+- LM Studio 官方文档支持 list/load/unload 和 UI per-model Prompt Template。另经本机 0.4.21 实际运行包 schema 与 HTTP 行为确认，`/api/v1/models/load` 接受顶层 `{ prompt_template: { type: "jinja", template, stop_strings } }`；该字段尚未出现在公开 REST 参数页，因此管理器把它作为严格验证、失败即回滚的版本相关能力，而不是稳定官方契约。
+- 自动流程只在精确源模板与三个已知失败码匹配、用户预览确认后运行；它保存 `selected_variant` 和全部当前可观察 load config，使用响应返回的新 instance ID，重新列举并执行 Basic/Leading/Conversation/Continuation 四阶段 Responses 差分。GGUF 与 LM Studio 持久 per-model 设置均不修改；手工导出仍保留。
+- 0.4.21 的实测加载契约区分三种 ID：`/load.model` 使用 list 返回的源 `key`；`selected_variant` 只作预期量化/文件验证；`instance_id` 只用于 Responses 与 `/unload`。向 `/load` 发送 `qwen/qwen3.8-27b@q8_0` 会得到 `404 model_not_found`，而源 key 可进入加载流程，因此管理器不会再把三者互换。
+- `prompt_template` schema 能力在卸载前用随机不存在的 model key 做无副作用探测：只有对象形态通过 schema 并到达 `404/model_not_found` 才继续。HTTP 错误只保留 status 与截断脱敏后的 `error.type/code/param/message`，不保留原始响应、模板正文或 bearer token。
+- 本机实物说明不能把“Qwen 模板”当成单一格式：Qwen3.6 的已审计源模板 SHA 为 `E84F32A23FDDA27689F868AA4A1A5621F41133E51A48D7F3EFCBEA2839574259`，Qwen3.8 Q6_K/Q8_0 为 `C3CF9E34ABF4F9E36C2D72165AA9C132D3E2A725B6C2586AAA3A8AF9D7A81041` 且带额外 `reasoning_instructions`。`qwen-interleaved-instructions-v3` 按宏、tools/system 区、主循环和拒绝分支的精确结构匹配两个变体，不按 SHA 或模型名放行；旧 v2 只用于精确升级与回滚。
+- Responses 输入允许在多轮历史中出现新的 developer/system 指令。Codex 在 Plan→Default、权限或 turn-context 更新时会追加 developer；因此 `instructions + developer + user` 单轮通过并不充分。四阶段探测的步骤 3/4 仅相差最后一个 user 前的 developer，用于把普通多轮错误与 continuation 模板错误分开。
 
 依据：
 
 - [LM Studio Models API](https://lmstudio.ai/docs/developer/rest/list)
+- [LM Studio Load API](https://lmstudio.ai/docs/developer/rest/load)
+- [LM Studio Unload API](https://lmstudio.ai/docs/developer/rest/unload)
 - [LM Studio Codex integration](https://lmstudio.ai/docs/integrations/codex)
 - [OpenAI-compatible endpoints](https://lmstudio.ai/docs/developer/openai-compat)
 - [Authentication](https://lmstudio.ai/docs/developer/core/authentication)
@@ -72,7 +78,7 @@
 - 当前 Codex 对审计中的 Qwen instance 报告 metadata not found，并回退 fallback metadata。
 - 本工具没有复制/伪造 GPT 或 DeepSeek catalog entry，因此 UI 会保留 compatibility warning。
 - Custom/local Responses backend 的 MCP namespace tool schema 曾有未解决兼容性报告；“Responses + function call PASS”不能推导“MCP PASS”。
-- Codex 的独立 developer 指令也不能由“普通 Responses PASS”推导兼容。当前 Qwen template 的差分复现为 control 200、加入 developer 后 system-order 500；管理器必须将这一检查放在切换写入之前。
+- Codex 的独立或后置 developer 指令都不能由“普通 Responses PASS”推导兼容。内置模板可表现为 Basic 200/Leading 500；旧 v2 可表现为 Basic 200/Leading 200/Conversation 200/Continuation 500。管理器必须将完整四阶段检查放在切换写入之前。
 
 相关 issue：
 
@@ -86,4 +92,4 @@
 2. `preferred_auth_method` 是官方脚本遗留字段，不应机械复制到新配置。
 3. LM Studio quantization 在当前 native API 是 object，parser 不能只按 string 读取。
 4. 当前 Qwen 的 L1/L2 成功不代表完整 Codex Agent 成功；真实 Level 3 已证明其 chat template 仍不兼容 Codex 消息序列。
-5. 因此新版管理器把 `instructions + developer + user` 作为 LM Studio 切换硬门槛，并提供不修改 GGUF 的 Prompt Template override 导出工具。
+5. 因此新版管理器把四阶段差分作为 LM Studio 切换硬门槛，并同时提供不修改 GGUF 的手工 v3 导出与经确认的事务式运行时 Prompt Template 注入；两者都必须以重载后的真实差分结果为准。

@@ -116,10 +116,48 @@ public interface IPromptTemplateRepairService
 {
     PromptTemplateRepairPreview CreatePreview(GgufChatTemplateAnalysis analysis);
 
+    string RecreateKnownTemplate(
+        GgufChatTemplateAnalysis analysis,
+        string ruleVersion,
+        string expectedTemplateSha256);
+
     Task<PromptTemplateRepairArtifact> ExportAsync(
         GgufChatTemplateAnalysis analysis,
         string modelId,
         string outputRoot,
+        CancellationToken cancellationToken = default);
+}
+
+public interface ILmStudioInstanceController : IDisposable
+{
+    Task<LmStudioLoadedInstanceSnapshot> CaptureAsync(
+        string instanceId,
+        CancellationToken cancellationToken = default);
+
+    Task<LmStudioTemplateRepairResult> ApplyTemplateAsync(
+        LmStudioTemplateRepairPlan plan,
+        CancellationToken cancellationToken = default);
+
+    Task<LmStudioRollbackResult> RollbackAsync(
+        LmStudioTemplateRepairPlan plan,
+        string? patchedInstanceId,
+        CancellationToken cancellationToken = default);
+
+    Task<LmStudioRollbackResult> RecoverAsync(
+        LmStudioTemplateTransactionRecord transaction,
+        CancellationToken cancellationToken = default);
+
+    Task<LmStudioRecoveryAssessment> AssessRecoveryAsync(
+        LmStudioTemplateTransactionRecord transaction,
+        CancellationToken cancellationToken = default);
+
+    Task<LmStudioRollbackResult> RecoverAsync(
+        LmStudioTemplateTransactionRecord transaction,
+        LmStudioRecoveryAssessment assessment,
+        CancellationToken cancellationToken = default);
+
+    Task CompleteAsync(
+        Guid transactionId,
         CancellationToken cancellationToken = default);
 }
 

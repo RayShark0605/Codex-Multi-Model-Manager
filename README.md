@@ -12,8 +12,8 @@
 - 配置安全：TOML 精确文本补丁、语法/语义校验、预览指纹、命名同步锁、同目录临时文件、flush、原子替换、重读校验和自动回滚。
 - 可逆备份：不可覆盖的 Initial Snapshot、显式修改外部 override 文件前的 supplemental baseline、每次切换/恢复前的 History、SHA-256 manifest。
 - 凭据：新 Token 默认进入 Windows Credential Manager；Codex 通过 command-backed auth Helper 从 stdout 获取，不进入 TOML、日志或 manifest。
-- 本地兼容性硬门槛：切换 LM Studio 前实时执行 `instructions + user` 与 `instructions + developer + user` 差分请求；不兼容时在备份和写盘前阻止切换。
-- Prompt Template 修复：只读解析所选 GGUF 的 `tokenizer.chat_template`，仅对精确匹配的 Qwen system-order 结构导出最小修补；不修改 GGUF 或 LM Studio 内部配置。
+- 本地兼容性硬门槛：切换 LM Studio 前实时执行 Basic、Leading Developer、Conversation Control、Continuation Developer 四阶段差分请求；四项未全部返回 HTTP 200 且含 `output` 数组时，在备份和写盘前阻止切换。
+- Prompt Template 修复：只读解析精确 loaded variant 的 GGUF，仅对结构精确匹配的 Qwen 指令层级失败提供可预览的 `qwen-interleaved-instructions-v3` 运行时 Jinja 修补；确认后通过原生 API 事务式 unload/load、复核全部可观察加载参数并重新探测，不修改 GGUF。已验证的旧 v2 运行时实例可安全升级，失败时确定性恢复 v2；手工导出仍作为回退路径。
 - 测试：Codex-shaped Level 1/2 Responses/SSE/function calling；用户主动触发的 Level 3 真实 Codex CLI 临时工作区测试。
 
 ## 快速使用
@@ -26,8 +26,8 @@
 3. 首次启动会只创建一次 **Initial Snapshot**。
 4. 若使用 DeepSeek，先在“设置与日志”页将 Token 保存到 Windows Credential Manager。LM Studio 返回 401 时同样保存 LM Token。
 5. 选择 Provider 与 Model；LM Studio 页确认 `Loaded Context` 与 `Codex Configured Context` 一致。
-6. 对 LM Studio 点击 **重新检测 Codex 指令层级**。只有普通 control 与 Codex-shaped 请求都 PASS 才能切换。
-7. 若显示 **Template Fix Required**，选择当前 loaded instance 对应的 GGUF，点击 **分析 Prompt Template** 与 **导出兼容模板**，按生成的 `APPLY.md` 在 LM Studio 中手动应用、手动重载，再重新检测。
+6. 对 LM Studio 点击 **重新检测 Codex 指令层级**。只有 Basic、Leading、Conversation、Continuation 四项都 PASS 才能切换。
+7. 若显示 **Template Fix Required** 或 **Template Upgrade Required (v2 → v3)**，可先点击 **Preview Changes** 查看当前运行时来源、原始/v2/v3 哈希、目标模板和完整加载配置而不改动任何运行状态；点击 **Switch Model** 后再明确确认“应用兼容模板并继续”。若自动 GGUF 定位、v2 provenance 或当前 LM Studio 版本不满足门槛，仍可使用 **分析/导出兼容模板** 的手工回退流程。
 8. 点击 **Preview Changes**，检查 semantic diff、Secondary Overrides 和警告。Secondary 列表默认全部不勾选；只有明确勾选的项才会在 `FollowMain`/`RestoreOriginal` 策略下修改。
 9. 点击 **Switch Model** 并确认。提交前会再次实时验证指令层级；完成后重新启动 Codex Desktop。
 
@@ -58,7 +58,7 @@ Codex 可能在运行期间缓存配置、更新模型 cache 或自行写回 `co
 - 默认 1234、无认证、无 `CODEX_OSS_*` 重定向时使用 Codex 内置 `lmstudio`，绝不创建 `[model_providers.lmstudio]`。
 - 非默认端口或启用认证时使用不冲突的 `lmstudio_local_cmm` custom provider。
 - 非 loopback endpoint 必须是 HTTPS；401 会提示 Token，Token 输入框使用系统密码字符。
-- 首版只发现 loaded/unloaded 状态，不会自动 load/unload，不会改变 GPU offload、KV cache、context 或量化参数。
+- 常规发现、刷新、兼容性测试与 Preview 不改变模型生命周期。只有三个已识别的模板失败码（含 v2 后置 developer 顺序错误）、精确 GGUF/变体解析成功且用户确认后，Switch 流程才调用原生 `/api/v1/models/unload` 与 `/load`；请求保留 native API 捕获的 context、batch、parallel、flash attention、KV cache、speculative decoding 等可观察参数，并在不一致时回滚。
 - LM Studio 仅报告 reasoning `on/off` 时，不会把它猜成 Codex 的 `low/medium/high`；此时本地配置明确删除 `model_reasoning_effort`。只有 Provider 返回值与 Codex 支持 effort 的精确交集才允许写入。
 
 ### Codex Instruction Hierarchy 与 Qwen Prompt Template
@@ -69,16 +69,18 @@ Codex 可能在运行期间缓存配置、更新模型 cache 或自行写回 `co
 System message must be at the beginning.
 ```
 
-这类模板会让“普通请求 PASS、Codex 第一句话立即 500”。管理器因此执行两次只改变 developer 消息的差分预检：
+这类模板会让“普通请求 PASS、Codex 第一句话立即 500”。旧 `qwen-leading-instructions-v2` 又只兼容连续前导指令：Plan Mode 能生成计划，但 Codex 在用户批准后追加 Default collaboration-mode `developer` 时会触发 `System and developer messages must precede conversation messages.`。管理器因此执行四阶段差分预检：
 
 ```text
-Control:       instructions + user
-Codex-shaped:  instructions + developer + user
+Basic:         instructions + user
+Leading:       instructions + developer + user
+Conversation:  instructions + developer + user + assistant + user
+Continuation:  与 Conversation 相同，仅在最后一个 user 前增加 developer
 ```
 
-任一正式 LM Studio Preview 与 Commit 都必须实时通过第二种结构；每次还会先从 native Models API 重新确认同一 loaded instance 与相同实际 context。instance 缺失/context 改变时不会发送可能触发后端自动加载的推理请求。成功结果不会被长期缓存，也没有绕过按钮；所有失败都发生在 History backup 和 `config.toml` 写入之前（Initial Snapshot 仍只按首次启动规则管理）。
+任一正式 LM Studio Preview 与 Commit 都必须实时通过四种结构；步骤 3/4 只改变后置 developer，因此普通多轮失败不会被误归类成模板升级问题。每次还会先从 native Models API 重新确认同一 loaded instance 与相同实际 context。instance 缺失/context 改变时不会发送可能触发后端自动加载的推理请求。成功结果不会被长期缓存，也没有绕过按钮；所有失败都发生在 History backup 和 `config.toml` 写入之前（Initial Snapshot 仍只按首次启动规则管理）。
 
-如果错误被分类为 `lmstudio-chat-template-system-order` 或 `lmstudio-chat-template-developer-role`，LM Studio 页可只读分析对应 GGUF。修补器不会套用通用 Qwen/GPT 模板，而是要求宏、system/tool 初始区、主 message 循环和拒绝分支全部精确匹配。生成模板只把开头连续的 system/developer 指令按原顺序合并为一个初始 system block；后置 system/developer 仍被拒绝，assistant/tool/thinking/vision 文本保持不变。
+如果错误被分类为 `lmstudio-chat-template-system-order`、`lmstudio-chat-template-developer-role` 或 `lmstudio-chat-template-continuation-instruction-order`，LM Studio 页可只读分析对应 GGUF。修补器不会套用通用 Qwen/GPT 模板，而是要求宏、system/tool 初始区、主 message 循环和拒绝分支全部精确匹配。v3 遍历完整 `messages`，按原始相对顺序收集任意位置的 system/developer，使用双换行合并为唯一初始 system block；`reasoning_instructions` 仍在前，tools 说明仍先输出，主 conversation 循环消费这些已合并项，user/assistant/tool/reasoning/vision/function call/output 的原有顺序与分支保持。
 
 导出目录：
 
@@ -90,7 +92,11 @@ Codex-shaped:  instructions + developer + user
   APPLY.md
 ```
 
-用户必须在 LM Studio 的 **My Models → 模型设置 → Prompt Template** 中手动启用 override、粘贴完整兼容模板并保存，然后手动卸载/重载模型。只有重载后的真实差分检测才算 PASS。撤销时删除/禁用该 per-model override 并再次重载；原始 GGUF 从未被修改。官方入口参见 [LM Studio Prompt Template](https://www.lmstudio.ai/docs/app/advanced/prompt-template) 与 [Per-model Defaults](https://lmstudio.ai/docs/app/advanced/per-model)。
+自动路径把 `prompt_template` 作为顶层对象随 `/api/v1/models/load` 注入，只作用于新加载实例。它在 LM Studio 0.4.21 本机运行包 schema 中已经验证，但截至本文更新时尚未列入公开 REST 参数文档，因此每次都以 load 响应、重新列举的实例配置和最终四阶段探测为准。字段被拒绝或行为无法证明时：原先为内置模板的事务恢复不带 `prompt_template` 的实例；原先为已证明 v2 的事务则从未变化的 GGUF 确定性重建相同 SHA 的 v2 并恢复，绝不错误退回内置模板。官方已文档化的模型管理端点参见 [List](https://lmstudio.ai/docs/developer/rest/list)、[Load](https://lmstudio.ai/docs/developer/rest/load) 与 [Unload](https://lmstudio.ai/docs/developer/rest/unload)，模板语法参见 [Prompt Template](https://lmstudio.ai/docs/app/advanced/prompt-template)。手工回退仍可在 **My Models → 模型设置 → Prompt Template** 中应用导出的模板。无论哪条路径，只有重载后的实时差分检测才算 PASS，原始 GGUF 从未被修改。
+
+`/load` 的 `model` 始终使用 native list 返回的源模型 `key`（例如 `qwen/qwen3.8-27b`）；`selected_variant`（例如 `...@q8_0`）只用于精确 GGUF 定位、并发指纹和加载后量化校验。旧实现曾把 variant 字符串当成 load ID，LM Studio 0.4.21 会返回 `404 model_not_found`；新版禁止混用 source key、selected variant 与 instance ID，也不预测 `:2` 之类的新实例后缀。
+
+运行时修复在 `%LOCALAPPDATA%\CodexModelManager\transactions` 中先写不含模板正文和 Token 的 schema-v3 恢复记录，保存最后稳定阶段、失败阶段、脱敏 API 错误、load 前后候选 ID、原运行时模板来源/规则/SHA/evidence transaction、目标规则和原四阶段摘要。load、配置对比、层级探测、最终 Codex 配置确认或 Commit 任一步失败/取消，都会卸载可唯一归因的补丁实例并恢复事务记录证明的原运行时模板。schema-v1/v2 继续只读兼容。程序异常退出后不会静默重载；下次启动会先只读评估，并在 LM Studio 页启用 **检查/恢复未完成事务**。如果唯一当前实例已经与原始快照和原四阶段签名完全一致，确认后只关闭 journal，不做昂贵的重复 unload/load；状态仍有歧义时继续阻断而不猜测。
 
 ## Local Context、Max Context 与 Auto Compact
 
@@ -109,9 +115,9 @@ min(floor(loadedContext * 0.90), loadedContext - 8192)
 
 它是**管理器安全建议值**，不是 Codex 官方百分比标准。每个 local model 的 loaded context 与 compact 偏好保存在管理器自己的 `appsettings.json`；如果实际 loaded context 改变，旧偏好不会被盲目套用。
 
-最终只读审计时，`/api/v1/models` 返回 16 个模型但没有任何 `loaded_instances`；与此同时 `lms ps` 显示 `qwen/qwen3.8-27b@q6_k` 为 `IDLE`、context `131072`。这两个表面互相矛盾的状态不会被管理器合并或猜测：安全切换只信任 native API 的 `loaded_instances[].config.context_length`，所以当前会阻止 LM Studio Preview/Switch，并要求用户在 LM Studio 中确认模型已为 Server 实例实际加载后重新刷新。`lms ps` 的 context、模型理论 Max 或旧缓存都不会被写进 Codex。
+2026-08-20 本轮只读审计执行时，native `/api/v1/models` 报告 `qwen/qwen3.8-27b@q6_k` 已加载，实际 `context_length=70144`；此前同日也观察过 Q8_0/32768，因此任一数值都不作为常量。管理器在预览、卸载前、补丁加载后和 Codex Commit 前重新读取 native 状态，始终使用当时真实的 `loaded_instances[].config.context_length`，不会把 `lms ps`、模型理论 Max、截图或缓存猜作 loaded context。
 
-本机只读 GGUF 检查还确认了两个不同的源模板结构：Qwen3.6 的模板 SHA-256 为 `E84F32A23FDDA27689F868AA4A1A5621F41133E51A48D7F3EFCBEA2839574259`，两个已检查的 Qwen3.8-27B Q6_K/Q8_0 文件共享 `C3CF9E34ABF4F9E36C2D72165AA9C132D3E2A725B6C2586AAA3A8AF9D7A81041`。后者额外保留 `reasoning_instructions`。修补规则 `qwen-leading-instructions-v2` 不是按模型名或 SHA 白名单放行，而是分别要求两个已支持结构中的每个锚点精确且唯一匹配；未知第三种结构仍会显示 `Unsupported Template`。
+本机只读 GGUF 检查还确认了两个不同的源模板结构：Qwen3.6 的模板 SHA-256 为 `E84F32A23FDDA27689F868AA4A1A5621F41133E51A48D7F3EFCBEA2839574259`，对应 v3 为 `235C3E8D316D80E23827174F1A8CEF37B1E5018CF70ED8F52F2C6FB9C0E233CD`；两个已检查的 Qwen3.8-27B Q6_K/Q8_0 文件共享源 SHA `C3CF9E34ABF4F9E36C2D72165AA9C132D3E2A725B6C2586AAA3A8AF9D7A81041`，对应 v3 为 `4AA5CC42C084FCC8235AAF0500835F4F9419A72280EA7E02D08EEE9A97807D8B`。后者额外保留 `reasoning_instructions`。v3 在主 conversation 循环中对已经合并的 system/developer 连 `render_content` 都不再调用，避免 vision 计数等隐藏副作用。`qwen-interleaved-instructions-v3` 不是按模型名或 SHA 白名单放行，而是分别要求两个已支持结构中的每个锚点精确且唯一匹配；未知第三种结构或未知管理器 Marker 仍显示 `Unsupported Template`。旧 v2 只用于精确识别、升级和事务回滚。
 
 ## 管理器会修改什么
 
@@ -142,7 +148,7 @@ min(floor(loadedContext * 0.90), loadedContext - 8192)
 - `auth.json`、ChatGPT 登录态、Cookie、OpenAI Credential、Windows 系统级环境变量。
 - Thread、Project、Goal、session、history、memory 等 `.codex` 数据库或目录。
 - 用户 MCP、Project Trust、sandbox、approval、permissions、hooks、plugins、skills、notifications、Computer Use 等无关配置。
-- LM Studio 模型生命周期与 GPU/KV/context 设置。
+- 未经专用模板预览与明确确认的 LM Studio 模型生命周期，以及任何主动改变 GPU/KV/context/量化的操作；受支持修复事务只按原配置重载同一源模型。
 - DeepSeek 官方 `backup-deepseek`。
 - 整个 `.codex` 目录；恢复只处理快照 manifest 明确登记的 `config.toml`、`models.json` 以及用户曾明确选择由管理器修改的外部 TOML override 文件，绝不回滚 Thread/Project/session 数据。
 
@@ -195,9 +201,9 @@ Local 主模型不代表这些覆盖一定跟随 Local。默认策略是 **Prese
 
 Project/Thread 多数属于 Codex App 层，切换器不会清理它们。Plan/Goal/MCP/Skills 还依赖模型 metadata、工具调用格式与后端实现；管理器不会为了让警告消失而复制 GPT/DeepSeek metadata 给 Qwen。
 
-Level 1/2 先执行普通 control 与 Codex-shaped 指令层级差分；只有层级 PASS 才继续测试带相同 instructions/developer/user 结构的 SSE streaming、reasoning artifact 和严格 dummy function call。Level 3 在 `%TEMP%\CodexModelManager\smoke\<guid>` 中创建临时 `CODEX_HOME` 和 workspace，使用 `workspace-write`、`approval_policy=never`，测试读取、PowerShell shell、结构化 `apply_patch/file_change` 事件与临时 `cmm_ping` MCP；不复制 `auth.json`，不使用危险 bypass。
+Level 1/2 先执行四阶段指令层级差分；只有四项 PASS 才继续测试 SSE streaming、reasoning artifact 和严格 dummy function call。Level 3 在 `%TEMP%\CodexModelManager\smoke\<guid>` 中创建临时 `CODEX_HOME` 和 workspace，使用 `workspace-write`、`approval_policy=never`，测试读取、PowerShell shell、结构化 `apply_patch/file_change` 事件与临时 `cmm_ping` MCP；不复制 `auth.json`，不使用危险 bypass。
 
-截至 2026-08-18，失败会话和独立差分请求均证明当前测试过的 Qwen 模板是“普通 control 通过，但加入 developer 后触发 system-order 500”。管理器现在会在真实配置写入前准确分类并阻止，不再把简单 Responses PASS 误报成 Codex Agent 可用。模板修补后的状态必须由用户应用、重载并重新实测，不能仅凭成功导出升级为 Supported。详见 [`docs/KNOWN-LIMITATIONS.md`](docs/KNOWN-LIMITATIONS.md)。
+截至 2026-08-20，本次失败会话和实时差分证明当前已加载旧 v2 实例为 `Basic=200 / Leading=200 / Conversation=200 / Continuation=500`；最后一步精确返回 `System and developer messages must precede conversation messages.`。管理器现在将其显示为 **Template Upgrade Required (v2 → v3)**，只有 completed v2 journal、当前实例/config、GGUF 指纹和确定性 v2 SHA 全部吻合才允许升级；四阶段全 200 前不会生成可提交的 Codex 配置计划。成功生成模板或 load 返回 200 本身都不会升级为 Supported。详见 [`docs/KNOWN-LIMITATIONS.md`](docs/KNOWN-LIMITATIONS.md)。
 
 ## 凭据、日志与目录
 
@@ -211,6 +217,7 @@ bin\mcp\              临时 MCP test helper
 logs\                  脱敏日志
 temp\                  管理器临时文件
 template-fixes\        原模板、兼容模板、哈希 manifest 与手动应用说明
+transactions\          不含模板正文/Token 的 LM Studio 恢复事务记录
 ```
 
 Windows Credential Manager target：
@@ -225,7 +232,7 @@ Windows Credential Manager target：
 1. 完全关闭 Codex。
 2. 在“备份历史”页选择 **恢复 Initial Snapshot**；确认后当前状态会先进入 History，主 `config.toml`/`models.json` 与所有曾由管理器明确修改过的 supplemental TOML 会一起恢复到各自首次触及时的状态。
 3. 重新启动 Codex，确认模型、MCP 与 Project/Trust 均正常。
-4. 如果曾在 LM Studio 手动应用兼容 Prompt Template，还应在对应模型设置中禁用/删除 per-model override 并手动重载；Codex Initial Snapshot 不管理 LM Studio 的独立设置。
+4. 如果当前保留的是自动运行时补丁实例，先在 LM Studio 中卸载它并按原参数不带模板重新加载；若应用存在未完成事务，下次启动可使用恢复对话框。若曾手工应用 per-model override，则在模型设置中禁用/删除并手动重载。Codex Initial Snapshot 不管理 LM Studio 的独立运行状态。
 5. 如要卸载应用，可删除 `%LOCALAPPDATA%\CodexModelManager`，并在 Windows“凭据管理器”中删除上述两个 `CodexModelManager/*` Generic Credential。
 6. 建议先保留 `~\.codex\model-switcher-backup` 一段时间；确认无误后再由用户自行归档。不要删除或改动 `backup-deepseek`。
 
@@ -276,6 +283,8 @@ artifacts/                             构建/发布输出（默认不入库）
 - [DeepSeek official Windows setup script](https://cdn.deepseek.com/api-docs/codex-deepseek-setup-en.ps1)
 - [LM Studio Codex integration](https://lmstudio.ai/docs/integrations/codex)
 - [LM Studio `/api/v1/models`](https://lmstudio.ai/docs/developer/rest/list)
+- [LM Studio `/api/v1/models/load`](https://lmstudio.ai/docs/developer/rest/load)
+- [LM Studio `/api/v1/models/unload`](https://lmstudio.ai/docs/developer/rest/unload)
 - [LM Studio OpenAI-compatible endpoints](https://lmstudio.ai/docs/developer/openai-compat)
 - [LM Studio Authentication](https://lmstudio.ai/docs/developer/core/authentication)
 

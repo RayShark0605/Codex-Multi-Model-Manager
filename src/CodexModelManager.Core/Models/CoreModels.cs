@@ -22,20 +22,66 @@ public enum CompatibilityStatus
 public enum PromptTemplateRepairStatus
 {
     Supported,
+    UpgradeRequired,
     AlreadyCompatible,
     Unsupported
+}
+
+public enum LmStudioRuntimeTemplateMode
+{
+    BuiltIn,
+    ManagerRule
+}
+
+public enum LmStudioTemplateTransactionState
+{
+    Prepared,
+    OriginalUnloaded,
+    PatchedLoaded,
+    PatchedAndVerified,
+    RolledBack,
+    RollbackFailed,
+    Completed
+}
+
+public enum LmStudioLifecycleStage
+{
+    None,
+    ApplyPreflight,
+    UnloadOriginal,
+    LoadPatched,
+    ValidatePatched,
+    ProbePatched,
+    UnloadPatched,
+    LoadOriginal,
+    ValidateOriginal,
+    ProbeOriginal,
+    RecoveryAssessment,
+    RecoveryCommit
+}
+
+public enum LmStudioRecoveryDisposition
+{
+    AlreadyRestored,
+    LoadOriginal,
+    UnloadKnownPatchAndLoadOriginal,
+    BlockedAmbiguous
 }
 
 public static class CompatibilityFailureCodes
 {
     public const string LmStudioChatTemplateSystemOrder = "lmstudio-chat-template-system-order";
     public const string LmStudioChatTemplateDeveloperRole = "lmstudio-chat-template-developer-role";
+    public const string LmStudioChatTemplateContinuationInstructionOrder = "lmstudio-chat-template-continuation-instruction-order";
     public const string ResponsesControlFailed = "responses-control-failed";
+    public const string ResponsesConversationControlFailed = "responses-conversation-control-failed";
     public const string AuthenticationRequired = "authentication-required";
     public const string Timeout = "timeout";
     public const string OtherProviderError = "other-provider-error";
     public const string LmStudioLoadedInstanceMissing = "lmstudio-loaded-instance-missing";
     public const string LmStudioLoadedContextChanged = "lmstudio-loaded-context-changed";
+    public const string LmStudioLoadedInstanceChanged = "lmstudio-loaded-instance-changed";
+    public const string LmStudioLifecycleFailed = "lmstudio-lifecycle-failed";
 }
 
 public enum ConfigMutationKind
@@ -105,6 +151,71 @@ public sealed record ContextConfiguration(
     int? AutoCompactTokenLimit,
     bool IsSuggested);
 
+public sealed record LmStudioLoadConfiguration(
+    int? ContextLength = null,
+    int? EvalBatchSize = null,
+    int? PhysicalBatchSize = null,
+    int? Parallel = null,
+    bool? FlashAttention = null,
+    int? ContextCheckpoints = null,
+    string? ReasoningBudgetMessage = null,
+    bool? SpeculativeDraftMtp = null,
+    bool? SpeculativeDraftSimple = null,
+    string? SpeculativeDraftModel = null,
+    int? SpeculativeDraftMaxTokens = null,
+    int? SpeculativeDraftMinTokens = null,
+    double? SpeculativeDraftMinContinueProbability = null,
+    bool? OffloadKvCacheToGpu = null,
+    int? NumExperts = null);
+
+public sealed record LmStudioPromptTemplateConfiguration(
+    string Type,
+    string Template,
+    IReadOnlyList<string> StopStrings);
+
+public sealed record LmStudioLoadedInstanceSnapshot(
+    Uri Endpoint,
+    string SourceModelKey,
+    string InstanceId,
+    string? SelectedVariant,
+    string? Architecture,
+    string? Quantization,
+    string? Parameters,
+    string? ModelType,
+    int? MaxContextLength,
+    LmStudioLoadConfiguration LoadConfiguration,
+    int? RemainingTtlSeconds,
+    bool RequiresAuthentication,
+    DateTimeOffset CapturedAt,
+    string Fingerprint,
+    LmStudioLoadTarget? LoadTarget = null);
+
+public sealed record LmStudioLoadTarget(
+    string ModelKey,
+    string? SelectedVariant,
+    IReadOnlyList<string> AvailableVariants,
+    string? Architecture,
+    string? Quantization,
+    string? Parameters,
+    string? Format,
+    int? MaxContextLength,
+    string Fingerprint);
+
+public sealed record LmStudioApiFailure(
+    int HttpStatus,
+    string? ErrorType,
+    string? ErrorCode,
+    string? Parameter,
+    string Message);
+
+public sealed record LmStudioModelFileResolution(
+    string FilePath,
+    string SourceModelKey,
+    string? SelectedVariant,
+    string? Architecture,
+    string? Quantization,
+    string Source);
+
 public sealed record ModelProfile(
     string Id,
     string DisplayName,
@@ -127,7 +238,12 @@ public sealed record ModelProfile(
     string? Architecture = null,
     string? DefaultReasoningEffort = null,
     string? ModelType = null,
-    string? SourceModelKey = null)
+    string? SourceModelKey = null,
+    string? SelectedVariant = null,
+    LmStudioLoadConfiguration? LoadedConfiguration = null,
+    int? RemainingTtlSeconds = null,
+    IReadOnlyList<string>? AvailableVariants = null,
+    string? Format = null)
 {
     [JsonIgnore]
     public string SelectionLabel
@@ -159,15 +275,27 @@ public sealed record CompatibilityResult(
     DateTimeOffset CheckedAt,
     string? FailureCode = null);
 
+public sealed record CodexInstructionProbeStepResult(
+    bool Passed,
+    int? HttpStatus);
+
 public sealed record CodexInstructionHierarchyProbeResult(
-    bool ControlPassed,
-    bool HierarchyPassed,
-    int? ControlHttpStatus,
-    int? HierarchyHttpStatus,
+    CodexInstructionProbeStepResult Control,
+    CodexInstructionProbeStepResult LeadingDeveloper,
+    CodexInstructionProbeStepResult ConversationControl,
+    CodexInstructionProbeStepResult ContinuationDeveloper,
     string? FailureCode,
     string Detail,
     DateTimeOffset CheckedAt)
 {
+    public bool ControlPassed => Control.Passed;
+
+    public bool HierarchyPassed => LeadingDeveloper.Passed && ConversationControl.Passed && ContinuationDeveloper.Passed;
+
+    public int? ControlHttpStatus => Control.HttpStatus;
+
+    public int? HierarchyHttpStatus => ContinuationDeveloper.HttpStatus ?? ConversationControl.HttpStatus ?? LeadingDeveloper.HttpStatus;
+
     public bool IsCompatible => ControlPassed && HierarchyPassed;
 }
 
@@ -287,6 +415,86 @@ public sealed record PromptTemplateRepairArtifact(
     string ApplyInstructionsPath,
     string OriginalTemplateSha256,
     string PatchedTemplateSha256);
+
+public sealed record LmStudioTemplateRepairPlan(
+    Guid TransactionId,
+    DateTimeOffset CreatedAt,
+    string FailureCode,
+    LmStudioLoadedInstanceSnapshot OriginalInstance,
+    LmStudioModelFileResolution ModelFile,
+    GgufChatTemplateAnalysis GgufAnalysis,
+    PromptTemplateRepairPreview TemplatePreview,
+    LmStudioRuntimeTemplateProvenance OriginalRuntimeTemplate,
+    CodexInstructionHierarchyProbeResult OriginalHierarchyProbe,
+    string? OriginalRuntimeTemplateText = null);
+
+public sealed record LmStudioRuntimeTemplateProvenance(
+    LmStudioRuntimeTemplateMode Mode,
+    string? RuleVersion = null,
+    string? TemplateSha256 = null,
+    Guid? EvidenceTransactionId = null);
+
+public sealed record LmStudioTemplateRepairResult(
+    LmStudioTemplateRepairPlan Plan,
+    LmStudioLoadedInstanceSnapshot PatchedInstance,
+    CodexInstructionHierarchyProbeResult HierarchyProbe,
+    string TransactionPath);
+
+public sealed record LmStudioRollbackResult(
+    bool Succeeded,
+    string Detail,
+    LmStudioLoadedInstanceSnapshot? RestoredInstance,
+    string TransactionPath);
+
+public sealed record LmStudioRecoveryCandidate(
+    LmStudioLoadedInstanceSnapshot Snapshot,
+    bool MatchesOriginalSnapshot,
+    CodexInstructionHierarchyProbeResult? HierarchyProbe,
+    bool ReproducesOriginalFailure);
+
+public sealed record LmStudioRecoveryAssessment(
+    Guid TransactionId,
+    LmStudioRecoveryDisposition Disposition,
+    IReadOnlyList<LmStudioRecoveryCandidate> Candidates,
+    string? InstanceToUnload,
+    bool RequiresLifecycleMutation,
+    bool IsLegacyJournal,
+    string StateFingerprint,
+    string Detail);
+
+public sealed record LmStudioTemplateTransactionRecord(
+    int SchemaVersion,
+    Guid TransactionId,
+    LmStudioTemplateTransactionState State,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset UpdatedAt,
+    LmStudioLoadedInstanceSnapshot OriginalInstance,
+    string FailureCode,
+    string GgufFilePath,
+    string GgufFileName,
+    long GgufLength,
+    DateTimeOffset GgufLastWriteTimeUtc,
+    uint GgufVersion,
+    string OriginalTemplateSha256,
+    string PatchedTemplateSha256,
+    string RuleVersion,
+    string? PatchedInstanceId,
+    string? Detail,
+    string? LoadModelKey = null,
+    LmStudioTemplateTransactionState? LastStableState = null,
+    LmStudioLifecycleStage FailureStage = LmStudioLifecycleStage.None,
+    LmStudioApiFailure? LastApiFailure = null,
+    IReadOnlyList<string>? SameSourceInstanceIdsBeforeLoad = null,
+    IReadOnlyList<string>? SameSourceInstanceIdsAfterLoad = null,
+    string? CandidateInstanceId = null,
+    int RecoveryAttemptCount = 0,
+    LmStudioLifecycleStage LastRecoveryFailureStage = LmStudioLifecycleStage.None,
+    LmStudioRuntimeTemplateMode OriginalRuntimeTemplateMode = LmStudioRuntimeTemplateMode.BuiltIn,
+    string? OriginalRuntimeRuleVersion = null,
+    string? OriginalRuntimeTemplateSha256 = null,
+    Guid? OriginalRuntimeEvidenceTransactionId = null,
+    string? TargetRuntimeRuleVersion = null,
+    CodexInstructionHierarchyProbeResult? OriginalHierarchyProbe = null);
 
 public sealed record ProviderState(
     ProviderKind Provider,

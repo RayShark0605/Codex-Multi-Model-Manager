@@ -95,10 +95,10 @@ public sealed class LmStudioSwitchPreflight(
     }
 
     private static CodexInstructionHierarchyProbeResult Failure(string code, string detail, DateTimeOffset checkedAt) => new(
-        false,
-        false,
-        null,
-        null,
+        new CodexInstructionProbeStepResult(false, null),
+        new CodexInstructionProbeStepResult(false, null),
+        new CodexInstructionProbeStepResult(false, null),
+        new CodexInstructionProbeStepResult(false, null),
         code,
         detail,
         checkedAt);

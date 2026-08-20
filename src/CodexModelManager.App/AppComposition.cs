@@ -32,6 +32,7 @@ internal sealed class AppComposition : IDisposable
         LmStudioPreflight = new LmStudioSwitchPreflight(providerHttpClient, ReadLmStudioSecretSafely);
         GgufReader = new GgufChatTemplateReader();
         TemplateRepair = new PromptTemplateRepairService(GgufReader);
+        TemplateTransactions = new LmStudioTemplateTransactionStore(Paths);
         Switches = new ConfigurationSwitchService(HomeProvider, PatchEngine, AtomicWriter, Backups, OverrideScanner, RuntimeProbe, SettingsRepository, SecretStore, LmStudioPreflight);
     }
 
@@ -49,7 +50,19 @@ internal sealed class AppComposition : IDisposable
     public LmStudioSwitchPreflight LmStudioPreflight { get; }
     public GgufChatTemplateReader GgufReader { get; }
     public PromptTemplateRepairService TemplateRepair { get; }
+    public LmStudioTemplateTransactionStore TemplateTransactions { get; }
     public ConfigurationSwitchService Switches { get; }
+
+    public LmStudioInstanceController CreateLmStudioInstanceController(Uri endpoint, bool requiresAuthentication) => new(
+        endpoint,
+        requiresAuthentication,
+        providerHttpClient,
+        requiresAuthentication ? ReadLmStudioSecretSafely : null,
+        RuntimeProbe,
+        GgufReader,
+        TemplateRepair,
+        TemplateTransactions,
+        logger);
 
     public MainForm CreateMainForm()
     {

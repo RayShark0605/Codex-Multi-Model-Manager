@@ -54,6 +54,25 @@ internal sealed class FakeSecretStore : ISecretStore
     public void Delete(string targetName) => values.Remove(targetName);
 }
 
+internal sealed class FakeLogger : IAppLogger
+{
+    public event EventHandler<string>? MessageLogged;
+
+    public List<string> Messages { get; } = [];
+
+    public void Info(string message) => Write(message);
+
+    public void Warning(string message) => Write(message);
+
+    public void LogError(string message, Exception? exception = null) => Write(message + (exception is null ? string.Empty : $" [{exception.GetType().Name}] {exception.Message}"));
+
+    private void Write(string message)
+    {
+        Messages.Add(message);
+        MessageLogged?.Invoke(this, message);
+    }
+}
+
 internal sealed class FakeRuntimeProbe(TestCodexHomeProvider home, bool running = false, string version = "codex-cli 0.148.0") : ICodexRuntimeProbe
 {
     public Task<CodexEnvironmentInfo> DetectAsync(CancellationToken cancellationToken = default) => Task.FromResult(new CodexEnvironmentInfo(
@@ -100,19 +119,19 @@ internal sealed class FakeLmStudioSwitchPreflight : ILmStudioSwitchPreflight
     }
 
     public static CodexInstructionHierarchyProbeResult Pass() => new(
-        true,
-        true,
-        200,
-        200,
+        new CodexInstructionProbeStepResult(true, 200),
+        new CodexInstructionProbeStepResult(true, 200),
+        new CodexInstructionProbeStepResult(true, 200),
+        new CodexInstructionProbeStepResult(true, 200),
         null,
         "test pass",
         DateTimeOffset.Now);
 
     public static CodexInstructionHierarchyProbeResult Fail(string code = CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder) => new(
-        true,
-        false,
-        200,
-        500,
+        new CodexInstructionProbeStepResult(true, 200),
+        new CodexInstructionProbeStepResult(false, 500),
+        new CodexInstructionProbeStepResult(false, null),
+        new CodexInstructionProbeStepResult(false, null),
         code,
         "test blocked",
         DateTimeOffset.Now);

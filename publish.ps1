@@ -28,6 +28,7 @@ $env:LOCALAPPDATA = Join-Path $root '.localappdata'
 $env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE = '1'
 $env:DOTNET_NOLOGO = '1'
 Remove-Item Env:CMM_RUN_LIVE_LM -ErrorAction SilentlyContinue
+Remove-Item Env:CMM_RUN_LIVE_LM_MUTATION -ErrorAction SilentlyContinue
 Remove-Item Env:CMM_RUN_LIVE_CODEX -ErrorAction SilentlyContinue
 
 $commonPublish = @(

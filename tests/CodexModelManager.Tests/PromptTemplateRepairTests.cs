@@ -71,12 +71,18 @@ public sealed class PromptTemplateRepairTests
             preview.Status == PromptTemplateRepairStatus.Supported,
             $"Template SHA {analysis.TemplateSha256} was {preview.Status}: {preview.Detail}");
         Assert.NotNull(preview.PatchedTemplate);
-        Assert.Contains("CMM-CODEX-INSTRUCTION-HIERARCHY", preview.PatchedTemplate, StringComparison.Ordinal);
-        Assert.Contains("message.role == 'system' or message.role == 'developer'", preview.PatchedTemplate, StringComparison.Ordinal);
-        Assert.Contains("messages[:cmm_instruction_state.count]", preview.PatchedTemplate, StringComparison.Ordinal);
-        Assert.Contains("System and developer messages must precede conversation messages.", preview.PatchedTemplate, StringComparison.Ordinal);
+        Assert.Contains("CMM-CODEX-INSTRUCTION-HIERARCHY qwen-interleaved-instructions-v3", preview.PatchedTemplate, StringComparison.Ordinal);
+        Assert.Contains("instruction.role == 'system' or instruction.role == 'developer'", preview.PatchedTemplate, StringComparison.Ordinal);
+        Assert.Contains("for instruction in messages", preview.PatchedTemplate, StringComparison.Ordinal);
+        Assert.DoesNotContain("messages[:cmm_instruction_state.count]", preview.PatchedTemplate, StringComparison.Ordinal);
+        Assert.DoesNotContain("System and developer messages must precede conversation messages.", preview.PatchedTemplate, StringComparison.Ordinal);
         Assert.DoesNotContain("System message must be at the beginning.", preview.PatchedTemplate, StringComparison.Ordinal);
         Assert.DoesNotContain("messages[0].role == 'system'", preview.PatchedTemplate, StringComparison.Ordinal);
+        Assert.Contains("if message.role == \"system\" or message.role == \"developer\"", preview.PatchedTemplate, StringComparison.Ordinal);
+        Assert.Contains("set content = ''", preview.PatchedTemplate, StringComparison.Ordinal);
+        int skipIndex = preview.PatchedTemplate!.IndexOf("set content = ''", StringComparison.Ordinal);
+        int conversationRenderIndex = preview.PatchedTemplate.IndexOf("render_content(message.content, true)|trim", skipIndex, StringComparison.Ordinal);
+        Assert.True(skipIndex >= 0 && conversationRenderIndex > skipIndex);
         Assert.Contains("ASSISTANT_SENTINEL", preview.PatchedTemplate, StringComparison.Ordinal);
         Assert.Contains("TOOL_SENTINEL", preview.PatchedTemplate, StringComparison.Ordinal);
         Assert.Contains("REASONING_SENTINEL", preview.PatchedTemplate, StringComparison.Ordinal);
@@ -134,6 +140,47 @@ public sealed class PromptTemplateRepairTests
         Assert.Equal(PromptTemplateRepairStatus.AlreadyCompatible, known.Status);
         Assert.Equal(PromptTemplateRepairStatus.Unsupported, markerOnly.Status);
         Assert.Null(markerOnly.PatchedTemplate);
+    }
+
+    [Fact]
+    public void ExactV2TemplateIsUpgradeRequiredAndCanBeDeterministicallyRecreated()
+    {
+        var service = new PromptTemplateRepairService();
+        string v2 = PromptTemplateRepairService.PatchExactQwenTemplateV2(SupportedTemplate);
+        string v2Sha = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(v2)));
+
+        PromptTemplateRepairPreview upgraded = service.CreatePreview(Analysis(v2));
+        string recreated = service.RecreateKnownTemplate(
+            Analysis(SupportedTemplate),
+            PromptTemplateRepairService.LegacyLeadingRuleVersion,
+            v2Sha);
+
+        Assert.Equal(PromptTemplateRepairStatus.UpgradeRequired, upgraded.Status);
+        Assert.Equal(PromptTemplateRepairService.CurrentRuleVersion, upgraded.RuleVersion);
+        Assert.Contains("qwen-leading-instructions-v2", v2, StringComparison.Ordinal);
+        Assert.Contains("System and developer messages must precede conversation messages.", v2, StringComparison.Ordinal);
+        Assert.DoesNotContain("set content = ''", v2, StringComparison.Ordinal);
+        Assert.DoesNotContain("System and developer messages must precede conversation messages.", upgraded.PatchedTemplate, StringComparison.Ordinal);
+        Assert.Contains("set content = ''", upgraded.PatchedTemplate, StringComparison.Ordinal);
+        Assert.Equal(v2, recreated);
+        Assert.Throws<InvalidDataException>(() => service.RecreateKnownTemplate(
+            Analysis(SupportedTemplate),
+            PromptTemplateRepairService.LegacyLeadingRuleVersion,
+            new string('0', 64)));
+    }
+
+    [Fact]
+    public void UnknownManagerMarkerIsNeverGuessed()
+    {
+        var service = new PromptTemplateRepairService();
+        PromptTemplateRepairPreview preview = service.CreatePreview(Analysis(
+            SupportedTemplate.Replace(
+                "{%- if not messages %}",
+                "{# CMM-CODEX-INSTRUCTION-HIERARCHY qwen-unknown-v99 #}\n{%- if not messages %}",
+                StringComparison.Ordinal)));
+
+        Assert.Equal(PromptTemplateRepairStatus.Unsupported, preview.Status);
+        Assert.Null(preview.PatchedTemplate);
     }
 
     [Fact]

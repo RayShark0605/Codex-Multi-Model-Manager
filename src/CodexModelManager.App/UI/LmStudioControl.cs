@@ -28,12 +28,18 @@ public sealed class LmStudioControl : UserControl
         DiscoverySourceValue = UiFactory.Label("未知");
         HierarchyStatusValue = UiFactory.Label("Untested", true);
         HierarchyStatusValue.ForeColor = Color.DarkOrange;
-        HierarchyDetailValue = UiFactory.Label("尚未对当前 loaded instance 执行 instructions + developer + user 差分检测。");
+        BasicControlValue = UiFactory.Label("Not run");
+        LeadingDeveloperValue = UiFactory.Label("Not run");
+        ConversationControlValue = UiFactory.Label("Not run");
+        ContinuationDeveloperValue = UiFactory.Label("Not run");
+        HierarchyDetailValue = UiFactory.Label("尚未对当前 loaded instance 执行四阶段差分检测。");
         GgufPathText = new TextBox { Width = 650 };
         BrowseGgufButton = UiFactory.Button("选择 GGUF", 110);
         var ggufPathPanel = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = false };
         ggufPathPanel.Controls.AddRange([GgufPathText, BrowseGgufButton]);
         TemplateStatusValue = UiFactory.Label("尚未分析");
+        RuntimeRepairStatusValue = UiFactory.Label("Idle");
+        RuntimeRepairStatusValue.MaximumSize = new Size(760, 0);
         AnalyzeTemplateButton = UiFactory.Button("分析 Prompt Template", 165);
         ExportTemplateButton = UiFactory.Button("导出兼容模板", 145);
         CopyTemplateButton = UiFactory.Button("复制兼容模板", 145);
@@ -58,15 +64,22 @@ public sealed class LmStudioControl : UserControl
         UiFactory.AddRow(table, "Context 检查", ContextWarningValue);
         UiFactory.AddRow(table, "发现来源", DiscoverySourceValue);
         UiFactory.AddRow(table, "Codex Instruction Hierarchy", HierarchyStatusValue);
+        UiFactory.AddRow(table, "Basic Control", BasicControlValue);
+        UiFactory.AddRow(table, "Leading Developer", LeadingDeveloperValue);
+        UiFactory.AddRow(table, "Conversation Control", ConversationControlValue);
+        UiFactory.AddRow(table, "Continuation Developer", ContinuationDeveloperValue);
         UiFactory.AddRow(table, "层级检测详情", HierarchyDetailValue);
         UiFactory.AddRow(table, "对应 GGUF（只读）", ggufPathPanel);
         UiFactory.AddRow(table, "Prompt Template", TemplateStatusValue);
+        UiFactory.AddRow(table, "运行时修复事务", RuntimeRepairStatusValue);
         UiFactory.AddRow(table, "模板修复操作", templateButtons);
 
         var buttons = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(12) };
         DetectButton = UiFactory.Button("检测 Server");
         RefreshModelsButton = UiFactory.Button("刷新模型");
-        buttons.Controls.AddRange([DetectButton, RefreshModelsButton]);
+        RecoverTransactionButton = UiFactory.Button("检查/恢复未完成事务", 190);
+        RecoverTransactionButton.Enabled = false;
+        buttons.Controls.AddRange([DetectButton, RefreshModelsButton, RecoverTransactionButton]);
         Controls.Add(buttons);
         Controls.Add(table);
     }
@@ -86,11 +99,17 @@ public sealed class LmStudioControl : UserControl
     public Label ContextWarningValue { get; }
     public Label DiscoverySourceValue { get; }
     public Label HierarchyStatusValue { get; }
+    public Label BasicControlValue { get; }
+    public Label LeadingDeveloperValue { get; }
+    public Label ConversationControlValue { get; }
+    public Label ContinuationDeveloperValue { get; }
     public Label HierarchyDetailValue { get; }
     public TextBox GgufPathText { get; }
     public Label TemplateStatusValue { get; }
+    public Label RuntimeRepairStatusValue { get; }
     public Button DetectButton { get; }
     public Button RefreshModelsButton { get; }
+    public Button RecoverTransactionButton { get; }
     public Button BrowseGgufButton { get; }
     public Button AnalyzeTemplateButton { get; }
     public Button ExportTemplateButton { get; }

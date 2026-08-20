@@ -63,11 +63,29 @@
 
 | GGUF | Source template SHA-256 | Patched template SHA-256 | 结果 |
 |---|---|---|---|
-| Qwen3.8-27B-Uncensored Q6_K | `C3CF9E34ABF4F9E36C2D72165AA9C132D3E2A725B6C2586AAA3A8AF9D7A81041` | `AA8741EB5D416E5E481B8E3BFE530CEEC25A005B1CCD384E6670FEA51B147531` | Supported |
-| Qwen3.8-27B-Uncensored Q8_0 | `C3CF9E34ABF4F9E36C2D72165AA9C132D3E2A725B6C2586AAA3A8AF9D7A81041` | `AA8741EB5D416E5E481B8E3BFE530CEEC25A005B1CCD384E6670FEA51B147531` | Supported |
-| Qwen3.6-35B-A3B Q4_K_M | `E84F32A23FDDA27689F868AA4A1A5621F41133E51A48D7F3EFCBEA2839574259` | `9E6CDDF08965594E25EE1678C9E823BB6413F51847964D3FD0A84DF1E14A2D73` | Supported |
+| Qwen3.8-27B-Uncensored Q6_K | `C3CF9E34ABF4F9E36C2D72165AA9C132D3E2A725B6C2586AAA3A8AF9D7A81041` | `4AA5CC42C084FCC8235AAF0500835F4F9419A72280EA7E02D08EEE9A97807D8B` | Supported v3 |
+| Qwen3.8-27B-Uncensored Q8_0 | `C3CF9E34ABF4F9E36C2D72165AA9C132D3E2A725B6C2586AAA3A8AF9D7A81041` | `4AA5CC42C084FCC8235AAF0500835F4F9419A72280EA7E02D08EEE9A97807D8B` | Supported v3 |
+| Qwen3.6-35B-A3B Q4_K_M | `E84F32A23FDDA27689F868AA4A1A5621F41133E51A48D7F3EFCBEA2839574259` | `235C3E8D316D80E23827174F1A8CEF37B1E5018CF70ED8F52F2C6FB9C0E233CD` | Supported v3 |
 
-三项均为 GGUF v3，仅读取 metadata header。Qwen3.8 模板包含额外的 `reasoning_instructions` system 前缀，因此并不等同于最初确认的 Qwen3.6 模板。修补器 `qwen-leading-instructions-v2` 通过精确结构锚点分别支持这两个变体，不使用 SHA 或模型名作为业务放行条件。实际 Qwen3.8 修补模板还用 Jinja 3.1.4 做了离线语义渲染：连续 system/developer 合并成唯一 system block，顺序与双换行保持，tools 模式保持，后置 system 仍被拒绝。
+三项均为 GGUF v3，仅读取 metadata header。Qwen3.8 模板包含额外的 `reasoning_instructions` system 前缀，因此并不等同于最初确认的 Qwen3.6 模板。修补器 `qwen-interleaved-instructions-v3` 通过精确结构锚点分别支持这两个变体，不使用 SHA 或模型名作为业务放行条件。v3 会遍历完整消息序列，按原相对顺序收集所有 system/developer，合并为唯一前导 system block并保持双换行；tools 和 reasoning-aware 分支均保留。未知第三种结构、混合换行或未知管理器 Marker 仍被拒绝。
+
+## 2026-08-20 earlier Q8 / 404 recovery audit
+
+- LM Studio 版本 `0.4.21.0`，`lms` CLI `1.3.3`，endpoint `http://127.0.0.1:1234`。
+- 当时 native `/api/v1/models` 报告 `qwen/qwen3.8-27b` loaded instance，`selected_variant=qwen/qwen3.8-27b@q8_0`，实际 `context_length=32768`；这取代当时截图中的 `262144`，但不是后续操作的固定目标。实现仍在每次操作前重读。
+- `lms ls --json --variants` 的精确 Q8 条目给出 `indexedModelIdentifier=qwen/qwen3.8-27b@lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q8_0.gguf`；结合 `~/.lmstudio/settings.json` 的 `downloadsFolder=J:\\LM Studio Models` 可唯一解析实际 GGUF。旧 locator 只读取逻辑 `path=qwen/qwen3.8-27b`，因此返回空路径；新版改为按 selected variant 和 indexed identifier 解析。
+- 已安装 0.4.21 主进程包的实际请求 schema接受顶层 `prompt_template` 对象及当前实例暴露的扩展加载字段。公开 REST 文档只作为 list/load/unload 基础契约；`prompt_template` 仍由请求回显、重新列举与 hierarchy probe 三层验证，任何不一致均回滚。
+- 失败事务 `ac6ea94927c1465693a826960f139630` 的 LM Studio server log 明确记录 `Model qwen/qwen3.8-27b@q8_0 not found in downloaded models`；`lms load ...@q8_0 --estimate-only` 同样拒绝，而 `lms load qwen/qwen3.8-27b --estimate-only` 能解析当前 Q8 下载。根因是旧实现把 `selected_variant` 错当成 `/load.model`。补丁 load 404 后，旧回滚又重复使用同一无效值，schema-v1 journal 最终只剩 `RollbackFailed`，导致恢复误把后来出现的唯一原实例判成歧义。
+- 新版只读 recovery assessment 曾直接读取该 legacy journal 和当时 native/Responses 状态：唯一实例 ID、Q8_0、架构、context 32768、完整 load config 与 GGUF 指纹均匹配，control HTTP 200 且 Codex-shaped 精确复现 `lmstudio-chat-template-system-order`；评估结果为 `AlreadyRestored`，并验证评估前后 loaded instance ID 集合未变化。该事务随后已按零重载路径更新为 schema 2 / `RolledBack`。
+- 本次开发会话本身运行于 Codex Desktop，因此产品的“Codex 必须完全关闭”门禁会阻止真实 unload/load；该门禁没有为了测试而绕过。显式 lifecycle live test只有在关闭 Codex并设置 `CMM_RUN_LIVE_LM_MUTATION=1` 后才会执行。
+
+## 2026-08-20 Plan→Default continuation re-audit
+
+- 失败任务的 LM Studio 请求先包含前导 developer、多轮 user/assistant/reasoning/function-call 历史，随后在用户批准计划前追加 Default collaboration-mode developer；Jinja 在模型推理之前抛出 `System and developer messages must precede conversation messages.`。
+- 根因是旧 `qwen-leading-instructions-v2` 只扫描连续前导 system/developer，并主动拒绝对话开始后的第二段指令。原两阶段探测只覆盖前导 developer，因此曾错误显示 PASS。
+- 本轮实现后的实时只读四阶段探测以当时 native 状态为准：instance `qwen/qwen3.8-27b`、variant `qwen/qwen3.8-27b@q6_k`、Q6_K、实际 context `70144`；结果为 Basic 200、Leading 200、Conversation 200、Continuation 500，准确分类 `lmstudio-chat-template-continuation-instruction-order`。
+- completed schema-v2 事务 `595a50afb4d342098626100d577aaa08`、当前 instance/config/variant、Q6_K GGUF 指纹和确定性 v2 SHA `AA8741EB5D416E5E481B8E3BFE530CEEC25A005B1CCD384E6670FEA51B147531` 全部匹配；新增 live 只读测试成功创建 v2→v3 计划，且前后 loaded instance ID 集合不变、没有写新 journal，也没有 unload/load。
+- 目标 Qwen3.8 v3 SHA 为 `4AA5CC42C084FCC8235AAF0500835F4F9419A72280EA7E02D08EEE9A97807D8B`。真正的 v3 生命周期注入、四项 200、隔离 Codex agent `CMM_PONG` 与 Plan→Default 工具闭环仍必须在关闭当前 Codex 任务后由发布 GUI 执行；产品进程门禁没有被绕过。发布工件自己的 MCP helper `cmm_ping` smoke 已通过，这不等价于模型侧 Codex agent smoke。
 
 ## 写入边界
 
@@ -75,4 +93,4 @@
 
 早期 GUI smoke 的第一版 PowerShell 驱动误用了只读 `$HOME` 变量名，使临时 `CODEX_HOME` 回退到 `%USERPROFILE%`，新建了 53-byte 的 `%USERPROFILE%\config.toml` 与只含 `initial/config.toml`、`initial/manifest.json` 的 `%USERPROFILE%\model-switcher-backup`。程序停止后，已按创建时间、精确内容、SHA 和路径白名单验证并只删除这两个新建路径；最终复核中二者均不存在。后续 smoke 使用 `$tempCodexHome` 且启用 `ErrorActionPreference=Stop`。
 
-用户此前实际使用旧版管理器切换后，真实 `model-switcher-backup` 已存在：Initial 存在、History 3 份；计划中指定的失败快照 `history\20260818-192701363\config.toml` 仍存在，5500 bytes、SHA-256 `B440C7686F903BF08AD179455E012038A37949886CD2D5D252E71F5E948704FD`。这些是当前真实状态，不被本轮修复删除或覆盖。最终真实 `config.toml` 为 5390 bytes、SHA-256 `FB2E44DD795360D6744F62C1524A76966EB8B7ECDA95B269FACD2078EE778B8C`，Provider 仍为 implicit `openai`、model 仍为 `gpt-5.6-sol`、reasoning 仍为 `max`。误建的 `%USERPROFILE%\config.toml` 与 `%USERPROFILE%\model-switcher-backup` 均不存在。本轮修复没有执行真实 Provider 切换，没有写 `models.json`，也没有触碰 `backup-deepseek`、`auth.json`、Credential Manager、Token 或用户/系统环境变量。
+用户此前实际使用旧版管理器切换后，真实 `model-switcher-backup` 已存在：Initial 与 History 均继续保留；计划中指定的失败快照 `history\20260818-192701363\config.toml` 仍不由本轮覆盖或删除。最终只读复核时，真实 `config.toml` 为 5427 bytes、SHA-256 `B2A3A7CD819B20304A017AA6202B96B85F28B7A9DEF8F445FD540C2C1C75B079`，Provider 仍为 implicit `openai`、model 仍为 `gpt-5.6-sol`、reasoning 为 `xhigh`。本轮 v3 开发没有执行真实 Provider 切换，没有写 `models.json`，也没有触碰 `backup-deepseek`、`auth.json`、Credential Manager、Token 或用户/系统环境变量。

@@ -32,6 +32,9 @@ internal sealed class MainController : IDisposable
     private GgufChatTemplateAnalysis? templateAnalysis;
     private PromptTemplateRepairPreview? templateRepairPreview;
     private string? templateModelId;
+    private bool lmStudioRecoveryPending;
+    private bool lmStudioLifecycleBusy;
+    private readonly Dictionary<Control, bool> lmStudioLifecycleControlStates = [];
 
     public MainController(MainForm form, AppComposition services, IAppLogger logger, HttpClient httpClient)
     {
@@ -58,6 +61,7 @@ internal sealed class MainController : IDisposable
             await services.Backups.EnsureInitialSnapshotAsync(lifetime.Token);
             logger.Info("Initial Snapshot 已检查（已有快照不会覆盖）。");
             await RefreshLmStudioAsync();
+            await RecoverIncompleteLmStudioTransactionsAsync();
             await LoadModelsForSelectedProviderAsync();
             await RefreshHistoryAsync();
             RefreshCredentialStatus();
@@ -95,6 +99,7 @@ internal sealed class MainController : IDisposable
 
         form.LmStudio.DetectButton.Click += async (_, _) => await RunUiActionAsync(DetectAndRefreshLmStudioAsync);
         form.LmStudio.RefreshModelsButton.Click += async (_, _) => await RunUiActionAsync(RefreshLmStudioAsync);
+        form.LmStudio.RecoverTransactionButton.Click += async (_, _) => await RunUiActionAsync(() => RecoverIncompleteLmStudioTransactionsAsync(showNoPendingMessage: true));
         form.LmStudio.EndpointText.TextChanged += (_, _) =>
         {
             if (updating) return;
@@ -145,6 +150,7 @@ internal sealed class MainController : IDisposable
             form.Current.CurrentModelValue.Text = environment.CurrentModel ?? "未显式配置";
             currentReasoningEffort = environment.ReasoningEffort;
             form.Current.SwitchButton.Enabled = !environment.IsRunning && environment.Warning is null;
+            form.Current.PreviewButton.Enabled = environment.Warning is null;
             form.Current.ProviderCombo.SelectedItem = environment.CurrentProvider is ProviderKind.Unknown ? ProviderKind.OpenAI : environment.CurrentProvider;
             form.Current.OverrideWarningValue.Text = environment.Warning ?? "扫描将在 Preview 时执行。";
             if (environment.Warning is not null) logger.Warning(environment.Warning);
@@ -158,6 +164,7 @@ internal sealed class MainController : IDisposable
 
         if (environment.Warning is null) await RefreshSecondaryOverridesAsync(environment.ConfigPath);
         else form.Current.SecondaryOverridesList.Items.Clear();
+        ApplyLmStudioRecoveryGate();
     }
 
     private async Task RefreshSecondaryOverridesAsync(string configPath)
@@ -232,7 +239,7 @@ internal sealed class MainController : IDisposable
             if (!string.IsNullOrWhiteSpace(resolvedGguf))
             {
                 form.LmStudio.GgufPathText.Text = resolvedGguf;
-                form.LmStudio.TemplateStatusValue.Text = "已通过 lms ls --json 解析 GGUF；请点击分析。";
+                form.LmStudio.TemplateStatusValue.Text = "已通过 lms ls --json --variants 解析精确 GGUF；请点击分析。";
             }
         }
 
@@ -355,7 +362,11 @@ internal sealed class MainController : IDisposable
     {
         form.LmStudio.HierarchyStatusValue.Text = "Untested";
         form.LmStudio.HierarchyStatusValue.ForeColor = Color.DarkOrange;
-        form.LmStudio.HierarchyDetailValue.Text = "当前 loaded instance 尚未执行 instructions + developer + user 差分检测。";
+        DisplayProbeStep(form.LmStudio.BasicControlValue, null);
+        DisplayProbeStep(form.LmStudio.LeadingDeveloperValue, null);
+        DisplayProbeStep(form.LmStudio.ConversationControlValue, null);
+        DisplayProbeStep(form.LmStudio.ContinuationDeveloperValue, null);
+        form.LmStudio.HierarchyDetailValue.Text = "当前 loaded instance 尚未执行四阶段差分检测。";
         string? selectedModel = (form.LmStudio.ModelCombo.SelectedItem as ModelProfile)?.Id;
         if (!string.Equals(templateModelId, selectedModel, StringComparison.Ordinal))
         {
@@ -423,17 +434,18 @@ internal sealed class MainController : IDisposable
         form.LmStudio.TemplateStatusValue.ForeColor = preview.Status switch
         {
             PromptTemplateRepairStatus.Supported => Color.DarkGreen,
+            PromptTemplateRepairStatus.UpgradeRequired => Color.DarkOrange,
             PromptTemplateRepairStatus.AlreadyCompatible => Color.DarkGreen,
             _ => Color.Firebrick,
         };
-        form.LmStudio.ExportTemplateButton.Enabled = preview.Status == PromptTemplateRepairStatus.Supported;
-        form.LmStudio.CopyTemplateButton.Enabled = preview.Status == PromptTemplateRepairStatus.Supported;
+        form.LmStudio.ExportTemplateButton.Enabled = preview.Status is PromptTemplateRepairStatus.Supported or PromptTemplateRepairStatus.UpgradeRequired;
+        form.LmStudio.CopyTemplateButton.Enabled = preview.Status is PromptTemplateRepairStatus.Supported or PromptTemplateRepairStatus.UpgradeRequired;
         logger.Info($"GGUF Prompt Template analysis: model={model.Id}, file={analysis.FileName}, gguf={analysis.GgufVersion}, templateSha={ShortHash(analysis.TemplateSha256)}, repair={preview.Status}");
     }
 
     private async Task ExportPromptTemplateAsync()
     {
-        if (templateAnalysis is null || templateRepairPreview?.Status != PromptTemplateRepairStatus.Supported ||
+        if (templateAnalysis is null || templateRepairPreview?.Status is not (PromptTemplateRepairStatus.Supported or PromptTemplateRepairStatus.UpgradeRequired) ||
             form.LmStudio.ModelCombo.SelectedItem is not ModelProfile model || !string.Equals(templateModelId, model.Id, StringComparison.Ordinal))
         {
             throw new InvalidOperationException("请先为当前 loaded instance 分析并确认可修补的 GGUF Prompt Template。");
@@ -449,7 +461,7 @@ internal sealed class MainController : IDisposable
         MessageBox.Show(
             form,
             "兼容模板已导出：\n" + artifact.Directory +
-            "\n\n请按 APPLY.md 在 LM Studio 中手动应用，保存后手动卸载并重新加载模型，再点击“重新检测 Codex 指令层级”。管理器不会自动修改 LM Studio 或 GGUF。",
+            "\n\n这是手工回退工件：可按 APPLY.md 在 LM Studio 中应用并手动重载。主 Switch 流程仅对受支持失败码提供经预览确认的事务式运行时重载；两种方式都不会修改 GGUF。",
             "Prompt Template 已导出",
             MessageBoxButtons.OK,
             MessageBoxIcon.Information);
@@ -459,7 +471,7 @@ internal sealed class MainController : IDisposable
     {
         if (form.LmStudio.ModelCombo.SelectedItem is not ModelProfile model ||
             templateAnalysis is null ||
-            templateRepairPreview?.Status != PromptTemplateRepairStatus.Supported ||
+            templateRepairPreview?.Status is not (PromptTemplateRepairStatus.Supported or PromptTemplateRepairStatus.UpgradeRequired) ||
             !string.Equals(templateModelId, model.Id, StringComparison.Ordinal))
         {
             MessageBox.Show(form, "请先分析并确认模板可安全修补。", "Prompt Template", MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -509,11 +521,11 @@ internal sealed class MainController : IDisposable
         var probe = new CodexInstructionHierarchyProbe(httpClient, endpoint, lmRequiresAuthentication ? () => token : null);
         CodexInstructionHierarchyProbeResult result = await probe.ProbeAsync(current.Id, lifetime.Token);
         DisplayHierarchyProbe(result);
-        logger.Info($"LM Studio instruction hierarchy: model={current.Id}, compatible={result.IsCompatible}, code={result.FailureCode ?? "none"}, control={result.ControlHttpStatus?.ToString(CultureInfo.InvariantCulture) ?? "none"}, hierarchy={result.HierarchyHttpStatus?.ToString(CultureInfo.InvariantCulture) ?? "none"}");
+        logger.Info($"LM Studio instruction hierarchy: model={current.Id}, compatible={result.IsCompatible}, code={result.FailureCode ?? "none"}, control={Status(result.Control)}, leading={Status(result.LeadingDeveloper)}, conversation={Status(result.ConversationControl)}, continuation={Status(result.ContinuationDeveloper)}");
         MessageBox.Show(
             form,
             result.IsCompatible
-                ? "普通 Responses 与 Codex instructions/developer/user 请求均已通过。正式切换时仍会再次实时验证。"
+                ? "Basic Control、Leading Developer、Conversation Control 与 Continuation Developer 四阶段均已通过。正式切换时仍会再次实时验证。"
                 : $"检测失败 [{result.FailureCode ?? CompatibilityFailureCodes.OtherProviderError}]：{result.Detail}\n\n若已应用兼容模板，请确认已经手动卸载并重新加载模型。",
             result.IsCompatible ? "Codex 指令层级 PASS" : "Codex 指令层级 FAILED",
             MessageBoxButtons.OK,
@@ -537,7 +549,7 @@ internal sealed class MainController : IDisposable
         }
 
         PromptTemplateRepairPreview currentPreview = services.TemplateRepair.CreatePreview(current);
-        if (currentPreview.Status != PromptTemplateRepairStatus.Supported || currentPreview.PatchedTemplate is null)
+        if (currentPreview.Status is not (PromptTemplateRepairStatus.Supported or PromptTemplateRepairStatus.UpgradeRequired) || currentPreview.PatchedTemplate is null)
         {
             InvalidateTemplateAnalysis();
             throw new InvalidDataException("重新读取后模板不再满足精确修补规则；请重新分析。");
@@ -550,11 +562,20 @@ internal sealed class MainController : IDisposable
 
     private void DisplayHierarchyProbe(CodexInstructionHierarchyProbeResult result)
     {
+        bool templateUpgradeRequired = result.FailureCode == CompatibilityFailureCodes.LmStudioChatTemplateContinuationInstructionOrder;
         bool templateFixRequired = result.FailureCode is CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder or CompatibilityFailureCodes.LmStudioChatTemplateDeveloperRole;
-        form.LmStudio.HierarchyStatusValue.Text = result.IsCompatible ? "PASS" : templateFixRequired ? "Template Fix Required" : "FAILED";
+        form.LmStudio.HierarchyStatusValue.Text = result.IsCompatible
+            ? "PASS"
+            : templateUpgradeRequired
+                ? "Template Upgrade Required (v2 → v3)"
+                : templateFixRequired ? "Template Fix Required" : "FAILED";
         form.LmStudio.HierarchyStatusValue.ForeColor = result.IsCompatible ? Color.DarkGreen : Color.Firebrick;
+        DisplayProbeStep(form.LmStudio.BasicControlValue, result.Control);
+        DisplayProbeStep(form.LmStudio.LeadingDeveloperValue, result.LeadingDeveloper);
+        DisplayProbeStep(form.LmStudio.ConversationControlValue, result.ConversationControl);
+        DisplayProbeStep(form.LmStudio.ContinuationDeveloperValue, result.ContinuationDeveloper);
         form.LmStudio.HierarchyDetailValue.Text =
-            $"Control {FormatProbeStatus(result.ControlPassed, result.ControlHttpStatus)}；Codex-shaped {FormatProbeStatus(result.HierarchyPassed, result.HierarchyHttpStatus)}；Failure Code: {result.FailureCode ?? "none"}。{result.Detail}";
+            $"Basic Control {FormatProbeStatus(result.Control)}；Leading Developer {FormatProbeStatus(result.LeadingDeveloper)}；Conversation Control {FormatProbeStatus(result.ConversationControl)}；Continuation Developer {FormatProbeStatus(result.ContinuationDeveloper)}；Failure Code: {result.FailureCode ?? "none"}。{result.Detail}";
         CompatibilityResult[] results =
         [
             new CompatibilityResult("Responses", result.ControlPassed ? CompatibilityStatus.Supported : CompatibilityStatus.Failed, result.ControlPassed ? "普通 Responses control 请求成功。" : result.Detail, result.CheckedAt, result.ControlPassed ? null : result.FailureCode),
@@ -623,26 +644,716 @@ internal sealed class MainController : IDisposable
 
     private async Task PreviewAsync()
     {
+        EnsureNoPendingLmStudioRecovery();
         SwitchRequest request = await CreateRequestAsync();
-        lastPlan = await services.Switches.CreatePlanAsync(request, lifetime.Token);
-        form.Current.OverrideWarningValue.Text = SummarizeOverrides(lastPlan.SecondaryOverrides);
-        ShowPlan(lastPlan, false);
+        try
+        {
+            lastPlan = await services.Switches.CreatePlanAsync(request, lifetime.Token);
+            form.Current.OverrideWarningValue.Text = SummarizeOverrides(lastPlan.SecondaryOverrides);
+            ShowPlan(lastPlan, false);
+        }
+        catch (LmStudioCompatibilityException exception) when (CanRepairTemplate(request, exception.Result))
+        {
+            DisplayHierarchyProbe(exception.Result);
+            (LmStudioInstanceController previewController, LmStudioTemplateRepairPlan repairPlan) = await CreateTemplateRepairPlanAsync(request, exception.Result);
+            using (previewController)
+            {
+                form.LmStudio.RuntimeRepairStatusValue.Text = "Preview Ready — 未执行 unload/load";
+                form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.DarkOrange;
+                using var dialog = new LmStudioTemplateRepairDialog(repairPlan, allowApply: false);
+                dialog.ShowDialog(form);
+            }
+        }
     }
 
     private async Task SwitchAsync()
     {
+        EnsureNoPendingLmStudioRecovery();
         SwitchRequest request = await CreateRequestAsync();
-        SwitchPlan plan = await services.Switches.CreatePlanAsync(request, lifetime.Token);
-        lastPlan = plan;
-        if (ShowPlan(plan, true) != DialogResult.Yes) return;
-        SwitchRequest confirmedRequest = await CreateRequestAsync();
-        if (confirmedRequest != plan.Request) throw new IOException("Provider/模型/context 在确认期间发生变化，请刷新并重新预览。");
-        await services.Switches.CommitAsync(plan, lifetime.Token);
-        appSettings = await services.SettingsRepository.LoadAsync(lifetime.Token);
-        logger.Info($"切换完成: provider={plan.Request.TargetProvider}, model={plan.Request.TargetModel}, files={plan.Files.Count}");
-        MessageBox.Show(form, "切换完成，请重新启动 Codex。", "Codex Multi-Model Manager", MessageBoxButtons.OK, MessageBoxIcon.Information);
-        await RefreshEnvironmentAsync();
-        await RefreshHistoryAsync();
+        LmStudioInstanceController? instanceController = null;
+        LmStudioTemplateRepairResult? repairResult = null;
+        bool codexConfigCommitted = false;
+        bool lifecycleStarted = false;
+        try
+        {
+            SwitchPlan plan;
+            try
+            {
+                plan = await services.Switches.CreatePlanAsync(request, lifetime.Token);
+            }
+            catch (LmStudioCompatibilityException exception) when (CanRepairTemplate(request, exception.Result))
+            {
+                DisplayHierarchyProbe(exception.Result);
+                (instanceController, LmStudioTemplateRepairPlan repairPlan) = await CreateTemplateRepairPlanAsync(request, exception.Result);
+                using var dialog = new LmStudioTemplateRepairDialog(repairPlan, allowApply: true);
+                if (dialog.ShowDialog(form) != DialogResult.OK)
+                {
+                    form.LmStudio.RuntimeRepairStatusValue.Text = "Cancelled — 未执行 unload/load";
+                    form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.DarkOrange;
+                    return;
+                }
+
+                form.LmStudio.RuntimeRepairStatusValue.Text = "Applying — 正在卸载/加载/验证";
+                form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.DarkOrange;
+                lifecycleStarted = true;
+                SetLmStudioLifecycleBusy(true);
+                logger.Info($"LM Studio runtime template repair confirmed: transaction={repairPlan.TransactionId:N}, instance={repairPlan.OriginalInstance.InstanceId}");
+                repairResult = await instanceController.ApplyTemplateAsync(repairPlan, lifetime.Token);
+                try
+                {
+                    form.LmStudio.RuntimeRepairStatusValue.Text = $"PatchedAndVerified — {repairResult.PatchedInstance.InstanceId}";
+                    form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.DarkGreen;
+                    int? requestedCompact = request.AutoCompactTokenLimit;
+                    await RefreshAndSelectLmStudioInstanceAsync(repairResult.PatchedInstance.InstanceId, requestedCompact);
+                    DisplayHierarchyProbe(repairResult.HierarchyProbe);
+
+                    request = await CreateRequestAsync();
+                    if (!request.TargetModel.Equals(repairResult.PatchedInstance.InstanceId, StringComparison.Ordinal))
+                    {
+                        throw new IOException("LM Studio 新实例 ID 未正确进入切换请求。");
+                    }
+
+                    plan = await services.Switches.CreatePlanAsync(request, lifetime.Token);
+                }
+                catch (Exception continuationException)
+                {
+                    try
+                    {
+                        await RollbackAppliedRepairAsync(instanceController, repairResult, "补丁通过后刷新或重新生成 Codex 配置计划失败");
+                    }
+                    catch (Exception rollbackException)
+                    {
+                        throw new AggregateException("补丁后续处理失败，且 LM Studio 事务回滚也失败。", continuationException, rollbackException);
+                    }
+
+                    throw;
+                }
+            }
+
+            lastPlan = plan;
+            if (ShowPlan(plan, true) != DialogResult.Yes)
+            {
+                if (repairResult is not null && instanceController is not null)
+                {
+                    await RollbackAppliedRepairAsync(instanceController, repairResult, "用户取消最终 Codex 配置确认");
+                    string restoredTemplate = repairResult.Plan.OriginalRuntimeTemplate.Mode == LmStudioRuntimeTemplateMode.ManagerRule
+                        ? $"原 LM Studio 运行时模板 {repairResult.Plan.OriginalRuntimeTemplate.RuleVersion}"
+                        : "原始 LM Studio 内置模板";
+                    MessageBox.Show(form, $"已取消 Codex 配置切换，并恢复{restoredTemplate}实例。", "切换已取消", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+
+                return;
+            }
+
+            try
+            {
+                SwitchRequest confirmedRequest = await CreateRequestAsync();
+                if (confirmedRequest != plan.Request) throw new IOException("Provider/模型/context 在确认期间发生变化，请刷新并重新预览。");
+                await services.Switches.CommitAsync(plan, lifetime.Token);
+                codexConfigCommitted = true;
+            }
+            catch (Exception commitException)
+            {
+                if (!codexConfigCommitted && repairResult is not null && instanceController is not null)
+                {
+                    CodexEnvironmentInfo? authoritative = null;
+                    try
+                    {
+                        authoritative = await services.RuntimeProbe.DetectAsync(CancellationToken.None);
+                    }
+                    catch (Exception auditException)
+                    {
+                        PreservePatchedInstanceForRecovery(repairResult, "Codex 配置提交报错，且无法重新读取权威配置；为避免卸载仍被配置引用的实例，已保留补丁实例。");
+                        codexConfigCommitted = true;
+                        throw new AggregateException("Codex 配置提交失败后无法确认磁盘最终状态；补丁实例已保留并禁止继续切换。", commitException, auditException);
+                    }
+
+                    bool pointsToPatchedInstance =
+                        authoritative.Warning is null &&
+                        authoritative.CurrentProvider == ProviderKind.LmStudio &&
+                        string.Equals(authoritative.CurrentModel, repairResult.PatchedInstance.InstanceId, StringComparison.Ordinal);
+                    if (pointsToPatchedInstance || authoritative.Warning is not null)
+                    {
+                        PreservePatchedInstanceForRecovery(
+                            repairResult,
+                            pointsToPatchedInstance
+                                ? "Commit 返回错误，但磁盘配置已经指向补丁实例；已保留实例并等待恢复复验。"
+                                : "Commit 返回错误，且配置重读存在警告；无法安全证明可回滚 LM Studio，已保留补丁实例。");
+                        codexConfigCommitted = true;
+                        throw new InvalidOperationException("Codex 配置提交结果不确定或已经指向补丁实例；未回滚 LM Studio，以避免配置引用被卸载的实例。", commitException);
+                    }
+
+                    try
+                    {
+                        await RollbackAppliedRepairAsync(instanceController, repairResult, "Codex 配置提交失败且磁盘配置确认未指向补丁实例");
+                    }
+                    catch (Exception rollbackException)
+                    {
+                        throw new AggregateException("Codex 配置提交失败，且 LM Studio 事务回滚也失败。", commitException, rollbackException);
+                    }
+                }
+
+                throw;
+            }
+
+            if (repairResult is not null && instanceController is not null)
+            {
+                try
+                {
+                    await instanceController.CompleteAsync(repairResult.Plan.TransactionId, lifetime.Token);
+                    form.LmStudio.RuntimeRepairStatusValue.Text = $"Completed — 保留补丁实例 {repairResult.PatchedInstance.InstanceId}";
+                    form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.DarkGreen;
+                }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException)
+                {
+                    lmStudioRecoveryPending = true;
+                    ApplyLmStudioRecoveryGate();
+                    form.LmStudio.RuntimeRepairStatusValue.Text = "Config Committed / Journal Pending — 必须保留补丁实例";
+                    form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.Firebrick;
+                    logger.LogError("Codex 配置已提交，但 LM Studio 事务完成标记写入失败", exception);
+                    MessageBox.Show(
+                        form,
+                        "Codex 配置已经成功切换，补丁实例必须保留；但恢复事务的 Completed 标记写入失败。请不要卸载当前补丁实例，也不要在下次启动时选择恢复原始模板，直到事务目录问题已修复。\n\n" + services.Redactor.Redact(exception.Message),
+                        "切换已提交，但事务日志待处理",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                }
+            }
+
+            appSettings = await services.SettingsRepository.LoadAsync(lifetime.Token);
+            logger.Info($"切换完成: provider={plan.Request.TargetProvider}, model={plan.Request.TargetModel}, files={plan.Files.Count}");
+            MessageBox.Show(form, "切换完成，请重新启动 Codex。", "Codex Multi-Model Manager", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            await RefreshEnvironmentAsync();
+            await RefreshHistoryAsync();
+        }
+        catch (Exception continuationException)
+        {
+            if (!codexConfigCommitted && repairResult is not null && instanceController is not null)
+            {
+                LmStudioTemplateTransactionRecord? record;
+                try
+                {
+                    record = await services.TemplateTransactions.ReadAsync(repairResult.Plan.TransactionId, CancellationToken.None);
+                }
+                catch (Exception journalException) when (journalException is IOException or UnauthorizedAccessException or JsonException)
+                {
+                    lmStudioRecoveryPending = true;
+                    ApplyLmStudioRecoveryGate();
+                    throw new AggregateException("补丁成功后的处理失败，且恢复事务记录无法读取；已禁止新的切换。", continuationException, journalException);
+                }
+
+                if (record is null)
+                {
+                    lmStudioRecoveryPending = true;
+                    ApplyLmStudioRecoveryGate();
+                    throw new AggregateException(
+                        "补丁成功后的处理失败，且恢复事务记录已丢失；已保留当前实例并禁止新的切换。",
+                        continuationException,
+                        new FileNotFoundException("LM Studio 恢复事务记录不存在。", services.TemplateTransactions.GetPath(repairResult.Plan.TransactionId)));
+                }
+
+                if (record.State is LmStudioTemplateTransactionState.PatchedLoaded or LmStudioTemplateTransactionState.PatchedAndVerified)
+                {
+                    try
+                    {
+                        await RollbackAppliedRepairAsync(instanceController, repairResult, "补丁成功后的未处理异常");
+                    }
+                    catch (Exception rollbackException)
+                    {
+                        throw new AggregateException("补丁成功后的处理失败，且 LM Studio 事务回滚也失败。", continuationException, rollbackException);
+                    }
+                }
+            }
+
+            throw;
+        }
+        finally
+        {
+            instanceController?.Dispose();
+            if (lifecycleStarted)
+            {
+                SetLmStudioLifecycleBusy(false);
+            }
+        }
+    }
+
+    private void PreservePatchedInstanceForRecovery(LmStudioTemplateRepairResult repairResult, string detail)
+    {
+        lmStudioRecoveryPending = true;
+        ApplyLmStudioRecoveryGate();
+        form.LmStudio.RuntimeRepairStatusValue.Text = "Config State Uncertain — 保留补丁实例并禁止新切换";
+        form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.Firebrick;
+        logger.Warning($"LM Studio patch preserved for recovery: transaction={repairResult.Plan.TransactionId:N}, instance={repairResult.PatchedInstance.InstanceId}, detail={detail}");
+    }
+
+    private async Task<(LmStudioInstanceController Controller, LmStudioTemplateRepairPlan Plan)> CreateTemplateRepairPlanAsync(
+        SwitchRequest request,
+        CodexInstructionHierarchyProbeResult failure)
+    {
+        if (request.LmStudioEndpoint is null || string.IsNullOrWhiteSpace(failure.FailureCode))
+        {
+            throw new InvalidOperationException("LM Studio 模板修复缺少 endpoint 或失败码。");
+        }
+
+        ModelProfile selected = lmModels.FirstOrDefault(model => model.Id.Equals(request.TargetModel, StringComparison.Ordinal))
+            ?? throw new InvalidOperationException("所选 LM Studio loaded instance 已不在当前 native 模型快照中，请刷新。");
+        LmStudioInstanceController controller = services.CreateLmStudioInstanceController(request.LmStudioEndpoint, request.LmStudioRequiresAuthentication);
+        controller.ProgressChanged += OnLmStudioLifecycleProgress;
+        var planner = new LmStudioTemplateRepairPlanner(controller, services.GgufReader, services.TemplateRepair, services.TemplateTransactions);
+        form.LmStudio.RuntimeRepairStatusValue.Text = "Planning — 捕获实例并分析精确 GGUF";
+        form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.DarkOrange;
+        LmStudioTemplateRepairPlan plan = await planner.CreatePlanAsync(selected, failure, lifetime.Token);
+        logger.Info($"LM Studio runtime template repair preview: transaction={plan.TransactionId:N}, instance={plan.OriginalInstance.InstanceId}, variant={plan.OriginalInstance.SelectedVariant ?? plan.OriginalInstance.SourceModelKey}, originalSha={ShortHash(plan.GgufAnalysis.TemplateSha256)}, patchedSha={ShortHash(plan.TemplatePreview.PatchedTemplateSha256!)}");
+        return (controller, plan);
+    }
+
+    private void OnLmStudioLifecycleProgress(object? sender, string stage)
+    {
+        if (form.IsDisposed || form.Disposing || !form.IsHandleCreated)
+        {
+            return;
+        }
+
+        void Update()
+        {
+            form.LmStudio.RuntimeRepairStatusValue.Text = stage;
+            form.LmStudio.RuntimeRepairStatusValue.ForeColor =
+                stage.Contains("Failed", StringComparison.OrdinalIgnoreCase) ? Color.Firebrick :
+                stage.Contains("Completed", StringComparison.OrdinalIgnoreCase) ||
+                stage.Contains("RolledBack", StringComparison.OrdinalIgnoreCase) ||
+                stage.Contains("PatchedAndVerified", StringComparison.OrdinalIgnoreCase) ? Color.DarkGreen :
+                Color.DarkOrange;
+        }
+
+        if (form.InvokeRequired)
+        {
+            form.BeginInvoke((Action)Update);
+        }
+        else
+        {
+            Update();
+        }
+    }
+
+    private async Task RefreshAndSelectLmStudioInstanceAsync(string instanceId, int? requestedCompact)
+    {
+        await RefreshLmStudioAsync();
+        ModelProfile selected = lmModels.FirstOrDefault(model => model.IsLoaded == true && model.Id.Equals(instanceId, StringComparison.Ordinal))
+            ?? throw new InvalidOperationException($"LM Studio load 响应实例 {instanceId} 未出现在 native 模型列表中。");
+        updating = true;
+        try
+        {
+            form.LmStudio.ModelCombo.SelectedItem = form.LmStudio.ModelCombo.Items.Cast<object>().OfType<ModelProfile>().First(model => model.Id.Equals(instanceId, StringComparison.Ordinal));
+            if (form.Current.ProviderCombo.SelectedItem is ProviderKind.LmStudio)
+            {
+                form.Current.ModelCombo.SelectedItem = form.Current.ModelCombo.Items.Cast<object>().OfType<ModelProfile>().First(model => model.Id.Equals(instanceId, StringComparison.Ordinal));
+            }
+        }
+        finally
+        {
+            updating = false;
+        }
+
+        UpdateLocalModelDetails();
+        UpdateReasoningChoices();
+        if (requestedCompact is > 0 && selected.LoadedContextLength is int context && requestedCompact < context && context - requestedCompact >= 1024)
+        {
+            form.LmStudio.AutoCompactInput.Value = Math.Clamp(requestedCompact.Value, (int)form.LmStudio.AutoCompactInput.Minimum, (int)form.LmStudio.AutoCompactInput.Maximum);
+        }
+    }
+
+    private async Task RollbackAppliedRepairAsync(
+        LmStudioInstanceController controller,
+        LmStudioTemplateRepairResult repair,
+        string reason)
+    {
+        form.LmStudio.RuntimeRepairStatusValue.Text = "Rolling Back — " + reason;
+        form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.DarkOrange;
+        logger.Warning($"LM Studio runtime template rollback requested: transaction={repair.Plan.TransactionId:N}, reason={reason}");
+        LmStudioRollbackResult rollback = await controller.RollbackAsync(repair.Plan, repair.PatchedInstance.InstanceId, lifetime.Token);
+        if (!rollback.Succeeded)
+        {
+            lmStudioRecoveryPending = true;
+            ApplyLmStudioRecoveryGate();
+            form.LmStudio.RuntimeRepairStatusValue.Text = "RollbackFailed — " + rollback.Detail;
+            form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.Firebrick;
+            throw new InvalidOperationException(rollback.Detail);
+        }
+
+        form.LmStudio.RuntimeRepairStatusValue.Text = repair.Plan.OriginalRuntimeTemplate.Mode == LmStudioRuntimeTemplateMode.ManagerRule
+            ? $"RolledBack — 已恢复 {repair.Plan.OriginalRuntimeTemplate.RuleVersion}"
+            : "RolledBack — 已恢复原始内置模板";
+        form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.DarkGreen;
+        await RefreshLmStudioAsync();
+    }
+
+    private static bool CanRepairTemplate(SwitchRequest request, CodexInstructionHierarchyProbeResult result) =>
+        request.TargetProvider == ProviderKind.LmStudio &&
+        result.FailureCode is CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder or
+            CompatibilityFailureCodes.LmStudioChatTemplateDeveloperRole or
+            CompatibilityFailureCodes.LmStudioChatTemplateContinuationInstructionOrder;
+
+    private async Task RecoverIncompleteLmStudioTransactionsAsync(bool showNoPendingMessage = false)
+    {
+        IReadOnlyList<LmStudioTemplateTransactionRecord> incomplete;
+        try
+        {
+            incomplete = await services.TemplateTransactions.ListIncompleteAsync(lifetime.Token);
+        }
+        catch (Exception exception) when (exception is IOException or JsonException or UnauthorizedAccessException)
+        {
+            lmStudioRecoveryPending = true;
+            ApplyLmStudioRecoveryGate();
+            form.LmStudio.RuntimeRepairStatusValue.Text = "Recovery Journal Invalid — 禁止新切换";
+            form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.Firebrick;
+            throw new InvalidDataException("LM Studio 恢复事务目录包含无法验证的记录；为避免覆盖未知运行状态，已禁止新的 Preview/Switch。", exception);
+        }
+
+        lmStudioRecoveryPending = incomplete.Count > 0;
+        if (incomplete.Count == 0)
+        {
+            ApplyLmStudioRecoveryGate();
+            if (showNoPendingMessage)
+            {
+                MessageBox.Show(form, "当前没有未完成的 LM Studio 模板事务。", "LM Studio 恢复", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+
+            return;
+        }
+
+        if (incomplete.Count > 1)
+        {
+            ApplyLmStudioRecoveryGate();
+            form.LmStudio.RuntimeRepairStatusValue.Text = $"Recovery Ambiguous — 检测到 {incomplete.Count} 个未完成事务";
+            form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.Firebrick;
+            MessageBox.Show(
+                form,
+                $"事务目录中同时存在 {incomplete.Count} 个未完成的 LM Studio 生命周期事务。为避免按错误顺序卸载或加载实例，本次不会自动恢复；新的 Preview/Switch 已禁止。请先审查 transactions 目录中的记录。",
+                "LM Studio 恢复状态有歧义",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            return;
+        }
+
+        foreach (LmStudioTemplateTransactionRecord transaction in incomplete)
+        {
+            try
+            {
+                if (await TryFinalizeAlreadyCommittedLmStudioTransactionAsync(transaction))
+                {
+                    continue;
+                }
+            }
+            catch (Exception exception)
+            {
+                lmStudioRecoveryPending = true;
+                ApplyLmStudioRecoveryGate();
+                form.LmStudio.RuntimeRepairStatusValue.Text = "Committed Transaction Verification Failed — 禁止恢复/切换";
+                form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.Firebrick;
+                logger.LogError($"LM Studio committed transaction verification failed: id={transaction.TransactionId:N}", exception);
+                MessageBox.Show(form, services.Redactor.Redact("Codex 配置似乎已指向补丁实例，但无法验证并完成事务。为避免恢复原模板后让 Codex 指向错误实例，本次没有执行 unload/load。\n\n" + exception.Message), "LM Studio 已提交事务待处理", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            LmStudioRecoveryAssessment assessment;
+            bool requiresAuthentication;
+            try
+            {
+                requiresAuthentication = await DetectLmStudioAuthenticationAsync(transaction.OriginalInstance.Endpoint);
+                using LmStudioInstanceController assessmentController = services.CreateLmStudioInstanceController(transaction.OriginalInstance.Endpoint, requiresAuthentication);
+                form.LmStudio.RuntimeRepairStatusValue.Text = $"Assessing Recovery — {transaction.TransactionId:N}";
+                form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.DarkOrange;
+                assessment = await assessmentController.AssessRecoveryAsync(transaction, lifetime.Token);
+            }
+            catch (Exception exception)
+            {
+                lmStudioRecoveryPending = true;
+                ApplyLmStudioRecoveryGate();
+                form.LmStudio.RuntimeRepairStatusValue.Text = "Recovery Assessment Failed — 禁止新切换";
+                form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.Firebrick;
+                logger.LogError($"LM Studio recovery assessment failed: id={transaction.TransactionId:N}", exception);
+                MessageBox.Show(form, services.Redactor.Redact(exception.Message), "LM Studio 恢复评估失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            if (assessment.Disposition == LmStudioRecoveryDisposition.BlockedAmbiguous)
+            {
+                form.LmStudio.RuntimeRepairStatusValue.Text = "Recovery Ambiguous — 未执行 unload/load";
+                form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.Firebrick;
+                ApplyLmStudioRecoveryGate();
+                MessageBox.Show(form, BuildRecoveryAssessmentMessage(transaction, assessment), "LM Studio 恢复状态有歧义", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            if (MessageBox.Show(form, BuildRecoveryAssessmentMessage(transaction, assessment), "LM Studio 未完成事务", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+            {
+                form.LmStudio.RuntimeRepairStatusValue.Text = $"Recovery Required — {transaction.TransactionId:N}";
+                form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.Firebrick;
+                ApplyLmStudioRecoveryGate();
+                return;
+            }
+
+            try
+            {
+                using LmStudioInstanceController controller = services.CreateLmStudioInstanceController(transaction.OriginalInstance.Endpoint, requiresAuthentication);
+                form.LmStudio.RuntimeRepairStatusValue.Text = $"Recovering — {transaction.TransactionId:N}";
+                form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.DarkOrange;
+                SetLmStudioLifecycleBusy(true);
+                LmStudioRollbackResult result = await controller.RecoverAsync(transaction, assessment, lifetime.Token);
+                if (!result.Succeeded)
+                {
+                    throw new InvalidOperationException(result.Detail);
+                }
+
+                logger.Info($"LM Studio incomplete transaction recovered: id={transaction.TransactionId:N}, detail={result.Detail}");
+                form.LmStudio.RuntimeRepairStatusValue.Text = transaction.OriginalRuntimeTemplateMode == LmStudioRuntimeTemplateMode.ManagerRule
+                    ? $"Recovered — 已验证 {transaction.OriginalRuntimeRuleVersion} 实例状态"
+                    : "Recovered — 已验证原始内置模板实例状态";
+                form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.DarkGreen;
+            }
+            catch (Exception exception)
+            {
+                lmStudioRecoveryPending = true;
+                ApplyLmStudioRecoveryGate();
+                logger.LogError($"LM Studio incomplete transaction recovery failed: id={transaction.TransactionId:N}", exception);
+                MessageBox.Show(form, services.Redactor.Redact(exception.Message), "LM Studio 恢复失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            finally
+            {
+                SetLmStudioLifecycleBusy(false);
+            }
+        }
+
+        lmStudioRecoveryPending = (await services.TemplateTransactions.ListIncompleteAsync(lifetime.Token)).Count > 0;
+        ApplyLmStudioRecoveryGate();
+        if (!lmStudioRecoveryPending && incomplete.Count > 0)
+        {
+            await RefreshEnvironmentAsync();
+            await RefreshLmStudioAsync();
+        }
+    }
+
+    private static string BuildRecoveryAssessmentMessage(
+        LmStudioTemplateTransactionRecord transaction,
+        LmStudioRecoveryAssessment assessment)
+    {
+        var builder = new StringBuilder()
+            .AppendLine("检测到未完成的 LM Studio 模板事务。")
+            .AppendLine()
+            .Append("Transaction: ").AppendLine(transaction.TransactionId.ToString("N"))
+            .Append("Journal schema/state: ").Append(transaction.SchemaVersion).Append(" / ").AppendLine(transaction.State.ToString())
+            .Append("Last stable/failure stage: ").Append(transaction.LastStableState?.ToString() ?? "<legacy unknown>").Append(" / ").AppendLine(transaction.FailureStage.ToString())
+            .Append("Endpoint: ").AppendLine(transaction.OriginalInstance.Endpoint.GetLeftPart(UriPartial.Authority))
+            .Append("REST load key: ").AppendLine(transaction.OriginalInstance.SourceModelKey)
+            .Append("Expected variant: ").AppendLine(transaction.OriginalInstance.SelectedVariant ?? "<unknown>")
+            .Append("Original instance: ").AppendLine(transaction.OriginalInstance.InstanceId)
+            .Append("Known patched/candidate: ").AppendLine(transaction.PatchedInstanceId ?? transaction.CandidateInstanceId ?? "<unknown>")
+            .Append("Context: ").AppendLine(transaction.OriginalInstance.LoadConfiguration.ContextLength?.ToString("N0", CultureInfo.CurrentCulture) ?? "unknown")
+            .Append("Original runtime template: ").Append(transaction.OriginalRuntimeTemplateMode)
+            .Append(transaction.OriginalRuntimeRuleVersion is null ? string.Empty : " / " + transaction.OriginalRuntimeRuleVersion).AppendLine()
+            .Append("Target runtime rule: ").AppendLine(transaction.TargetRuntimeRuleVersion ?? transaction.RuleVersion)
+            .AppendLine()
+            .AppendLine("当前权威 native 候选：");
+        if (assessment.Candidates.Count == 0)
+        {
+            builder.AppendLine("- <none>");
+        }
+        else
+        {
+            foreach (LmStudioRecoveryCandidate candidate in assessment.Candidates)
+            {
+                builder.Append("- ").Append(candidate.Snapshot.InstanceId)
+                    .Append(" | config=").Append(candidate.MatchesOriginalSnapshot ? "MATCH" : "MISMATCH")
+                    .Append(" | basic=").Append(candidate.HierarchyProbe is null ? "not-run" : Status(candidate.HierarchyProbe.Control))
+                    .Append(" | leading=").Append(candidate.HierarchyProbe is null ? "not-run" : Status(candidate.HierarchyProbe.LeadingDeveloper))
+                    .Append(" | conversation=").Append(candidate.HierarchyProbe is null ? "not-run" : Status(candidate.HierarchyProbe.ConversationControl))
+                    .Append(" | continuation=").Append(candidate.HierarchyProbe is null ? "not-run" : Status(candidate.HierarchyProbe.ContinuationDeveloper))
+                    .Append(" | failure=").AppendLine(candidate.HierarchyProbe?.FailureCode ?? "none");
+            }
+        }
+
+        builder.AppendLine()
+            .Append("评估结果: ").AppendLine(assessment.Disposition.ToString())
+            .AppendLine(assessment.Detail)
+            .AppendLine()
+            .AppendLine(assessment.RequiresLifecycleMutation
+                ? "确认后将执行上述精确 unload/load；执行前会再次指纹复查。"
+                : "确认后只会把 journal 标记为 RolledBack，不会 unload/load 模型。")
+            .AppendLine("恢复完成前新的 Preview/Switch 保持禁用。是否继续？");
+        return builder.ToString();
+    }
+
+    private async Task<bool> TryFinalizeAlreadyCommittedLmStudioTransactionAsync(LmStudioTemplateTransactionRecord transaction)
+    {
+        if (transaction.State != LmStudioTemplateTransactionState.PatchedAndVerified || string.IsNullOrWhiteSpace(transaction.PatchedInstanceId))
+        {
+            return false;
+        }
+
+        CodexEnvironmentInfo environment = await services.RuntimeProbe.DetectAsync(lifetime.Token);
+        if (environment.CurrentProvider != ProviderKind.LmStudio || !string.Equals(environment.CurrentModel, transaction.PatchedInstanceId, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        string message =
+            "恢复记录停留在 PatchedAndVerified，但当前 Codex 配置已经指向同一补丁实例。这通常表示配置提交成功后、写入 Completed 标记前程序退出。\n\n" +
+            $"Transaction: {transaction.TransactionId:N}\n" +
+            $"Patched instance: {transaction.PatchedInstanceId}\n" +
+            $"Codex context: {transaction.OriginalInstance.LoadConfiguration.ContextLength?.ToString("N0", CultureInfo.CurrentCulture) ?? "unknown"}\n\n" +
+            "是否只重新验证实例与指令层级并补写 Completed 标记？此操作不会 unload/load 模型，也不会修改 Codex 配置。";
+        if (MessageBox.Show(form, message, "完成已提交的 LM Studio 事务", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+        {
+            form.LmStudio.RuntimeRepairStatusValue.Text = $"Completion Required — {transaction.TransactionId:N}";
+            form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.Firebrick;
+            return true;
+        }
+
+        if (environment.IsRunning)
+        {
+            throw new InvalidOperationException("请先完全关闭 Codex，再验证并完成已提交事务。");
+        }
+
+        bool requiresAuthentication = await DetectLmStudioAuthenticationAsync(transaction.OriginalInstance.Endpoint);
+        using LmStudioInstanceController controller = services.CreateLmStudioInstanceController(transaction.OriginalInstance.Endpoint, requiresAuthentication);
+        LmStudioLoadedInstanceSnapshot patched = await controller.CaptureAsync(transaction.PatchedInstanceId, lifetime.Token);
+        if (!string.Equals(patched.SourceModelKey, transaction.OriginalInstance.SourceModelKey, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(patched.SelectedVariant, transaction.OriginalInstance.SelectedVariant, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(patched.Architecture, transaction.OriginalInstance.Architecture, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(patched.Quantization, transaction.OriginalInstance.Quantization, StringComparison.OrdinalIgnoreCase) ||
+            !LmStudioClient.LoadConfigurationsEqual(transaction.OriginalInstance.LoadConfiguration, patched.LoadConfiguration))
+        {
+            throw new InvalidDataException("当前补丁实例的模型变体或加载配置与事务记录不一致。");
+        }
+
+        var request = new SwitchRequest(
+            ProviderKind.LmStudio,
+            patched.InstanceId,
+            ContextWindow: patched.LoadConfiguration.ContextLength,
+            LmStudioEndpoint: patched.Endpoint,
+            LmStudioRequiresAuthentication: requiresAuthentication,
+            TargetModelType: patched.ModelType);
+        CodexInstructionHierarchyProbeResult hierarchy = await services.LmStudioPreflight.ProbeAsync(request, lifetime.Token);
+        if (!hierarchy.IsCompatible)
+        {
+            throw new LmStudioCompatibilityException(hierarchy);
+        }
+
+        await controller.CompleteAsync(transaction.TransactionId, lifetime.Token);
+        form.LmStudio.RuntimeRepairStatusValue.Text = $"Completed — 保留补丁实例 {patched.InstanceId}";
+        form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.DarkGreen;
+        logger.Info($"LM Studio committed transaction finalized after restart: id={transaction.TransactionId:N}, instance={patched.InstanceId}");
+        return true;
+    }
+
+    private async Task<bool> DetectLmStudioAuthenticationAsync(Uri endpoint)
+    {
+        var unauthenticated = new LmStudioClient(endpoint, null, httpClient);
+        ProviderProbeResult probe = await unauthenticated.ProbeAsync(lifetime.Token);
+        if (probe.RequiresAuthentication)
+        {
+            if (string.IsNullOrWhiteSpace(GetSecret(CredentialNames.LmStudio)))
+            {
+                throw new InvalidOperationException("LM Studio 需要 Token，但 Windows Credential Manager 中没有可用凭据。");
+            }
+
+            return true;
+        }
+
+        if (!probe.IsAvailable)
+        {
+            throw new InvalidOperationException("无法连接事务记录中的 LM Studio endpoint: " + probe.Summary);
+        }
+
+        return false;
+    }
+
+    private void EnsureNoPendingLmStudioRecovery()
+    {
+        if (lmStudioLifecycleBusy)
+        {
+            throw new InvalidOperationException("LM Studio 实例生命周期操作正在进行；请等待当前卸载、加载或恢复完成。");
+        }
+
+        if (lmStudioRecoveryPending)
+        {
+            throw new InvalidOperationException("存在未完成或回滚失败的 LM Studio 模板事务；请在 LM Studio 页使用“检查/恢复未完成事务”完成评估与恢复。");
+        }
+    }
+
+    private void SetLmStudioLifecycleBusy(bool busy)
+    {
+        Control[] lifecycleControls =
+        [
+            form.Current.RefreshButton,
+            form.Current.PreviewButton,
+            form.Current.SwitchButton,
+            form.Current.ProviderCombo,
+            form.Current.ModelCombo,
+            form.Current.ReasoningCombo,
+            form.Current.SecondaryPolicyCombo,
+            form.Current.SecondaryOverridesList,
+            form.LmStudio.DetectButton,
+            form.LmStudio.RefreshModelsButton,
+            form.LmStudio.RecoverTransactionButton,
+            form.LmStudio.EndpointText,
+            form.LmStudio.ModelCombo,
+            form.LmStudio.CodexContextInput,
+            form.LmStudio.AutoCompactInput,
+            form.LmStudio.GgufPathText,
+            form.LmStudio.BrowseGgufButton,
+            form.LmStudio.AnalyzeTemplateButton,
+            form.LmStudio.ExportTemplateButton,
+            form.LmStudio.CopyTemplateButton,
+            form.LmStudio.RecheckHierarchyButton,
+        ];
+
+        if (busy)
+        {
+            if (lmStudioLifecycleBusy)
+            {
+                return;
+            }
+
+            lmStudioLifecycleControlStates.Clear();
+            foreach (Control control in lifecycleControls)
+            {
+                lmStudioLifecycleControlStates[control] = control.Enabled;
+                control.Enabled = false;
+            }
+
+            lmStudioLifecycleBusy = true;
+        }
+        else
+        {
+            if (!lmStudioLifecycleBusy)
+            {
+                ApplyLmStudioRecoveryGate();
+                return;
+            }
+
+            lmStudioLifecycleBusy = false;
+            foreach ((Control control, bool enabled) in lmStudioLifecycleControlStates)
+            {
+                control.Enabled = enabled;
+            }
+
+            lmStudioLifecycleControlStates.Clear();
+        }
+
+        ApplyLmStudioRecoveryGate();
+    }
+
+    private void ApplyLmStudioRecoveryGate()
+    {
+        form.LmStudio.RecoverTransactionButton.Enabled = lmStudioRecoveryPending && !lmStudioLifecycleBusy;
+
+        if (lmStudioRecoveryPending || lmStudioLifecycleBusy)
+        {
+            form.Current.PreviewButton.Enabled = false;
+            form.Current.SwitchButton.Enabled = false;
+        }
     }
 
     private async Task<SwitchRequest> CreateRequestAsync()
@@ -784,15 +1495,25 @@ internal sealed class MainController : IDisposable
 
     private void DisplayHierarchyCompatibilityResult(IEnumerable<CompatibilityResult> results)
     {
-        CompatibilityResult? hierarchy = results.FirstOrDefault(item => item.Capability == "Codex Instruction Hierarchy");
+        CompatibilityResult[] resultArray = results.ToArray();
+        CompatibilityResult? hierarchy = resultArray.FirstOrDefault(item => item.Capability == "Codex Instruction Hierarchy");
         if (hierarchy is null)
         {
             return;
         }
 
+        bool templateUpgradeRequired = hierarchy.FailureCode == CompatibilityFailureCodes.LmStudioChatTemplateContinuationInstructionOrder;
         bool templateFixRequired = hierarchy.FailureCode is CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder or CompatibilityFailureCodes.LmStudioChatTemplateDeveloperRole;
-        form.LmStudio.HierarchyStatusValue.Text = hierarchy.Status == CompatibilityStatus.Supported ? "PASS" : templateFixRequired ? "Template Fix Required" : "FAILED";
+        form.LmStudio.HierarchyStatusValue.Text = hierarchy.Status == CompatibilityStatus.Supported
+            ? "PASS"
+            : templateUpgradeRequired
+                ? "Template Upgrade Required (v2 → v3)"
+                : templateFixRequired ? "Template Fix Required" : "FAILED";
         form.LmStudio.HierarchyStatusValue.ForeColor = hierarchy.Status == CompatibilityStatus.Supported ? Color.DarkGreen : Color.Firebrick;
+        DisplayCompatibilityProbeStep(form.LmStudio.BasicControlValue, resultArray, "Basic Control");
+        DisplayCompatibilityProbeStep(form.LmStudio.LeadingDeveloperValue, resultArray, "Leading Developer");
+        DisplayCompatibilityProbeStep(form.LmStudio.ConversationControlValue, resultArray, "Conversation Control");
+        DisplayCompatibilityProbeStep(form.LmStudio.ContinuationDeveloperValue, resultArray, "Continuation Developer");
         form.LmStudio.HierarchyDetailValue.Text = $"Failure Code: {hierarchy.FailureCode ?? "none"}。{hierarchy.Detail}";
     }
 
@@ -924,8 +1645,10 @@ internal sealed class MainController : IDisposable
         if (plan.LmStudioPreflight is CodexInstructionHierarchyProbeResult preflight)
         {
             builder.AppendLine().AppendLine("LM Studio Preflight:")
-                .Append("  Control: ").AppendLine(FormatProbeStatus(preflight.ControlPassed, preflight.ControlHttpStatus))
-                .Append("  Codex Instruction Hierarchy: ").AppendLine(FormatProbeStatus(preflight.HierarchyPassed, preflight.HierarchyHttpStatus));
+                .Append("  Basic Control: ").AppendLine(FormatProbeStatus(preflight.Control))
+                .Append("  Leading Developer: ").AppendLine(FormatProbeStatus(preflight.LeadingDeveloper))
+                .Append("  Conversation Control: ").AppendLine(FormatProbeStatus(preflight.ConversationControl))
+                .Append("  Continuation Developer: ").AppendLine(FormatProbeStatus(preflight.ContinuationDeveloper));
         }
 
         string text = services.Redactor.Redact(builder.ToString());
@@ -1017,11 +1740,50 @@ internal sealed class MainController : IDisposable
         catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
         {
         }
+        catch (LmStudioTemplateApplyException exception)
+        {
+            logger.LogError($"LM Studio runtime template repair failed; rollbackSucceeded={exception.Rollback.Succeeded}, transaction={Path.GetFileNameWithoutExtension(exception.Rollback.TransactionPath)}", exception.InnerException ?? exception);
+            form.LmStudio.RuntimeRepairStatusValue.Text = exception.Rollback.Succeeded ? "RolledBack — 修复失败，原实例已恢复" : "RollbackFailed — 需要恢复";
+            form.LmStudio.RuntimeRepairStatusValue.ForeColor = exception.Rollback.Succeeded ? Color.DarkGreen : Color.Firebrick;
+            if (!exception.Rollback.Succeeded)
+            {
+                lmStudioRecoveryPending = true;
+                ApplyLmStudioRecoveryGate();
+            }
+
+            var detail = new StringBuilder()
+                .AppendLine("LM Studio 运行时 Prompt Template 修复失败。")
+                .Append("请求阶段: ").AppendLine(exception.FailureStage.ToString())
+                .Append("REST load key: ").AppendLine(exception.Plan.OriginalInstance.SourceModelKey)
+                .Append("Expected variant: ").AppendLine(exception.Plan.OriginalInstance.SelectedVariant ?? "<unknown>");
+            if (exception.InnerException is LmStudioApiException apiException)
+            {
+                detail.AppendLine(FormatLmStudioApiFailure(apiException.Failure));
+            }
+            else if (exception.InnerException is not null)
+            {
+                detail.Append("原始错误: ").Append(exception.InnerException.GetType().Name).Append(": ").AppendLine(exception.InnerException.Message);
+            }
+
+            detail.AppendLine()
+                .AppendLine(exception.Rollback.Detail)
+                .Append("事务记录：").Append(exception.Rollback.TransactionPath);
+            MessageBox.Show(form, services.Redactor.Redact(detail.ToString()), "LM Studio 运行时模板修复失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
         catch (LmStudioCompatibilityException exception)
         {
             DisplayHierarchyProbe(exception.Result);
-            logger.Warning($"LM Studio compatibility blocked: code={exception.Result.FailureCode ?? CompatibilityFailureCodes.OtherProviderError}, control={exception.Result.ControlHttpStatus?.ToString(CultureInfo.InvariantCulture) ?? "none"}, hierarchy={exception.Result.HierarchyHttpStatus?.ToString(CultureInfo.InvariantCulture) ?? "none"}");
+            logger.Warning($"LM Studio compatibility blocked: code={exception.Result.FailureCode ?? CompatibilityFailureCodes.OtherProviderError}, control={Status(exception.Result.Control)}, leading={Status(exception.Result.LeadingDeveloper)}, conversation={Status(exception.Result.ConversationControl)}, continuation={Status(exception.Result.ContinuationDeveloper)}");
             MessageBox.Show(form, services.Redactor.Redact(exception.Message), "LM Studio Prompt Template 不兼容", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        catch (LmStudioApiException exception)
+        {
+            logger.LogError($"LM Studio API request failed: status={exception.Failure.HttpStatus}, type={exception.Failure.ErrorType ?? "none"}, code={exception.Failure.ErrorCode ?? "none"}", exception);
+            ModelProfile? selected = form.Current.ModelCombo.SelectedItem as ModelProfile;
+            string context = selected?.Provider == ProviderKind.LmStudio
+                ? $"请求阶段: preflight/schema\nREST load key: {selected.SourceModelKey ?? "<unknown>"}\nExpected variant: {selected.SelectedVariant ?? "<unknown>"}\n"
+                : string.Empty;
+            MessageBox.Show(form, services.Redactor.Redact(context + FormatLmStudioApiFailure(exception.Failure)), "LM Studio HTTP 请求失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
         catch (Exception exception)
         {
@@ -1044,7 +1806,45 @@ internal sealed class MainController : IDisposable
 
     private void InvalidatePreview() => lastPlan = null;
 
-    private static string FormatProbeStatus(bool passed, int? status) => $"{(passed ? "PASS" : "FAILED")} (HTTP {status?.ToString(CultureInfo.InvariantCulture) ?? "未返回"})";
+    private static string FormatProbeStatus(CodexInstructionProbeStepResult result) =>
+        $"{(result.Passed ? "PASS" : result.HttpStatus is null ? "NOT RUN" : "FAILED")} (HTTP {result.HttpStatus?.ToString(CultureInfo.InvariantCulture) ?? "未返回"})";
+
+    private static string Status(CodexInstructionProbeStepResult result) =>
+        $"{(result.Passed ? "PASS" : result.HttpStatus is null ? "NOT-RUN" : "FAIL")}/{result.HttpStatus?.ToString(CultureInfo.InvariantCulture) ?? "none"}";
+
+    private static void DisplayProbeStep(Label label, CodexInstructionProbeStepResult? result)
+    {
+        label.Text = result is null ? "NOT RUN" : FormatProbeStatus(result);
+        label.ForeColor = result is null ? Color.DarkOrange : result.Passed ? Color.DarkGreen : result.HttpStatus is null ? Color.DarkOrange : Color.Firebrick;
+    }
+
+    private static void DisplayCompatibilityProbeStep(
+        Label label,
+        IReadOnlyList<CompatibilityResult> results,
+        string capability)
+    {
+        CompatibilityResult? result = results.FirstOrDefault(item => item.Capability == capability);
+        if (result is null)
+        {
+            DisplayProbeStep(label, null);
+            return;
+        }
+
+        label.Text = $"{result.Status}: {result.Detail}";
+        label.ForeColor = result.Status switch
+        {
+            CompatibilityStatus.Supported => Color.DarkGreen,
+            CompatibilityStatus.Failed => Color.Firebrick,
+            _ => Color.DarkOrange,
+        };
+    }
+
+    private static string FormatLmStudioApiFailure(LmStudioApiFailure failure) =>
+        $"HTTP: {failure.HttpStatus.ToString(CultureInfo.InvariantCulture)}\n" +
+        $"error.type: {failure.ErrorType ?? "<none>"}\n" +
+        $"error.code: {failure.ErrorCode ?? "<none>"}\n" +
+        $"error.param: {failure.Parameter ?? "<none>"}\n" +
+        $"error.message: {failure.Message}";
 
     private void BeginInvokePreviewInvalidation()
     {

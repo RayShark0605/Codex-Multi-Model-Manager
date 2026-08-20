@@ -22,6 +22,7 @@ public sealed class AppPaths
         BinDirectory = Path.Combine(Root, "bin");
         TempDirectory = Path.Combine(Root, "temp");
         TemplateFixDirectory = Path.Combine(Root, "template-fixes");
+        TransactionsDirectory = Path.Combine(Root, "transactions");
     }
 
     public string Root { get; }
@@ -38,6 +39,8 @@ public sealed class AppPaths
 
     public string TemplateFixDirectory { get; }
 
+    public string TransactionsDirectory { get; }
+
     public void EnsureDirectories()
     {
         Directory.CreateDirectory(Root);
@@ -46,5 +49,6 @@ public sealed class AppPaths
         Directory.CreateDirectory(BinDirectory);
         Directory.CreateDirectory(TempDirectory);
         Directory.CreateDirectory(TemplateFixDirectory);
+        Directory.CreateDirectory(TransactionsDirectory);
     }
 }

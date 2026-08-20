@@ -1,4 +1,5 @@
 using System.Net;
+using System.Text.Json;
 using CodexModelManager.Core.Models;
 using CodexModelManager.Core.Providers;
 
@@ -14,18 +15,24 @@ public sealed class ResponsesCompatibilityTests
         {
             1 => StubHttpHandler.Json("{\"output\":[{\"type\":\"message\"}]}"),
             2 => StubHttpHandler.Json("{\"output\":[{\"type\":\"message\"}]}"),
-            3 => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("event: response.completed\ndata: {}\n") },
-            4 => StubHttpHandler.Json("{\"output\":[{\"type\":\"function_call\",\"name\":\"cmm_echo\",\"arguments\":\"{\\\"value\\\":\\\"CMM_TOOL_OK\\\"}\"}]}"),
-            5 => StubHttpHandler.Json("{\"output\":[{\"type\":\"reasoning\",\"summary\":[]}]}"),
+            3 => StubHttpHandler.Json("{\"output\":[{\"type\":\"message\"}]}"),
+            4 => StubHttpHandler.Json("{\"output\":[{\"type\":\"message\"}]}"),
+            5 => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("event: response.completed\ndata: {}\n") },
+            6 => StubHttpHandler.Json("{\"output\":[{\"type\":\"function_call\",\"name\":\"cmm_echo\",\"arguments\":\"{\\\"value\\\":\\\"CMM_TOOL_OK\\\"}\"}]}"),
+            7 => StubHttpHandler.Json("{\"output\":[{\"type\":\"reasoning\",\"summary\":[]}]}"),
             _ => throw new InvalidOperationException("Unexpected request."),
         }));
         var client = new ResponsesCompatibilityClient(http, new Uri("http://127.0.0.1:1234/"));
 
         CompatibilityReport report = await client.TestAsync(ProviderKind.LmStudio, "fixture", true);
 
-        Assert.Equal(5, request);
+        Assert.Equal(7, request);
         Assert.Equal(CompatibilityStatus.Supported, report.Results.Single(item => item.Capability == "Responses").Status);
         Assert.Equal(CompatibilityStatus.Supported, report.Results.Single(item => item.Capability == "Codex Instruction Hierarchy").Status);
+        Assert.Equal(CompatibilityStatus.Supported, report.Results.Single(item => item.Capability == "Basic Control").Status);
+        Assert.Equal(CompatibilityStatus.Supported, report.Results.Single(item => item.Capability == "Leading Developer").Status);
+        Assert.Equal(CompatibilityStatus.Supported, report.Results.Single(item => item.Capability == "Conversation Control").Status);
+        Assert.Equal(CompatibilityStatus.Supported, report.Results.Single(item => item.Capability == "Continuation Developer").Status);
         Assert.Equal(CompatibilityStatus.Supported, report.Results.Single(item => item.Capability == "Streaming").Status);
         Assert.Equal(CompatibilityStatus.Supported, report.Results.Single(item => item.Capability == "Tool Calling").Status);
         Assert.Equal(CompatibilityStatus.Supported, report.Results.Single(item => item.Capability == "Reasoning").Status);
@@ -40,8 +47,10 @@ public sealed class ResponsesCompatibilityTests
         {
             1 => StubHttpHandler.Json("{\"output\":[{\"type\":\"message\"}]}"),
             2 => StubHttpHandler.Json("{\"output\":[{\"type\":\"message\"}]}"),
-            3 => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("data: {}\n") },
-            4 => StubHttpHandler.Json("{\"output\":[{\"type\":\"message\",\"text\":\"cmm_echo CMM_TOOL_OK\"}]}"),
+            3 => StubHttpHandler.Json("{\"output\":[{\"type\":\"message\"}]}"),
+            4 => StubHttpHandler.Json("{\"output\":[{\"type\":\"message\"}]}"),
+            5 => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("data: {}\n") },
+            6 => StubHttpHandler.Json("{\"output\":[{\"type\":\"message\",\"text\":\"cmm_echo CMM_TOOL_OK\"}]}"),
             _ => throw new InvalidOperationException("Unexpected request."),
         }));
         var client = new ResponsesCompatibilityClient(http, new Uri("http://127.0.0.1:1234/"));
@@ -50,7 +59,7 @@ public sealed class ResponsesCompatibilityTests
 
         Assert.Equal(CompatibilityStatus.Failed, report.Results.Single(item => item.Capability == "Tool Calling").Status);
         Assert.Equal(CompatibilityStatus.Untested, report.Results.Single(item => item.Capability == "Reasoning").Status);
-        Assert.Equal(4, request);
+        Assert.Equal(6, request);
     }
 
     [Fact]
@@ -71,6 +80,10 @@ public sealed class ResponsesCompatibilityTests
         CompatibilityResult hierarchy = report.Results.Single(item => item.Capability == "Codex Instruction Hierarchy");
         Assert.Equal(CompatibilityStatus.Failed, hierarchy.Status);
         Assert.Equal(CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder, hierarchy.FailureCode);
+        Assert.Equal(CompatibilityStatus.Supported, report.Results.Single(item => item.Capability == "Basic Control").Status);
+        Assert.Equal(CompatibilityStatus.Failed, report.Results.Single(item => item.Capability == "Leading Developer").Status);
+        Assert.Equal(CompatibilityStatus.Untested, report.Results.Single(item => item.Capability == "Conversation Control").Status);
+        Assert.Equal(CompatibilityStatus.Untested, report.Results.Single(item => item.Capability == "Continuation Developer").Status);
         Assert.Equal(CompatibilityStatus.Failed, report.Results.Single(item => item.Capability == "Codex Agent").Status);
         Assert.Equal(CompatibilityStatus.Untested, report.Results.Single(item => item.Capability == "Streaming").Status);
         Assert.DoesNotContain(report.Results, item => item.Detail.Contains("Jinja Exception", StringComparison.Ordinal));
@@ -144,7 +157,7 @@ public sealed class ResponsesCompatibilityTests
     }
 
     [Fact]
-    public async Task ProbePayloadChangesOnlyByAddingDeveloperMessage()
+    public async Task FourStageProbeHasExpectedPlanToDefaultContinuationShape()
     {
         List<string> bodies = [];
         using var http = new HttpClient(new StubHttpHandler(request =>
@@ -157,11 +170,52 @@ public sealed class ResponsesCompatibilityTests
         CodexInstructionHierarchyProbeResult result = await probe.ProbeAsync("fixture");
 
         Assert.True(result.IsCompatible);
-        Assert.Equal(2, bodies.Count);
+        Assert.Equal(4, bodies.Count);
         Assert.DoesNotContain("\"role\":\"developer\"", bodies[0], StringComparison.Ordinal);
         Assert.Contains("\"role\":\"developer\"", bodies[1], StringComparison.Ordinal);
-        Assert.Contains("\"instructions\":", bodies[0], StringComparison.Ordinal);
-        Assert.Contains("\"instructions\":", bodies[1], StringComparison.Ordinal);
+        using JsonDocument conversation = JsonDocument.Parse(bodies[2]);
+        using JsonDocument continuation = JsonDocument.Parse(bodies[3]);
+        string[] conversationRoles = conversation.RootElement.GetProperty("input").EnumerateArray().Select(item => item.GetProperty("role").GetString()!).ToArray();
+        string[] continuationRoles = continuation.RootElement.GetProperty("input").EnumerateArray().Select(item => item.GetProperty("role").GetString()!).ToArray();
+        Assert.Equal(["developer", "user", "assistant", "user"], conversationRoles);
+        Assert.Equal(["developer", "user", "assistant", "developer", "user"], continuationRoles);
+        Assert.Equal(conversation.RootElement.GetProperty("instructions").GetString(), continuation.RootElement.GetProperty("instructions").GetString());
+    }
+
+    [Fact]
+    public async Task V2ContinuationFailureIsClassifiedOnlyAfterConversationControlPasses()
+    {
+        int request = 0;
+        using var http = new HttpClient(new StubHttpHandler(_ => ++request < 4
+            ? StubHttpHandler.Json("{\"output\":[]}")
+            : StubHttpHandler.Json("{\"error\":{\"message\":\"System and developer messages must precede conversation messages.\"}}", HttpStatusCode.InternalServerError)));
+        var probe = new CodexInstructionHierarchyProbe(http, new Uri("http://127.0.0.1:1234/"));
+
+        CodexInstructionHierarchyProbeResult result = await probe.ProbeAsync("fixture");
+
+        Assert.Equal(4, request);
+        Assert.True(result.Control.Passed);
+        Assert.True(result.LeadingDeveloper.Passed);
+        Assert.True(result.ConversationControl.Passed);
+        Assert.False(result.ContinuationDeveloper.Passed);
+        Assert.Equal(CompatibilityFailureCodes.LmStudioChatTemplateContinuationInstructionOrder, result.FailureCode);
+        Assert.False(result.IsCompatible);
+    }
+
+    [Fact]
+    public async Task ConversationControlFailureIsNotMisclassifiedAsContinuationOrder()
+    {
+        int request = 0;
+        using var http = new HttpClient(new StubHttpHandler(_ => ++request < 3
+            ? StubHttpHandler.Json("{\"output\":[]}")
+            : StubHttpHandler.Json("System and developer messages must precede conversation messages.", HttpStatusCode.InternalServerError)));
+        var probe = new CodexInstructionHierarchyProbe(http, new Uri("http://127.0.0.1:1234/"));
+
+        CodexInstructionHierarchyProbeResult result = await probe.ProbeAsync("fixture");
+
+        Assert.Equal(3, request);
+        Assert.Equal(CompatibilityFailureCodes.ResponsesConversationControlFailed, result.FailureCode);
+        Assert.Null(result.ContinuationDeveloper.HttpStatus);
     }
 
     [Theory]

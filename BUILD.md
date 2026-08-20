@@ -45,6 +45,23 @@ Remove-Item Env:CMM_RUN_LIVE_LM
 
 这会先发送 `instructions + user` 与 `instructions + developer + user` 差分请求。只有指令层级通过才继续发送带同样结构的 SSE 与 harmless dummy function schema；不会改变模型生命周期。若 native `/api/v1/models` 当前没有报告 `loaded_instances`，测试会明确 Skip，而不会把 `lms ps` 或理论模型列表猜作 Server loaded context。
 
+同一分类还会用 `lms ls --json --variants` 与 `~/.lmstudio/settings.json` 只读解析当前 `selected_variant` 的精确 GGUF，并核对量化、架构和可修补模板结构。
+
+### 显式 opt-in 的事务式 LM Studio 生命周期测试
+
+该测试会真实 unload/load 当前 LLM，必须先完全关闭 Codex，并只在准备接受一次模型重载时显式启用。测试捕获当前 native load config、注入运行时模板、要求 hierarchy PASS，随后在 `finally` 中卸载补丁实例并不带模板恢复原配置：
+
+```powershell
+$env:CMM_RUN_LIVE_LM_MUTATION='1'
+dotnet test .\tests\CodexModelManager.Tests\CodexModelManager.Tests.csproj `
+  --filter 'Category=LiveLmStudioMutation'
+Remove-Item Env:CMM_RUN_LIVE_LM_MUTATION
+```
+
+恢复事务记录写入 `%LOCALAPPDATA%\CodexModelManager\transactions`。若测试进程在重载窗口异常终止，先启动管理器并完成恢复对话框，不要直接重复运行。
+
+恢复与正常 load 都把 `/api/v1/models` 的源 `key` 发送为 `model`；`selected_variant` 只用于 Q8/Q6 等精确变体的前后验证。LM Studio 页的 **检查/恢复未完成事务** 会先执行只读评估并显示是否真的需要 unload/load，legacy journal 已经处于原始状态时可以零重载关闭。
+
 ### 只读 GGUF Prompt Template Live Test
 
 指定一个实际 GGUF 后，只读取 metadata header、校验 `tokenizer.chat_template` SHA、在 `%TEMP%` 导出修补工件并立即清理；不会读取 tensor、修改 GGUF 或修改 LM Studio：
@@ -58,7 +75,7 @@ Remove-Item Env:CMM_LIVE_GGUF_PATH
 Remove-Item Env:CMM_LIVE_GGUF_TEMPLATE_SHA -ErrorAction SilentlyContinue
 ```
 
-`CMM_LIVE_GGUF_TEMPLATE_SHA` 只是让测试确认“本次读取的实物仍是预期版本”，不会进入修补器的业务放行逻辑。最终审计已分别对本机 Qwen3.8 Q6_K、Q8_0 和 Qwen3.6 Q4_K_M 执行此只读测试；三个实物都能按 `qwen-leading-instructions-v2` 精确结构规则导出到临时目录并通过 manifest/hash 校验。
+`CMM_LIVE_GGUF_TEMPLATE_SHA` 只是让测试确认“本次读取的实物仍是预期版本”，不会进入修补器的业务放行逻辑。最终审计已分别对本机 Qwen3.8 Q6_K、Q8_0 和 Qwen3.6 Q4_K_M 执行此只读测试；三个实物都能按 `qwen-interleaved-instructions-v3` 精确结构规则导出到临时目录并通过 manifest/hash 校验。旧 `qwen-leading-instructions-v2` 仅作为已完成事务的精确 provenance、v2→v3 预览和确定性回滚格式保留。
 
 ### 隔离 Codex Agent Level 3
 

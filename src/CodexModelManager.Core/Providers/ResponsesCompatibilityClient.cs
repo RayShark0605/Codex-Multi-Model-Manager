@@ -44,13 +44,19 @@ public sealed class ResponsesCompatibilityClient
             results.Add(new CompatibilityResult(
                 "Codex Instruction Hierarchy",
                 hierarchy.IsCompatible ? CompatibilityStatus.Supported : CompatibilityStatus.Failed,
-                hierarchy.IsCompatible ? "instructions + developer + user 请求成功。" : hierarchy.Detail,
+                hierarchy.IsCompatible ? "Basic、前导 developer、多轮 control 与后置 developer 四阶段请求成功。" : hierarchy.Detail,
                 hierarchy.CheckedAt,
                 hierarchy.IsCompatible ? null : hierarchy.FailureCode));
+            AddProbeStep(results, "Basic Control", hierarchy.Control, hierarchy, hierarchy.CheckedAt);
+            AddProbeStep(results, "Leading Developer", hierarchy.LeadingDeveloper, hierarchy, hierarchy.CheckedAt);
+            AddProbeStep(results, "Conversation Control", hierarchy.ConversationControl, hierarchy, hierarchy.CheckedAt);
+            AddProbeStep(results, "Continuation Developer", hierarchy.ContinuationDeveloper, hierarchy, hierarchy.CheckedAt);
 
             if (!hierarchy.IsCompatible)
             {
-                bool templateFailure = hierarchy.FailureCode is CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder or CompatibilityFailureCodes.LmStudioChatTemplateDeveloperRole;
+                bool templateFailure = hierarchy.FailureCode is CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder or
+                    CompatibilityFailureCodes.LmStudioChatTemplateDeveloperRole or
+                    CompatibilityFailureCodes.LmStudioChatTemplateContinuationInstructionOrder;
                 string blocked = templateFailure
                     ? "被 Codex 指令层级模板错误阻止，未继续发送重复请求。"
                     : "基础 Responses/Codex 指令层级预检失败，未继续发送依赖请求。";
@@ -63,7 +69,7 @@ public sealed class ResponsesCompatibilityClient
                     results,
                     now,
                     CompatibilityStatus.Failed,
-                    "基础 Codex instructions/developer/user 请求失败，当前 loaded instance 无法启动可靠的 Codex Agent。",
+                    "四阶段 Codex 指令层级请求未全部通过，当前 loaded instance 无法启动可靠的 Codex Agent。",
                     hierarchy.FailureCode);
             }
 
@@ -185,6 +191,29 @@ public sealed class ResponsesCompatibilityClient
         {
             results.Add(new CompatibilityResult(capability, status, detail, now, failureCode));
         }
+    }
+
+    private static void AddProbeStep(
+        List<CompatibilityResult> results,
+        string capability,
+        CodexInstructionProbeStepResult step,
+        CodexInstructionHierarchyProbeResult hierarchy,
+        DateTimeOffset checkedAt)
+    {
+        CompatibilityStatus status = step.Passed
+            ? CompatibilityStatus.Supported
+            : step.HttpStatus is null ? CompatibilityStatus.Untested : CompatibilityStatus.Failed;
+        string detail = step.Passed
+            ? $"PASS（HTTP {step.HttpStatus}，响应包含 output 数组）。"
+            : step.HttpStatus is null
+                ? "前置阶段失败，未发送该请求。"
+                : $"FAILED（HTTP {step.HttpStatus}）。";
+        results.Add(new CompatibilityResult(
+            capability,
+            status,
+            detail,
+            checkedAt,
+            status == CompatibilityStatus.Failed ? hierarchy.FailureCode : null));
     }
 
     private static object[] CreateCodexShapedInput(string userText) =>
