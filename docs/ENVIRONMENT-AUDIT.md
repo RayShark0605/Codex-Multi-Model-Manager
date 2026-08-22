@@ -1,6 +1,16 @@
 # Environment Audit (redacted)
 
-审计时间：2026-08-18（Asia/Shanghai）。本文件不含完整配置、Token、Authorization、Cookie 或 `auth.json` 内容。
+审计时间：原始基线 2026-08-18；最新只读增量 2026-08-22（Asia/Shanghai）。本文件不含完整配置、Token、Authorization、Cookie 或 `auth.json` 内容。
+
+## 2026-08-22 Unsloth Q6_K_XL 只读增量
+
+- native `/api/v1/models` 权威快照：source/instance ID 均为 `qwen3.8-27b@q6_k_xl`，type `llm`，architecture `qwen35`，quantization `Q6_K_XL`，loaded context `161024`，Max `262144`，`selected_variant=null`。
+- `lms ls --json --variants` 只列出另一个 `qwen/qwen3.8-27b` Hub 家族，不能定位当前 Unsloth 文件；endpoint-aware `lms ps --json --host 127.0.0.1 --port 1234` 则唯一给出 publisher `unsloth` 与相对路径 `unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q6_K_XL.gguf`。新 locator 的现场断言确认 provenance 为 `lms ps --json`，但 instance/context/架构/量化仍以 native 为准。
+- 当前 GGUF 的 184 行 metadata Prompt Template 与运行模板证据 SHA 均为 `12827F24B742EA4E80CDC12DBCF9622227056B9F797252A3149263D4F9AAADCE`；新精确模板族可确定性生成 `qwen-interleaved-instructions-v3`，SHA 为 `9DC0DA000D1DF280BE9F6F64D314EB52879C0DF5C3C951F74105964136592F85`。业务放行依赖完整结构与 post-patch 复验，不依赖模型名或 SHA allowlist。
+- 修复前的已确认四阶段行为为 Basic/Leading/Conversation `200`，Continuation `500`，failure code `lmstudio-chat-template-system-order`；新 probe 文案会把它明确说明为“只接受开头连续指令、拒绝后置 developer”，而不是将重新检测本身显示成崩溃。
+- 两项现场测试仅执行 native/CLI/GGUF metadata 读取与临时目录导出，均 `1 PASS / 0 FAIL`。前后 loaded instance、真实 `config.toml`（5456 bytes，SHA-256 `68D514211B78B939C63D79802B03EB27539E2B021192A0420BBC522D3B4BDE96`）以及 12 个 transaction/lock 文件的名称、长度和 SHA 集合完全一致。证据：`artifacts/test-results/live-q6-k-xl-readonly-invariants.json`。
+- 本轮没有调用 `/load`、`/unload`，没有应用 Prompt Template，没有切换真实 Provider，也没有修改 GGUF、LM Studio settings、Credential Manager、真实 Codex 配置或既有 journal。post-patch 四阶段 PASS、真实 Codex Agent 与 Provider 切换保持 `Untested`。
+- GUI smoke 后续被用户明确叫停并判定为 `ABORTED_BY_USER / NOT PASS`：用户观察到重复错误框（疑似 Git 无法启动），且当前 Codex 正在运行。叫停后没有再次启动 `CodexModelManager.exe`；精确发布路径残留进程为 0，隔离 GUI 临时目录已清理，真实切换仍未执行。
 
 ## Codex
 

@@ -235,11 +235,16 @@ internal sealed class MainController : IDisposable
         UpdateLocalModelDetails();
         if (form.LmStudio.ModelCombo.SelectedItem is ModelProfile selectedModel)
         {
-            string? resolvedGguf = await LmStudioModelFileLocator.TryResolveAsync(selectedModel, lifetime.Token);
-            if (!string.IsNullOrWhiteSpace(resolvedGguf))
+            LmStudioModelFileResolutionAttempt resolutionAttempt = await services.ModelFileLocator
+                .ResolveAsync(selectedModel, endpoint, lifetime.Token);
+            if (resolutionAttempt.Succeeded && resolutionAttempt.Resolution is LmStudioModelFileResolution resolution)
             {
-                form.LmStudio.GgufPathText.Text = resolvedGguf;
-                form.LmStudio.TemplateStatusValue.Text = "已通过 lms ls --json --variants 解析精确 GGUF；请点击分析。";
+                form.LmStudio.GgufPathText.Text = resolution.FilePath;
+                form.LmStudio.TemplateStatusValue.Text = $"已通过 {resolution.Source} 解析精确 GGUF；请点击分析。";
+            }
+            else
+            {
+                form.LmStudio.TemplateStatusValue.Text = resolutionAttempt.Diagnostic + " 可继续使用手工选择 GGUF。";
             }
         }
 
@@ -522,14 +527,23 @@ internal sealed class MainController : IDisposable
         CodexInstructionHierarchyProbeResult result = await probe.ProbeAsync(current.Id, lifetime.Token);
         DisplayHierarchyProbe(result);
         logger.Info($"LM Studio instruction hierarchy: model={current.Id}, compatible={result.IsCompatible}, code={result.FailureCode ?? "none"}, control={Status(result.Control)}, leading={Status(result.LeadingDeveloper)}, conversation={Status(result.ConversationControl)}, continuation={Status(result.ContinuationDeveloper)}");
+        bool templateFixRequired = result.FailureCode is
+            CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder or
+            CompatibilityFailureCodes.LmStudioChatTemplateDeveloperRole or
+            CompatibilityFailureCodes.LmStudioChatTemplateContinuationInstructionOrder;
+        string message = result.IsCompatible
+            ? "Basic Control、Leading Developer、Conversation Control 与 Continuation Developer 四阶段均已通过。正式切换时仍会再次实时验证。"
+            : templateFixRequired
+                ? $"检测已正常完成，但当前运行时模板需要修复 [{result.FailureCode}]：{result.Detail}\n\n这不是“重新检测”操作崩溃。请在主页面点击 Preview Changes 查看只读模板修复计划；确认后再通过 Switch Model 进入事务修复。若已手工应用模板，请先卸载并重新加载模型。"
+                : $"检测失败 [{result.FailureCode ?? CompatibilityFailureCodes.OtherProviderError}]：{result.Detail}";
         MessageBox.Show(
             form,
+            message,
             result.IsCompatible
-                ? "Basic Control、Leading Developer、Conversation Control 与 Continuation Developer 四阶段均已通过。正式切换时仍会再次实时验证。"
-                : $"检测失败 [{result.FailureCode ?? CompatibilityFailureCodes.OtherProviderError}]：{result.Detail}\n\n若已应用兼容模板，请确认已经手动卸载并重新加载模型。",
-            result.IsCompatible ? "Codex 指令层级 PASS" : "Codex 指令层级 FAILED",
+                ? "Codex 指令层级 PASS"
+                : templateFixRequired ? "Template Fix Required" : "Codex 指令层级 FAILED",
             MessageBoxButtons.OK,
-            result.IsCompatible ? MessageBoxIcon.Information : MessageBoxIcon.Error);
+            result.IsCompatible ? MessageBoxIcon.Information : templateFixRequired ? MessageBoxIcon.Warning : MessageBoxIcon.Error);
     }
 
     private async Task<(GgufChatTemplateAnalysis Analysis, PromptTemplateRepairPreview Preview)> RevalidateTemplateAnalysisAsync(ModelProfile model)
@@ -899,7 +913,12 @@ internal sealed class MainController : IDisposable
             ?? throw new InvalidOperationException("所选 LM Studio loaded instance 已不在当前 native 模型快照中，请刷新。");
         LmStudioInstanceController controller = services.CreateLmStudioInstanceController(request.LmStudioEndpoint, request.LmStudioRequiresAuthentication);
         controller.ProgressChanged += OnLmStudioLifecycleProgress;
-        var planner = new LmStudioTemplateRepairPlanner(controller, services.GgufReader, services.TemplateRepair, services.TemplateTransactions);
+        var planner = new LmStudioTemplateRepairPlanner(
+            controller,
+            services.GgufReader,
+            services.TemplateRepair,
+            services.TemplateTransactions,
+            services.ModelFileLocator);
         form.LmStudio.RuntimeRepairStatusValue.Text = "Planning — 捕获实例并分析精确 GGUF";
         form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.DarkOrange;
         LmStudioTemplateRepairPlan plan = await planner.CreatePlanAsync(selected, failure, lifetime.Token);

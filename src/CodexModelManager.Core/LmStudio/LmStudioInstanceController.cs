@@ -1021,6 +1021,12 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
         CodexInstructionHierarchyProbeResult result,
         LmStudioTemplateTransactionRecord record)
     {
+        if (record.SchemaVersion >= 3)
+        {
+            return record.OriginalHierarchyProbe is not null &&
+                SameProbeSignature(result, record.OriginalHierarchyProbe);
+        }
+
         if (record.OriginalRuntimeTemplateMode == LmStudioRuntimeTemplateMode.ManagerRule)
         {
             return record.OriginalRuntimeRuleVersion == PromptTemplateRepairService.LegacyLeadingRuleVersion &&

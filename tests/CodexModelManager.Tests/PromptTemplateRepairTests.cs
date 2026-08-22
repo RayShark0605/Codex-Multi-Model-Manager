@@ -184,6 +184,110 @@ public sealed class PromptTemplateRepairTests
     }
 
     [Fact]
+    public void PrefixMergedSystemTemplateGetsExactInterleavedV3Patch()
+    {
+        string source = ReadPrefixMergedSystemFixture();
+        Assert.Equal(
+            "12827F24B742EA4E80CDC12DBCF9622227056B9F797252A3149263D4F9AAADCE",
+            Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(source))));
+        var service = new PromptTemplateRepairService();
+
+        PromptTemplateRepairPreview preview = service.CreatePreview(Analysis(source));
+
+        Assert.Equal(PromptTemplateRepairStatus.Supported, preview.Status);
+        Assert.Equal(
+            "9DC0DA000D1DF280BE9F6F64D314EB52879C0DF5C3C951F74105964136592F85",
+            preview.PatchedTemplateSha256);
+        string patched = Assert.IsType<string>(preview.PatchedTemplate);
+        Assert.Contains("CMM-CODEX-INSTRUCTION-HIERARCHY qwen-interleaved-instructions-v3", patched, StringComparison.Ordinal);
+        Assert.Contains("for instruction in messages", patched, StringComparison.Ordinal);
+        Assert.Contains("instruction.role == 'system' or instruction.role == 'developer'", patched, StringComparison.Ordinal);
+        Assert.Contains("cmm_instruction_state.text + ('\\n\\n' if cmm_instruction_state.text else '')", patched, StringComparison.Ordinal);
+        Assert.Contains("if message.role == \"system\" or message.role == \"developer\"", patched, StringComparison.Ordinal);
+        Assert.Contains("set content = ''", patched, StringComparison.Ordinal);
+        Assert.DoesNotContain("sysns.count == loop.index0", patched, StringComparison.Ordinal);
+        Assert.DoesNotContain("loop.index0 >= num_sys", patched, StringComparison.Ordinal);
+        Assert.DoesNotContain("System message must be at the beginning.", patched, StringComparison.Ordinal);
+        Assert.Contains("for message in messages[::-1]", patched, StringComparison.Ordinal);
+        Assert.Contains("<|vision_start|><|image_pad|><|vision_end|>", patched, StringComparison.Ordinal);
+        Assert.Contains("message.reasoning_content is string", patched, StringComparison.Ordinal);
+        Assert.Contains("message.tool_calls and message.tool_calls is iterable", patched, StringComparison.Ordinal);
+        Assert.Contains("<tool_response>", patched, StringComparison.Ordinal);
+        Assert.Contains("if add_generation_prompt", patched, StringComparison.Ordinal);
+        Assert.Equal(
+            patched,
+            service.RecreateKnownTemplate(Analysis(source), PromptTemplateRepairService.CurrentRuleVersion, preview.PatchedTemplateSha256!));
+        Assert.Equal(PromptTemplateRepairStatus.AlreadyCompatible, service.CreatePreview(Analysis(patched)).Status);
+    }
+
+    [Fact]
+    public void PrefixMergedSystemTemplatePreservesCrLfAndRejectsMixedNewLines()
+    {
+        string source = ReadPrefixMergedSystemFixture();
+        string crLf = source.Replace("\n", "\r\n", StringComparison.Ordinal);
+        var service = new PromptTemplateRepairService();
+
+        PromptTemplateRepairPreview preview = service.CreatePreview(Analysis(crLf));
+        PromptTemplateRepairPreview mixed = service.CreatePreview(Analysis(crLf + "\nlone"));
+
+        Assert.Equal(PromptTemplateRepairStatus.Supported, preview.Status);
+        Assert.DoesNotContain("\n", preview.PatchedTemplate!.Replace("\r\n", string.Empty, StringComparison.Ordinal), StringComparison.Ordinal);
+        Assert.Equal(PromptTemplateRepairStatus.Unsupported, mixed.Status);
+        Assert.Null(mixed.PatchedTemplate);
+    }
+
+    [Fact]
+    public void EveryPrefixMergedSystemStructuralNearMatchRemainsUnsupported()
+    {
+        string source = ReadPrefixMergedSystemFixture();
+        (string Anchor, string Replacement)[] mutations =
+        [
+            ("macro render_content(content, do_vision_count, is_system_content=false)", "macro render_content(content, do_vision_count, is_system_content=true)"),
+            ("sysns.count == loop.index0", "sysns.count <= loop.index0"),
+            ("set merged_system = sysns.text", "set merged_system = sysns.text|trim"),
+            ("if tools and tools is iterable and tools is not mapping", "if tools and tools is iterable"),
+            ("for message in messages[::-1]", "for message in messages|reverse"),
+            ("loop.index0 >= num_sys", "loop.index0 > num_sys"),
+            ("System message must be at the beginning.", "System message must remain first."),
+            ("elif message.role == \"user\"", "elif message.role == \"human\""),
+            ("elif message.role == \"assistant\"", "elif message.role == \"model\""),
+            ("elif message.role == \"tool\"", "elif message.role == \"function\""),
+            ("<|vision_start|><|image_pad|><|vision_end|>", "<|vision_start|><|image|><|vision_end|>"),
+            ("message.reasoning_content is string", "message.reasoning_content is defined"),
+            ("message.tool_calls and message.tool_calls is iterable", "message.tool_calls and message.tool_calls is sequence"),
+            ("if add_generation_prompt", "if add_generation_prompt is true"),
+            ("Unsloth fixes - developer role, merged system messages, tool calling", "changed non-target footer"),
+        ];
+        var service = new PromptTemplateRepairService();
+
+        foreach ((string anchor, string replacement) in mutations)
+        {
+            string mutated = source.Replace(anchor, replacement, StringComparison.Ordinal);
+            Assert.NotEqual(source, mutated);
+            PromptTemplateRepairPreview preview = service.CreatePreview(Analysis(mutated));
+            Assert.True(
+                preview.Status == PromptTemplateRepairStatus.Unsupported,
+                $"Near-match anchor unexpectedly passed: {anchor}");
+            Assert.Null(preview.PatchedTemplate);
+        }
+    }
+
+    [Fact]
+    public void GeneratedPrefixMergedSystemV3RejectsNonTargetBranchMutation()
+    {
+        var service = new PromptTemplateRepairService();
+        PromptTemplateRepairPreview generated = service.CreatePreview(Analysis(ReadPrefixMergedSystemFixture()));
+        string mutated = generated.PatchedTemplate!.Replace(
+            "<tool_response>",
+            "<changed_tool_response>",
+            StringComparison.Ordinal);
+
+        PromptTemplateRepairPreview preview = service.CreatePreview(Analysis(mutated));
+
+        Assert.Equal(PromptTemplateRepairStatus.Unsupported, preview.Status);
+        Assert.Null(preview.PatchedTemplate);
+    }
+    [Fact]
     public async Task ExportWritesAuditableArtifactsWithoutAbsoluteSourcePathOrSecrets()
     {
         using var temporary = new TemporaryDirectory();
@@ -276,6 +380,8 @@ public sealed class PromptTemplateRepairTests
         Assert.DoesNotContain(Path.GetDirectoryName(path!)!, manifest, StringComparison.OrdinalIgnoreCase);
     }
 
+    private static string ReadPrefixMergedSystemFixture() => File.ReadAllText(
+        Path.Combine(AppContext.BaseDirectory, "Fixtures", "unsloth-qwen3.8-prefix-template.jinja"));
     private static GgufChatTemplateAnalysis Analysis(string template) => new(
         "C:\\fixture\\model.gguf",
         "model.gguf",

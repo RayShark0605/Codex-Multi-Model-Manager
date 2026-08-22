@@ -80,9 +80,15 @@ public sealed class LiveLmStudioIntegrationTests
             .FirstOrDefault(model => model.IsLoaded == true && model.ModelType == "llm");
         Assert.NotNull(loaded);
 
-        LmStudioModelFileResolution? resolution = await LmStudioModelFileLocator.TryResolveDetailedAsync(loaded, TestContext.Current.CancellationToken);
+        var locator = new LmStudioModelFileLocator();
+        LmStudioModelFileResolutionAttempt attempt = await locator.ResolveAsync(
+            loaded,
+            new Uri("http://127.0.0.1:1234"),
+            TestContext.Current.CancellationToken);
 
-        Assert.NotNull(resolution);
+        Assert.True(attempt.Succeeded, attempt.Diagnostic);
+        LmStudioModelFileResolution resolution = Assert.IsType<LmStudioModelFileResolution>(attempt.Resolution);
+        Assert.Equal("lms ps --json", resolution.Source);
         Assert.True(File.Exists(resolution.FilePath));
         Assert.Equal(loaded.SourceModelKey, resolution.SourceModelKey, ignoreCase: true);
         Assert.Equal(loaded.SelectedVariant, resolution.SelectedVariant, ignoreCase: true);

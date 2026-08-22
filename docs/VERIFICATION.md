@@ -1,106 +1,172 @@
 # Final Verification
 
-验证日期：2026-08-20（Asia/Shanghai）。自动写入测试全部使用临时目录；发布版 GUI smoke 同时设置随机临时 `CODEX_HOME` 与 `CMM_LOCALAPPDATA_OVERRIDE`。真实 LM Studio 只执行 native list、四阶段 Responses、随机不存在模型的 `prompt_template` schema probe 与 GGUF metadata 读取；没有执行真实 unload/load，也没有修改用户 Codex 配置或现有 transaction journal。
+验证日期：2026-08-22（Asia/Shanghai）。
 
-## Build / test / static checks
+## 验证边界
+
+本轮交付严格遵守只读现场边界：
+
+- 没有调用 LM Studio `/load` 或 `/unload`；
+- 没有把兼容 Prompt Template 应用到正在运行的实例；
+- 没有写入 `C:\Users\xr\.codex\config.toml`；
+- 没有切换真实 Codex Provider；
+- 没有修改 GGUF、LM Studio settings、Credential Manager 或既有 transaction journal；
+- 现场验证仅包括 native/CLI 状态读取、GGUF metadata 读取、临时目录模板导出和文件指纹比较。
+
+用户明确要求停止运行 `CodexModelManager.exe` 后，本轮没有再次启动该程序。GUI smoke 不计为 PASS，详见“GUI 验证状态”。
+
+## 构建、测试与静态检查
 
 | 检查 | 结果 |
 |---|---|
-| Release solution build | PASS，0 warning / 0 error |
-| xUnit solution | 163 total：156 PASS / 0 FAIL / 7 SKIP |
-| 普通测试结果 | `artifacts\test-results\final-v3-postdocs-tests.trx` |
+| 修改前基线 | 163 total：156 PASS / 0 FAIL / 7 opt-in SKIP |
+| 修改后 Release 测试 | 197 total：190 PASS / 0 FAIL / 7 opt-in SKIP |
+| 最终 TRX | `artifacts\test-results\final-q6-k-xl-offline.trx` |
+| Release publish | PASS，0 warning / 0 error |
 | `dotnet format --verify-no-changes --no-restore` | PASS |
 | `git diff --check` | PASS |
-| NuGet `--vulnerable --include-transitive` | 5 个项目均未报告已知 vulnerable package |
-| 生产代码 Secret 形态扫描 | 0 hit；测试中的 `sk-...fixture` 仅为脱敏测试值 |
-| 变更源码 TODO/FIXME/HACK/NotImplemented/Console 调试扫描 | 0 hit |
-| 模板正文日志扫描 | 0 hit；日志只记录阶段、实例/变体与短哈希 |
+| 生产源码敏感信息形态扫描 | 0 hit |
+| 变更生产源码调试标记扫描 | 0 hit |
 
-七个普通运行中跳过的测试均为显式 opt-in：三个 `LiveLmStudio` 只读用例、一个只读 incomplete-journal 用例、一个 `LiveLmStudioMutation` 生命周期用例、一个 `LiveCodexSmoke` 和一个指定实物路径的 `LiveGguf`。随后显式执行了安全的只读部分：
+七个 SKIP 均为显式 opt-in 的现场测试，不会在普通回归中执行真实生命周期或真实 Codex Agent 操作。
 
-- `LiveLmStudio`：3 PASS / 0 FAIL / 1 SKIP，最终结果为 `artifacts\test-results\live-lm-v3-readonly-final.trx`；唯一 SKIP 是当前没有 incomplete journal。
-- Qwen3.8 Q6_K、Qwen3.8 Q8_0、Qwen3.6 Q4_K_M 三个实物 GGUF 各 1 PASS / 0 FAIL，结果分别为 `live-gguf-v3-qwen38-q6.trx`、`live-gguf-v3-qwen38-q8.trx`、`live-gguf-v3-qwen36-q4.trx`。
+### 自动化覆盖
 
-非 live 回归除既有 Provider/TOML/backup/secondary override/Responses/SSE/tool/GGUF 安全矩阵外，本轮新增或强化：
+#### GGUF 定位器
 
-- 四阶段请求体严格为 Basic、Leading Developer、Conversation Control、Continuation Developer；步骤 3/4 的唯一输入差异是最后一个 user 前是否插入后置 developer。
-- HTTP 200 但没有 JSON `output` 数组仍判失败；前置阶段失败后不发送后续请求。
-- v2 的 `200 / 200 / 200 / 500` 精确分类为 `lmstudio-chat-template-continuation-instruction-order`；Conversation Control 自身失败不会误归类。
-- `ResponsesCompatibilityClient` 只有四阶段全部 PASS 才继续 streaming/tool/reasoning，并把四项独立状态暴露给 UI。
-- v3 对完整 messages 收集所有 system/developer，保持相对顺序与双换行；reasoning 前缀及 tools/user/assistant/tool/reasoning sentinel 均保留。
-- v3 主 conversation 循环在调用 `render_content` 前显式跳过已合并的 system/developer，避免重复输出及 vision 计数等隐藏副作用。
-- 原始 Qwen、精确 v2、精确 v3、未知 Marker、混合换行和未知结构的保守分类；v2/v3 确定性重建必须满足预期 SHA-256。
-- v2→v3 只有在 completed v2 journal、instance/config/variant、GGUF 指纹、行为签名与 v2 SHA 共同匹配时才允许进入 unload 前阶段。
-- journal schema v3 保存 BuiltIn/ManagerRule provenance、原/目标规则、哈希、evidence transaction 与原四阶段摘要；schema v1/v2 继续只读兼容。
-- v3 load 或验证失败时恢复确定性 v2 对象模板，而非错误恢复内置模板；恢复必须重新得到 v2 的前三项 PASS/Continuation 精确失败。
-- 崩溃恢复覆盖无实例、已知补丁、多实例歧义、响应缺 ID、状态漂移和同 ID 已恢复 v2；最后一种只关闭 journal，零 unload/load。
-- 任一四阶段未全 PASS 时，Codex 配置写入次数为零。
+新增 endpoint-aware 的 `ILmStudioModelFileLocator.ResolveAsync(ModelProfile, Uri, CancellationToken)` 和结构化 `LmStudioModelFileResolutionAttempt`。定位器专项测试覆盖：
 
-## Real LM Studio read-only verification
+- 当 `lms ls --json --variants` 完全没有 Unsloth 模型时，仍可由 `lms ps --json --host <host> --port <port>` 唯一定位当前 Q6_K_XL；
+- native loaded instance 的 identifier/source、type、architecture、quantization、context 与 CLI 候选逐项一致；
+- publisher/source 等价匹配，同时支持 native source key 不带 publisher 的现场形状；
+- 路径必须位于配置的 downloads/models 根目录，必须真实存在且扩展名严格为 `.gguf`；
+- source、identifier、publisher、架构、量化、context、文件类型、文件存在性、路径越界、重复候选和 `lms ls`/`lms ps` 冲突全部 fail closed；
+- 非 loopback endpoint、CLI 不存在、启动失败、超时、输出过大、非法 JSON、无匹配和歧义返回稳定脱敏诊断；
+- 任一 CLI 数据面失败不会被另一个数据面的表面成功掩盖；
+- 不把 CLI/native 的 size 与单个 GGUF 文件长度强制相等。
 
-最终只读复核时 LM Studio 0.4.21 的 authoritative native 状态：
+#### Prompt Template
 
-- instance ID / source model key：`qwen/qwen3.8-27b`
-- selected variant：`qwen/qwen3.8-27b@q6_k`
-- architecture / quantization：`qwen35` / `Q6_K`
-- actual loaded context：`70144`
-- completed v2 provenance：`595a50afb4d342098626100d577aaa08`，旧规则 `qwen-leading-instructions-v2`
+新增当前 184 行 Unsloth prefix-merged-system 模板的独立精确结构族：
 
-对当前 v2 运行时的实时四阶段证据：
+- 源 fixture：`src\CodexModelManager.Core\LmStudio\Templates\qwen-prefix-merged-system-source.jinja`；
+- 源模板 SHA-256：`12827F24B742EA4E80CDC12DBCF9622227056B9F797252A3149263D4F9AAADCE`；
+- 确定性 `qwen-interleaved-instructions-v3` SHA-256：`9DC0DA000D1DF280BE9F6F64D314EB52879C0DF5C3C951F74105964136592F85`。
 
-| 阶段 | HTTP | `output` 数组 | 判定 |
-|---|---:|---:|---|
-| Basic Control | 200 | Yes | PASS |
-| Leading Developer | 200 | Yes | PASS |
-| Conversation Control | 200 | Yes | PASS |
-| Continuation Developer | 500 | No | FAILED |
+规则不按模型名称或 SHA allowlist 放行，而是要求 canonical fixture 与全部关键结构唯一、完整匹配。测试覆盖：
 
-最终失败码为 `lmstudio-chat-template-continuation-instruction-order`，`IsCompatible=false`。这证明旧 v2 能通过前导与普通多轮请求，但仍会在 Plan→Default 一类后置 developer 更新处于 Jinja 渲染阶段失败。
+- 任意位置、多次交错的 system/developer 按原始顺序收集，以双换行合并为唯一初始 system block；
+- 主 conversation 循环跳过所有已合并指令，并且不会先调用 `render_content`；
+- tools、vision、reasoning、反向扫描、user、assistant、tool response、tool-call 和 generation-prompt 分支保持不变；
+- generation 确定、可重建并带 v3 marker；
+- CRLF 可按受控规范处理，混合换行拒绝；
+- 每个关键锚点的 one-change near-match、重复锚点和非目标分支变化均返回 `Unsupported Template`；
+- patch 后再次执行完整 canonical 与结构复验。
 
-不含任何 Prompt/错误正文的最终结构化现场证据保存为 `artifacts\test-results\live-lm-v3-probe-final.json`；捕获时间为 `2026-08-20T22:19:16.6264461+08:00`。
+#### 探测、provenance 与恢复
 
-只读 live planner 进一步证明：当前 instance ID、Q6_K variant、70144 context、完整 load config、Q6_K GGUF 指纹、completed journal 与确定性 v2 SHA 全部匹配，可创建 `ManagerRule/v2 → v3` 升级计划；计划前后 loaded instance ID 集合不变，没有新增 journal，也没有 unload/load。
+- failure code 继续使用 `lmstudio-chat-template-system-order`；
+- Leading Developer 阶段失败会说明“前导独立指令被拒绝”；
+- Continuation Developer 阶段失败会说明“模板只接受开头连续指令、拒绝对话中的后置 developer”；
+- 当前 BuiltIn provenance 只接受精确四阶段形状：Basic、Leading、Conversation 均 PASS，Continuation 以 system-order 签名失败；
+- Preview 只生成计划；fake locator/controller 测试确认 Preview 前后无 journal、无 unload/load、无配置写入；
+- schema 3 恢复必须比较完整四阶段结果与 failure code；schema 1/2 只保留兼容读取，不降低 schema 3 验证强度；
+- 旧 `qwen-leading-instructions-v2` 升级和恢复路径继续独立测试。
 
-随机不存在 model key 的 schema probe 返回预期 `404/model_not_found`，证明当前 0.4.21 运行时接受顶层对象形态 `prompt_template` 并已越过请求 schema。它不是模板生效证明；正式流程仍以 load response、native config 复核与四阶段最终 PASS 为准。
+## 当前 Q6_K_XL 的只读现场验证
 
-## Prompt Template verification
+### native 权威快照
 
-| GGUF | Source SHA-256 | v2 SHA-256 | v3 SHA-256 |
-|---|---|---|---|
-| Qwen3.8-27B Q6_K | `C3CF9E34ABF4F9E36C2D72165AA9C132D3E2A725B6C2586AAA3A8AF9D7A81041` | `AA8741EB5D416E5E481B8E3BFE530CEEC25A005B1CCD384E6670FEA51B147531` | `4AA5CC42C084FCC8235AAF0500835F4F9419A72280EA7E02D08EEE9A97807D8B` |
-| Qwen3.8-27B Q8_0 | `C3CF9E34ABF4F9E36C2D72165AA9C132D3E2A725B6C2586AAA3A8AF9D7A81041` | `AA8741EB5D416E5E481B8E3BFE530CEEC25A005B1CCD384E6670FEA51B147531` | `4AA5CC42C084FCC8235AAF0500835F4F9419A72280EA7E02D08EEE9A97807D8B` |
-| Qwen3.6-35B-A3B Q4_K_M | `E84F32A23FDDA27689F868AA4A1A5621F41133E51A48D7F3EFCBEA2839574259` | `9E6CDDF08965594E25EE1678C9E823BB6413F51847964D3FD0A84DF1E14A2D73` | `235C3E8D316D80E23827174F1A8CEF37B1E5018CF70ED8F52F2C6FB9C0E233CD` |
+| 字段 | 现场值 |
+|---|---|
+| instance ID | `qwen3.8-27b@q6_k_xl` |
+| native source key | `qwen3.8-27b@q6_k_xl` |
+| type | `llm` |
+| architecture | `qwen35` |
+| quantization | `Q6_K_XL` |
+| loaded context | `161024` |
+| model max context | `262144` |
+| selected variant | `null` |
 
-三项均仅读取 GGUF v3 metadata header。SHA 只用于实物/事务身份与漂移检测，业务放行仍要求模板锚点精确且唯一匹配，并在运行时完成四阶段探测。
+native `/api/v1/models` 仍是 loaded instance 和实际 context 的权威来源。`lms ps` 只贡献文件位置证据，不反向覆盖 native 状态。
 
-## Published artifacts
+### 精确文件解析
 
-目录：`D:\MyProjects\Codex Multi-Model Manager\artifacts\publish\win-x64`
+`lms ps --json --host 127.0.0.1 --port 1234` 唯一解析到：
+
+`J:\LM Studio Models\unsloth\Qwen3.8-27B-GGUF\Qwen3.8-27B-UD-Q6_K_XL.gguf`
+
+解析 provenance 为 `lms ps --json`。`lms ls --json --variants` 没有当前 Unsloth 文件，但仍保留为 Hub variant 数据面。
+
+### 两项只读 live 测试
+
+| 测试 | 结果 | TRX |
+|---|---|---|
+| 当前 loaded instance 精确定位 | 1 PASS / 0 FAIL | `artifacts\test-results\live-q6-k-xl-locator.trx` |
+| 当前 GGUF 模板识别与临时导出 | 1 PASS / 0 FAIL | `artifacts\test-results\live-q6-k-xl-template.trx` |
+
+完整 before/after 证据保存为：
+
+`artifacts\test-results\live-q6-k-xl-readonly-invariants.json`
+
+其中确认：
+
+- loaded instance 完整快照前后相同；
+- 真实 Codex 配置前后均为 5456 bytes，SHA-256 均为 `68D514211B78B939C63D79802B03EB27539E2B021192A0420BBC522D3B4BDE96`；
+- 12 个 transaction/lock 文件的名称、长度和 SHA 集合前后完全相同；
+- `lifecycle_mutation_executed=false`；
+- `codex_provider_switch_executed=false`。
+
+## GUI 验证状态
+
+**状态：`ABORTED_BY_USER / NOT PASS`。**
+
+用户现场观察到每次运行 `CodexModelManager.exe` 都会弹出错误框，其中疑似包含 Git 无法启动的信息；同时当前 Codex 正在运行，本来就不满足真实切换的执行条件。按照用户的明确要求：
+
+- 不再启动 `CodexModelManager.exe`；
+- 不再尝试 GUI 自动化；
+- 不把先前任何不完整 UI 观察记作 GUI smoke PASS；
+- 没有点击 `Switch Model`；
+- 没有执行真实 Provider 切换；
+- 已确认精确发布路径的 `CodexModelManager.exe` 剩余进程数为 0；
+- 已清理本轮遗留的隔离 GUI 临时目录。
+
+结构化记录：
+
+`artifacts\test-results\gui-smoke-q6-k-xl.json`
+
+该记录明确设置 `accepted_as_pass=false`。疑似 Git 启动错误没有通过再次运行 EXE 复现，因此保持“未复现、未解决”，不会误报为已修复。对 `src`/`tests` 的 C# 静态搜索没有发现直接以 `ProcessStartInfo` 启动 `git`/`git.exe` 的代码路径；这只能排除直接调用，不能替代弹窗和日志证据。
+
+## 发布工件
+
+发布目录：
+
+`D:\MyProjects\Codex Multi-Model Manager\artifacts\publish\win-x64`
 
 | 文件 | Bytes | SHA-256 | File version |
 |---|---:|---|---|
-| `CodexModelManager.exe` | 71,957,186 | `EF1C506359C07AAFCF8478E387A759AE0286622479F559E1BF8E71F75981B320` | `1.0.0.0` |
-| `helpers\credential\CodexModelManager.CredentialHelper.exe` | 35,424,843 | `DBD79E6584D4DF546BEA04E6CB4B296BF5C2107BE87A56537B50D90D1F4CC67F` | `1.0.0.0` |
-| `helpers\mcp\CodexModelManager.TestMcpServer.exe` | 35,092,453 | `91345B6E9480E045AD4232B2721C3206EF27ABEFAC0AF900452EDC0F31A9294A` | `1.0.0.0` |
+| `CodexModelManager.exe` | 71,985,490 | `285CFF43A05207A8626847312F691FAE076057FC01429925E83CBBEC8B8EA317` | `1.0.0.0` |
+| `helpers\credential\CodexModelManager.CredentialHelper.exe` | 35,440,135 | `30BB244935D434678A8A2A4E1A9E38E4940F67A1B3587D32543524C6A4F52C9C` | `1.0.0.0` |
+| `helpers\mcp\CodexModelManager.TestMcpServer.exe` | 35,092,602 | `6BF33CCEE6EF52B9BA752B5C63A168FF0952BBA07F998595947A7CBAE137C871` | `1.0.0.0` |
 
-发布参数为 `win-x64`、self-contained、single-file、`PublishTrimmed=false`。`publish.ps1` 在测试/发布前显式清除所有 live/mutation opt-in 环境变量，因此发布过程不会误触真实 LM Studio 生命周期。
+以上文件已经重新发布，但本轮在用户叫停后没有执行主程序。
 
-## Runtime smoke
+## 最终验收结论
 
-- 隐藏启动最终发布 EXE：进程存活，UI thread `Responding=true`。
-- 隔离 `config.toml` 启动前后 SHA 均为 `ABC8B19D3F5D195DB674FA4CBA5C9065201B09706D37FAD4819BE7F6044AFCBB`。
-- 隔离 appsettings、Initial Snapshot 与 `transactions` 目录创建成功，incomplete transaction 数为 0；仅停止本次精确 PID，并在绝对路径校验后删除随机临时目录。
-- GUI smoke：`artifacts\test-results\gui-smoke-v3.json`。
-- Credential Helper 非法参数契约：exit 2、stdout 0 bytes、stderr 0 bytes。
-- MCP Helper：`initialize`、`tools/list`、`tools/call(cmm_ping)` 均有效，返回 `CMM_PONG`，exit 0、stderr 0 bytes。
-- Helper smoke：`artifacts\test-results\helper-smoke-v3.json`。
+| 目标 | 状态 |
+|---|---|
+| Q6_K_XL 精确 GGUF 自动定位 | **PASS（源码、自动化、只读 live）** |
+| 当前 Unsloth 184 行模板精确识别 | **PASS（源码、自动化、只读 live）** |
+| 确定性 v3 模板生成与临时导出 | **PASS（源码、自动化、只读 live）** |
+| Continuation Developer 准确分类和说明 | **PASS（自动化）** |
+| BuiltIn provenance / schema 3 完整恢复签名 | **PASS（自动化）** |
+| Preview 无生命周期副作用 | **PASS（fake controller 自动化）** |
+| 发布构建 | **PASS** |
+| GUI smoke | **ABORTED_BY_USER / NOT PASS** |
+| 疑似 Git 启动错误 | **Untested / Unresolved（禁止再次启动 EXE）** |
+| 把 v3 模板应用到真实 LM Studio 实例 | **Untested** |
+| post-patch 四阶段 runtime PASS | **Untested** |
+| 真实 Codex Agent | **Untested** |
+| 真实 Codex Provider 切换 | **Untested** |
 
-MCP helper 的 `CMM_PONG` 仅验证发布 helper 协议，不等同于“Codex agent 通过当前 Qwen 调用 LM Studio”的模型侧 smoke。
-
-## Authoritative user state and remaining end-to-end step
-
-最终只读复核时，真实 `C:\Users\xr\.codex\config.toml` 为 5427 bytes，SHA-256 `B2A3A7CD819B20304A017AA6202B96B85F28B7A9DEF8F445FD540C2C1C75B079`；Provider 仍为 implicit `openai`，model 为 `gpt-5.6-sol`，reasoning 为 `xhigh`。现有 LM Studio journals 均为 `Completed` 或 `RolledBack`，没有 incomplete transaction。
-
-真实 v3 生命周期注入、补丁后四项 200、隔离 Codex agent `CMM_PONG`、真实配置 Commit、重启后调用以及 Plan→Default 无害工具闭环仍未在本开发会话中执行。原因是当前会话本身运行在 Codex/ChatGPT Desktop 中，产品门禁会在写 journal 和 unload 之前阻断；没有绕过该门禁。
-
-完成现场闭环时应：完全关闭 Codex Desktop/ChatGPT Desktop、CLI 与 helper → 启动本页记录的新 EXE → Preview 当前 Q6_K/70144 v2→v3 升级 → 确认运行时模板事务 → 确认四项均 200/PASS → 执行隔离 Codex smoke → 最终确认 Codex 配置 → 重启 Codex → 执行一次 Plan→Default + 临时目录无害工具任务。任一步失败时应保留错误 journal 并按 v3 provenance 恢复 v2；四阶段 PASS 前真实 Codex 配置不会写入。
+因此，本轮已经完成并验证了**定位器、模板识别/生成、探测分类、provenance、恢复强度、测试与重新发布**；但没有声称当前正在运行的 Codex 已切换到 LM Studio，也没有声称真实运行时模板已被修补。

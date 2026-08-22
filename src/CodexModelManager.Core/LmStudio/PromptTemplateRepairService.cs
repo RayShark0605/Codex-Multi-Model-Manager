@@ -246,10 +246,13 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
                 throw new InvalidDataException("Unsupported Template：检测到未知管理器模板规则标记；拒绝猜测升级路径。");
             }
 
+            bool prefixMergedSystem = QwenPrefixMergedSystemTemplateRule.IsSourceCandidate(analysis.ChatTemplate);
             string patched = PatchExactQwenTemplate(analysis.ChatTemplate);
             return Preview(
                 PromptTemplateRepairStatus.Supported,
-                "模板结构与受支持的 Qwen system-order 模式精确匹配；可以生成 interleaved-instructions v3 修补。",
+                prefixMergedSystem
+                    ? "模板结构与受支持的 Qwen prefix-merged-system 模式逐字及锚点匹配；可以生成 interleaved-instructions v3 修补。"
+                    : "模板结构与受支持的 Qwen system-order 模式精确匹配；可以生成 interleaved-instructions v3 修补。",
                 patched,
                 CurrentRuleVersion);
         }
@@ -384,7 +387,10 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
         }
     }
 
-    internal static string PatchExactQwenTemplate(string template) => PatchOriginalTemplate(template, CurrentRuleVersion);
+    internal static string PatchExactQwenTemplate(string template) =>
+        QwenPrefixMergedSystemTemplateRule.IsSourceCandidate(template)
+            ? QwenPrefixMergedSystemTemplateRule.Patch(template)
+            : PatchOriginalTemplate(template, CurrentRuleVersion);
 
     public static string PatchExactQwenTemplateV2(string template) => PatchOriginalTemplate(template, LegacyLeadingRuleVersion);
 
@@ -503,6 +509,12 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
 
     private static void ValidateKnownV3Template(string template)
     {
+        if (QwenPrefixMergedSystemTemplateRule.IsPatchedCandidate(template))
+        {
+            QwenPrefixMergedSystemTemplateRule.ValidatePatched(template);
+            return;
+        }
+
         string newLine = DetectNewLine(template);
         string normalized = Normalize(template, newLine);
         RequireCount(normalized, "{%- macro render_content(content, do_vision_count, is_system_content=false) %}", 1, "render_content 宏");

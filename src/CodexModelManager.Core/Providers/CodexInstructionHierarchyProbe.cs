@@ -59,7 +59,7 @@ public sealed class CodexInstructionHierarchyProbe : ICodexInstructionHierarchyP
             if (!control.Passed)
             {
                 string failureCode = ClassifyFailure(controlHttp.StatusCode, controlHttp.Body, ProbeShape.Control);
-                return Result(control, leadingDeveloper, conversationControl, continuationDeveloper, failureCode, DescribeFailure(failureCode, control.HttpStatus), checkedAt);
+                return Result(control, leadingDeveloper, conversationControl, continuationDeveloper, failureCode, DescribeFailure(failureCode, control.HttpStatus, ProbeShape.Control), checkedAt);
             }
 
             ProbeHttpResult leadingHttp = await SendAsync(CreateProbeBody(modelId, ProbeShape.LeadingDeveloper), cancellationToken).ConfigureAwait(false);
@@ -67,7 +67,7 @@ public sealed class CodexInstructionHierarchyProbe : ICodexInstructionHierarchyP
             if (!leadingDeveloper.Passed)
             {
                 string failureCode = ClassifyFailure(leadingHttp.StatusCode, leadingHttp.Body, ProbeShape.LeadingDeveloper);
-                return Result(control, leadingDeveloper, conversationControl, continuationDeveloper, failureCode, DescribeFailure(failureCode, leadingDeveloper.HttpStatus), checkedAt);
+                return Result(control, leadingDeveloper, conversationControl, continuationDeveloper, failureCode, DescribeFailure(failureCode, leadingDeveloper.HttpStatus, ProbeShape.LeadingDeveloper), checkedAt);
             }
 
             ProbeHttpResult conversationHttp = await SendAsync(CreateProbeBody(modelId, ProbeShape.ConversationControl), cancellationToken).ConfigureAwait(false);
@@ -75,7 +75,7 @@ public sealed class CodexInstructionHierarchyProbe : ICodexInstructionHierarchyP
             if (!conversationControl.Passed)
             {
                 string failureCode = ClassifyFailure(conversationHttp.StatusCode, conversationHttp.Body, ProbeShape.ConversationControl);
-                return Result(control, leadingDeveloper, conversationControl, continuationDeveloper, failureCode, DescribeFailure(failureCode, conversationControl.HttpStatus), checkedAt);
+                return Result(control, leadingDeveloper, conversationControl, continuationDeveloper, failureCode, DescribeFailure(failureCode, conversationControl.HttpStatus, ProbeShape.ConversationControl), checkedAt);
             }
 
             ProbeHttpResult continuationHttp = await SendAsync(CreateProbeBody(modelId, ProbeShape.ContinuationDeveloper), cancellationToken).ConfigureAwait(false);
@@ -83,7 +83,7 @@ public sealed class CodexInstructionHierarchyProbe : ICodexInstructionHierarchyP
             if (!continuationDeveloper.Passed)
             {
                 string failureCode = ClassifyFailure(continuationHttp.StatusCode, continuationHttp.Body, ProbeShape.ContinuationDeveloper);
-                return Result(control, leadingDeveloper, conversationControl, continuationDeveloper, failureCode, DescribeFailure(failureCode, continuationDeveloper.HttpStatus), checkedAt);
+                return Result(control, leadingDeveloper, conversationControl, continuationDeveloper, failureCode, DescribeFailure(failureCode, continuationDeveloper.HttpStatus, ProbeShape.ContinuationDeveloper), checkedAt);
             }
 
             return Result(
@@ -222,24 +222,31 @@ public sealed class CodexInstructionHierarchyProbe : ICodexInstructionHierarchyP
         return CompatibilityFailureCodes.OtherProviderError;
     }
 
-    private static string DescribeFailure(string failureCode, int? httpStatus) => failureCode switch
-    {
-        CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder =>
-            "模型 Prompt Template 拒绝 Codex 的第二条前导 system/developer 指令；需要应用兼容模板并重载模型。",
-        CompatibilityFailureCodes.LmStudioChatTemplateDeveloperRole =>
-            "模型 Prompt Template 不支持 Codex developer 指令角色；需要应用兼容模板并重载模型。",
-        CompatibilityFailureCodes.LmStudioChatTemplateContinuationInstructionOrder =>
-            "旧版运行时 Prompt Template 拒绝多轮对话中的后置 developer 指令；需要升级为 interleaved-instructions v3。",
-        CompatibilityFailureCodes.AuthenticationRequired =>
-            "LM Studio 返回 HTTP 401，需要有效的 API Token。",
-        CompatibilityFailureCodes.ResponsesControlFailed =>
-            $"普通 Responses control 请求失败（HTTP {FormatStatus(httpStatus)}）。",
-        CompatibilityFailureCodes.ResponsesConversationControlFailed =>
-            $"不含后置 developer 的多轮 conversation control 请求失败（HTTP {FormatStatus(httpStatus)}）；该错误不允许自动套用模板修补。",
-        CompatibilityFailureCodes.Timeout =>
-            "Codex 指令层级预检超时。",
-        _ => $"Codex-shaped Responses 请求失败（HTTP {FormatStatus(httpStatus)}）。",
-    };
+    private static string DescribeFailure(
+        string failureCode,
+        int? httpStatus,
+        ProbeShape shape) => failureCode switch
+        {
+            CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder when shape == ProbeShape.LeadingDeveloper =>
+                "模型 Prompt Template 拒绝前导独立 developer 指令；需要应用兼容模板并重载模型。",
+            CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder when shape == ProbeShape.ContinuationDeveloper =>
+                "模型 Prompt Template 只接受开头连续的 system/developer 指令，拒绝多轮对话中的后置 developer；需要应用兼容模板并重载模型。",
+            CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder =>
+                "模型 Prompt Template 拒绝 Codex 的 system/developer 指令顺序；需要应用兼容模板并重载模型。",
+            CompatibilityFailureCodes.LmStudioChatTemplateDeveloperRole =>
+                "模型 Prompt Template 不支持 Codex developer 指令角色；需要应用兼容模板并重载模型。",
+            CompatibilityFailureCodes.LmStudioChatTemplateContinuationInstructionOrder =>
+                "旧版运行时 Prompt Template 拒绝多轮对话中的后置 developer 指令；需要升级为 interleaved-instructions v3。",
+            CompatibilityFailureCodes.AuthenticationRequired =>
+                "LM Studio 返回 HTTP 401，需要有效的 API Token。",
+            CompatibilityFailureCodes.ResponsesControlFailed =>
+                $"普通 Responses control 请求失败（HTTP {FormatStatus(httpStatus)}）。",
+            CompatibilityFailureCodes.ResponsesConversationControlFailed =>
+                $"不含后置 developer 的多轮 conversation control 请求失败（HTTP {FormatStatus(httpStatus)}）；该错误不允许自动套用模板修补。",
+            CompatibilityFailureCodes.Timeout =>
+                "Codex 指令层级预检超时。",
+            _ => $"Codex-shaped Responses 请求失败（HTTP {FormatStatus(httpStatus)}）。",
+        };
 
     private static string FormatStatus(int? status) => status?.ToString(CultureInfo.InvariantCulture) ?? "未知";
 

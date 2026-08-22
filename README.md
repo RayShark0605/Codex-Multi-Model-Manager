@@ -8,12 +8,12 @@
 
 - OpenAI：从 Codex App Server 动态获取账户可见模型；App Server 不可用时才读取并标记可能过期的 `models_cache.json`。
 - DeepSeek：识别官方 `models.json`；否则下载并只解析官方 PowerShell setup script，离线时使用随发行版附带、带来源哈希的官方 catalog 快照。
-- LM Studio：优先调用 `/api/v1/models`，回退 `/api/v0/models`、`/v1/models`；一条 loaded instance 对应一个可查看项。native `type` 会被保留，embedding 等已知非 LLM instance 不会进入 Codex 切换列表，核心层也会再次拒绝。
+- LM Studio：优先调用 `/api/v1/models`，回退 `/api/v0/models`、`/v1/models`；一条 loaded instance 对应一个可查看项。native `type` 会被保留，embedding 等已知非 LLM instance 不会进入 Codex 切换列表，核心层也会再次拒绝。GGUF 自动定位保留 Hub `lms ls --json --variants`，并新增 endpoint-aware `lms ps --json --host/--port` loaded-instance 证据；native loaded state 始终是权威面。
 - 配置安全：TOML 精确文本补丁、语法/语义校验、预览指纹、命名同步锁、同目录临时文件、flush、原子替换、重读校验和自动回滚。
 - 可逆备份：不可覆盖的 Initial Snapshot、显式修改外部 override 文件前的 supplemental baseline、每次切换/恢复前的 History、SHA-256 manifest。
 - 凭据：新 Token 默认进入 Windows Credential Manager；Codex 通过 command-backed auth Helper 从 stdout 获取，不进入 TOML、日志或 manifest。
 - 本地兼容性硬门槛：切换 LM Studio 前实时执行 Basic、Leading Developer、Conversation Control、Continuation Developer 四阶段差分请求；四项未全部返回 HTTP 200 且含 `output` 数组时，在备份和写盘前阻止切换。
-- Prompt Template 修复：只读解析精确 loaded variant 的 GGUF，仅对结构精确匹配的 Qwen 指令层级失败提供可预览的 `qwen-interleaved-instructions-v3` 运行时 Jinja 修补；确认后通过原生 API 事务式 unload/load、复核全部可观察加载参数并重新探测，不修改 GGUF。已验证的旧 v2 运行时实例可安全升级，失败时确定性恢复 v2；手工导出仍作为回退路径。
+- Prompt Template 修复：只读解析精确 loaded instance 的 GGUF，仅对结构精确匹配的 Qwen 指令层级失败提供可预览的 `qwen-interleaved-instructions-v3` 运行时 Jinja 修补；现已覆盖当前 Unsloth 184 行 prefix-merged-system 模板族。确认后通过原生 API 事务式 unload/load、复核全部可观察加载参数并重新探测，不修改 GGUF。已验证的旧 v2 运行时实例可安全升级，失败时确定性恢复 v2；手工导出仍作为回退路径。
 - 测试：Codex-shaped Level 1/2 Responses/SSE/function calling；用户主动触发的 Level 3 真实 Codex CLI 临时工作区测试。
 
 ## 快速使用
@@ -27,9 +27,9 @@
 4. 若使用 DeepSeek，先在“设置与日志”页将 Token 保存到 Windows Credential Manager。LM Studio 返回 401 时同样保存 LM Token。
 5. 选择 Provider 与 Model；LM Studio 页确认 `Loaded Context` 与 `Codex Configured Context` 一致。
 6. 对 LM Studio 点击 **重新检测 Codex 指令层级**。只有 Basic、Leading、Conversation、Continuation 四项都 PASS 才能切换。
-7. 若显示 **Template Fix Required** 或 **Template Upgrade Required (v2 → v3)**，可先点击 **Preview Changes** 查看当前运行时来源、原始/v2/v3 哈希、目标模板和完整加载配置而不改动任何运行状态；点击 **Switch Model** 后再明确确认“应用兼容模板并继续”。若自动 GGUF 定位、v2 provenance 或当前 LM Studio 版本不满足门槛，仍可使用 **分析/导出兼容模板** 的手工回退流程。
+7. 若显示 **Template Fix Required** 或 **Template Upgrade Required (v2 → v3)**，可先点击 **Preview Changes** 查看当前运行时来源、GGUF 定位证据（`lms ps --json` 或 `lms ls --json --variants`）、原始/v2/v3 哈希、目标模板和完整加载配置而不改动任何运行状态；点击 **Switch Model** 后再明确确认“应用兼容模板并继续”。若自动 GGUF 定位、v2 provenance 或当前 LM Studio 版本不满足门槛，稳定诊断会保留 **分析/导出兼容模板** 的手工回退流程。
 8. 点击 **Preview Changes**，检查 semantic diff、Secondary Overrides 和警告。Secondary 列表默认全部不勾选；只有明确勾选的项才会在 `FollowMain`/`RestoreOriginal` 策略下修改。
-9. 点击 **Switch Model** 并确认。提交前会再次实时验证指令层级；完成后重新启动 Codex Desktop。
+9. **先完全退出 Codex Desktop/CLI，再单独启动管理器**，随后点击 **Switch Model** 并确认。当前 Codex 仍在运行时不要尝试真实切换；提交前会再次实时验证进程状态与指令层级，完成后再重新启动 Codex Desktop。
 
 ### 为什么必须先关闭 Codex
 
@@ -58,7 +58,7 @@ Codex 可能在运行期间缓存配置、更新模型 cache 或自行写回 `co
 - 默认 1234、无认证、无 `CODEX_OSS_*` 重定向时使用 Codex 内置 `lmstudio`，绝不创建 `[model_providers.lmstudio]`。
 - 非默认端口或启用认证时使用不冲突的 `lmstudio_local_cmm` custom provider。
 - 非 loopback endpoint 必须是 HTTPS；401 会提示 Token，Token 输入框使用系统密码字符。
-- 常规发现、刷新、兼容性测试与 Preview 不改变模型生命周期。只有三个已识别的模板失败码（含 v2 后置 developer 顺序错误）、精确 GGUF/变体解析成功且用户确认后，Switch 流程才调用原生 `/api/v1/models/unload` 与 `/load`；请求保留 native API 捕获的 context、batch、parallel、flash attention、KV cache、speculative decoding 等可观察参数，并在不一致时回滚。
+- 常规发现、刷新、兼容性测试与 Preview 不改变模型生命周期。自动 GGUF 定位要求 `lms ps` 的 identifier/modelKey、publisher/source、type、architecture、quantization、context 与 native loaded 快照一致，路径唯一、真实、为 `.gguf` 且位于配置的 downloads/models 根目录；不把进程 size 与单个文件长度强行等同。两数据面冲突、非法 JSON、CLI 失败/超时、歧义或非本机 endpoint 均 fail closed 并保留手工选择。只有三个已识别的模板失败码（含 v2 后置 developer 顺序错误）、精确 GGUF 解析成功且用户确认后，Switch 流程才调用原生 `/api/v1/models/unload` 与 `/load`；请求保留 native API 捕获的 context、batch、parallel、flash attention、KV cache、speculative decoding 等可观察参数，并在不一致时回滚。
 - LM Studio 仅报告 reasoning `on/off` 时，不会把它猜成 Codex 的 `low/medium/high`；此时本地配置明确删除 `model_reasoning_effort`。只有 Provider 返回值与 Codex 支持 effort 的精确交集才允许写入。
 
 ### Codex Instruction Hierarchy 与 Qwen Prompt Template
@@ -69,7 +69,7 @@ Codex 可能在运行期间缓存配置、更新模型 cache 或自行写回 `co
 System message must be at the beginning.
 ```
 
-这类模板会让“普通请求 PASS、Codex 第一句话立即 500”。旧 `qwen-leading-instructions-v2` 又只兼容连续前导指令：Plan Mode 能生成计划，但 Codex 在用户批准后追加 Default collaboration-mode `developer` 时会触发 `System and developer messages must precede conversation messages.`。管理器因此执行四阶段差分预检：
+这类模板会让“普通请求 PASS、Codex 第一句话立即 500”。旧 `qwen-leading-instructions-v2` 又只兼容连续前导指令：Plan Mode 能生成计划，但 Codex 在用户批准后追加 Default collaboration-mode `developer` 时会触发 `System and developer messages must precede conversation messages.`。当前 Unsloth Qwen3.8 prefix-merged-system 内置模板则先合并开头连续 system/developer，再进入第二个主循环，因此形成 Basic/Leading/Conversation 均 200、Continuation 500 且错误仍为 `System message must be at the beginning.` 的第三种精确形状；它保持 BuiltIn provenance，不与旧 v2 混淆。管理器因此执行四阶段差分预检：
 
 ```text
 Basic:         instructions + user
@@ -80,7 +80,7 @@ Continuation:  与 Conversation 相同，仅在最后一个 user 前增加 devel
 
 任一正式 LM Studio Preview 与 Commit 都必须实时通过四种结构；步骤 3/4 只改变后置 developer，因此普通多轮失败不会被误归类成模板升级问题。每次还会先从 native Models API 重新确认同一 loaded instance 与相同实际 context。instance 缺失/context 改变时不会发送可能触发后端自动加载的推理请求。成功结果不会被长期缓存，也没有绕过按钮；所有失败都发生在 History backup 和 `config.toml` 写入之前（Initial Snapshot 仍只按首次启动规则管理）。
 
-如果错误被分类为 `lmstudio-chat-template-system-order`、`lmstudio-chat-template-developer-role` 或 `lmstudio-chat-template-continuation-instruction-order`，LM Studio 页可只读分析对应 GGUF。修补器不会套用通用 Qwen/GPT 模板，而是要求宏、system/tool 初始区、主 message 循环和拒绝分支全部精确匹配。v3 遍历完整 `messages`，按原始相对顺序收集任意位置的 system/developer，使用双换行合并为唯一初始 system block；`reasoning_instructions` 仍在前，tools 说明仍先输出，主 conversation 循环消费这些已合并项，user/assistant/tool/reasoning/vision/function call/output 的原有顺序与分支保持。
+如果错误被分类为 `lmstudio-chat-template-system-order`、`lmstudio-chat-template-developer-role` 或 `lmstudio-chat-template-continuation-instruction-order`，LM Studio 页可只读分析对应 GGUF。修补器不会套用通用 Qwen/GPT 模板，而是要求宏、system/tool 初始区、反向扫描、主 message 循环、vision/reasoning/tool-call/generation 分支和拒绝路径全部精确且唯一匹配。当前 Unsloth 模板族还必须逐字匹配 `sysns.count == loop.index0` 前缀聚合、`merged_system` 两个输出区和 `loop.index0 >= num_sys` 保护；任何 one-change near-match、重复锚点或混合换行都返回 Unsupported。v3 遍历完整 `messages`，按原始相对顺序收集任意位置的 system/developer，使用双换行合并为唯一初始 system block；`reasoning_instructions`、tools、反向扫描和其他非目标分支逐字保持，主 conversation 循环跳过所有已合并项。
 
 导出目录：
 
@@ -96,7 +96,7 @@ Continuation:  与 Conversation 相同，仅在最后一个 user 前增加 devel
 
 `/load` 的 `model` 始终使用 native list 返回的源模型 `key`（例如 `qwen/qwen3.8-27b`）；`selected_variant`（例如 `...@q8_0`）只用于精确 GGUF 定位、并发指纹和加载后量化校验。旧实现曾把 variant 字符串当成 load ID，LM Studio 0.4.21 会返回 `404 model_not_found`；新版禁止混用 source key、selected variant 与 instance ID，也不预测 `:2` 之类的新实例后缀。
 
-运行时修复在 `%LOCALAPPDATA%\CodexModelManager\transactions` 中先写不含模板正文和 Token 的 schema-v3 恢复记录，保存最后稳定阶段、失败阶段、脱敏 API 错误、load 前后候选 ID、原运行时模板来源/规则/SHA/evidence transaction、目标规则和原四阶段摘要。load、配置对比、层级探测、最终 Codex 配置确认或 Commit 任一步失败/取消，都会卸载可唯一归因的补丁实例并恢复事务记录证明的原运行时模板。schema-v1/v2 继续只读兼容。程序异常退出后不会静默重载；下次启动会先只读评估，并在 LM Studio 页启用 **检查/恢复未完成事务**。如果唯一当前实例已经与原始快照和原四阶段签名完全一致，确认后只关闭 journal，不做昂贵的重复 unload/load；状态仍有歧义时继续阻断而不猜测。
+运行时修复在 `%LOCALAPPDATA%\CodexModelManager\transactions` 中先写不含模板正文和 Token 的 schema-v3 恢复记录，保存最后稳定阶段、失败阶段、脱敏 API 错误、load 前后候选 ID、原运行时模板来源/规则/SHA/evidence transaction、目标规则和原四阶段摘要。load、配置对比、层级探测、最终 Codex 配置确认或 Commit 任一步失败/取消，都会卸载可唯一归因的补丁实例并恢复事务记录证明的原运行时模板。schema-v1/v2 继续只读兼容。程序异常退出后不会静默重载；下次启动会先只读评估，并在 LM Studio 页启用 **检查/恢复未完成事务**。如果唯一当前实例已经与原始快照和原四阶段签名完全一致，确认后只关闭 journal，不做昂贵的重复 unload/load；schema 3 比较四个步骤各自的 PASS/HTTP 状态及 failure code，不再只看某一个失败标签。schema 1/2 仅兼容旧记录，状态仍有歧义时继续阻断而不猜测。
 
 ## Local Context、Max Context 与 Auto Compact
 
@@ -115,9 +115,9 @@ min(floor(loadedContext * 0.90), loadedContext - 8192)
 
 它是**管理器安全建议值**，不是 Codex 官方百分比标准。每个 local model 的 loaded context 与 compact 偏好保存在管理器自己的 `appsettings.json`；如果实际 loaded context 改变，旧偏好不会被盲目套用。
 
-2026-08-20 本轮只读审计执行时，native `/api/v1/models` 报告 `qwen/qwen3.8-27b@q6_k` 已加载，实际 `context_length=70144`；此前同日也观察过 Q8_0/32768，因此任一数值都不作为常量。管理器在预览、卸载前、补丁加载后和 Codex Commit 前重新读取 native 状态，始终使用当时真实的 `loaded_instances[].config.context_length`，不会把 `lms ps`、模型理论 Max、截图或缓存猜作 loaded context。
+2026-08-22 本轮只读审计执行时，native `/api/v1/models` 报告 `qwen3.8-27b@q6_k_xl` 已加载，architecture/quantization 为 `qwen35` / `Q6_K_XL`，实际 `context_length=161024`、Max `262144`；这些是本次现场快照，不是代码常量。管理器在预览、卸载前、补丁加载后和 Codex Commit 前重新读取 native 状态，始终使用当时真实的 `loaded_instances[].config.context_length`，不会把 `lms ps`、模型理论 Max、截图或缓存猜作 loaded context。
 
-本机只读 GGUF 检查还确认了两个不同的源模板结构：Qwen3.6 的模板 SHA-256 为 `E84F32A23FDDA27689F868AA4A1A5621F41133E51A48D7F3EFCBEA2839574259`，对应 v3 为 `235C3E8D316D80E23827174F1A8CEF37B1E5018CF70ED8F52F2C6FB9C0E233CD`；两个已检查的 Qwen3.8-27B Q6_K/Q8_0 文件共享源 SHA `C3CF9E34ABF4F9E36C2D72165AA9C132D3E2A725B6C2586AAA3A8AF9D7A81041`，对应 v3 为 `4AA5CC42C084FCC8235AAF0500835F4F9419A72280EA7E02D08EEE9A97807D8B`。后者额外保留 `reasoning_instructions`。v3 在主 conversation 循环中对已经合并的 system/developer 连 `render_content` 都不再调用，避免 vision 计数等隐藏副作用。`qwen-interleaved-instructions-v3` 不是按模型名或 SHA 白名单放行，而是分别要求两个已支持结构中的每个锚点精确且唯一匹配；未知第三种结构或未知管理器 Marker 仍显示 `Unsupported Template`。旧 v2 只用于精确识别、升级和事务回滚。
+本机只读 GGUF 检查确认了三个不同的源模板结构：Qwen3.6 的模板 SHA-256 为 `E84F32A23FDDA27689F868AA4A1A5621F41133E51A48D7F3EFCBEA2839574259`，对应 v3 为 `235C3E8D316D80E23827174F1A8CEF37B1E5018CF70ED8F52F2C6FB9C0E233CD`；两个较早检查的 Qwen3.8-27B Q6_K/Q8_0 文件共享源 SHA `C3CF9E34ABF4F9E36C2D72165AA9C132D3E2A725B6C2586AAA3A8AF9D7A81041`，对应 v3 为 `4AA5CC42C084FCC8235AAF0500835F4F9419A72280EA7E02D08EEE9A97807D8B`；当前 Unsloth `Qwen3.8-27B-UD-Q6_K_XL.gguf` 的 184 行 prefix-merged-system 源 SHA 为 `12827F24B742EA4E80CDC12DBCF9622227056B9F797252A3149263D4F9AAADCE`，确定性 v3 SHA 为 `9DC0DA000D1DF280BE9F6F64D314EB52879C0DF5C3C951F74105964136592F85`。v3 在主 conversation 循环中对已经合并的 system/developer 连 `render_content` 都不再调用，避免 vision 计数等隐藏副作用。所有 SHA 仅用于审计、重建与漂移检测；`qwen-interleaved-instructions-v3` 仍按各模板族完整精确结构放行，未知结构或 Marker 保守返回 `Unsupported Template`。旧 v2 只用于精确识别、升级和事务回滚。
 
 ## 管理器会修改什么
 

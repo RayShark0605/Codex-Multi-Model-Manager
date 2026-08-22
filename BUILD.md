@@ -45,7 +45,7 @@ Remove-Item Env:CMM_RUN_LIVE_LM
 
 这会先发送 `instructions + user` 与 `instructions + developer + user` 差分请求。只有指令层级通过才继续发送带同样结构的 SSE 与 harmless dummy function schema；不会改变模型生命周期。若 native `/api/v1/models` 当前没有报告 `loaded_instances`，测试会明确 Skip，而不会把 `lms ps` 或理论模型列表猜作 Server loaded context。
 
-同一分类还会用 `lms ls --json --variants` 与 `~/.lmstudio/settings.json` 只读解析当前 `selected_variant` 的精确 GGUF，并核对量化、架构和可修补模板结构。
+同一分类还会用 native loaded snapshot 作为权威身份，同时查询 `lms ls --json --variants` 与 endpoint-aware `lms ps --json --host <host> --port <port>`。`lms ps` 只提供 loaded-instance 文件位置证据；候选必须匹配 source/identifier/publisher/type/architecture/quantization/context，且唯一落在 `~/.lmstudio/settings.json` 配置的 downloads 根或传统 models 根。现场测试会断言最终 provenance 为 `lms ps --json`，再只读核对 GGUF 模板。
 
 ### 显式 opt-in 的事务式 LM Studio 生命周期测试
 

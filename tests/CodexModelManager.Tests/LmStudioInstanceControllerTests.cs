@@ -213,6 +213,56 @@ public sealed class LmStudioInstanceControllerTests
     }
 
     [Fact]
+    public async Task SchemaV3RecoveryRejectsSameFailureCodeWhenFourStageSignatureDiffers()
+    {
+        using var fixture = new ControllerFixture(hierarchyPasses: true);
+        LmStudioLoadedInstanceSnapshot original = await fixture.Controller.CaptureAsync(ControllerFixture.OriginalInstanceId);
+        LmStudioTemplateRepairPlan plan = fixture.CreatePlan(original);
+        var storedPrefixOnlyFailure = new CodexInstructionHierarchyProbeResult(
+            new CodexInstructionProbeStepResult(true, 200),
+            new CodexInstructionProbeStepResult(true, 200),
+            new CodexInstructionProbeStepResult(true, 200),
+            new CodexInstructionProbeStepResult(false, 500),
+            CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder,
+            "stored prefix-only continuation signature",
+            DateTimeOffset.Now);
+        var record = new LmStudioTemplateTransactionRecord(
+            3,
+            plan.TransactionId,
+            LmStudioTemplateTransactionState.Prepared,
+            plan.CreatedAt,
+            DateTimeOffset.Now,
+            original,
+            plan.FailureCode,
+            plan.GgufAnalysis.FilePath,
+            plan.GgufAnalysis.FileName,
+            plan.GgufAnalysis.FileLength,
+            plan.GgufAnalysis.LastWriteTimeUtc,
+            plan.GgufAnalysis.GgufVersion,
+            plan.GgufAnalysis.TemplateSha256,
+            plan.TemplatePreview.PatchedTemplateSha256!,
+            plan.TemplatePreview.RuleVersion,
+            null,
+            "schema 3 exact signature test",
+            LoadModelKey: original.SourceModelKey,
+            LastStableState: LmStudioTemplateTransactionState.Prepared,
+            OriginalRuntimeTemplateMode: LmStudioRuntimeTemplateMode.BuiltIn,
+            TargetRuntimeRuleVersion: plan.TemplatePreview.RuleVersion,
+            OriginalHierarchyProbe: storedPrefixOnlyFailure);
+        await fixture.Store.WriteAsync(record);
+
+        LmStudioRecoveryAssessment assessment = await fixture.Controller.AssessRecoveryAsync(record);
+
+        LmStudioRecoveryCandidate candidate = Assert.Single(assessment.Candidates);
+        Assert.True(candidate.MatchesOriginalSnapshot);
+        Assert.NotNull(candidate.HierarchyProbe);
+        Assert.Equal(CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder, candidate.HierarchyProbe.FailureCode);
+        Assert.False(candidate.ReproducesOriginalFailure);
+        Assert.Equal(LmStudioRecoveryDisposition.BlockedAmbiguous, assessment.Disposition);
+        Assert.Equal(0, fixture.Handler.UnloadCount);
+        Assert.Empty(fixture.Handler.LoadBodies);
+    }
+    [Fact]
     public async Task HierarchyFailureAutomaticallyRollsBackOriginalTemplateInstance()
     {
         using var fixture = new ControllerFixture(hierarchyPasses: false);

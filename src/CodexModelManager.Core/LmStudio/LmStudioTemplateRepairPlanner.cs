@@ -7,8 +7,10 @@ public sealed class LmStudioTemplateRepairPlanner(
     ILmStudioInstanceController instanceController,
     IGgufChatTemplateReader ggufReader,
     IPromptTemplateRepairService templateRepair,
-    LmStudioTemplateTransactionStore transactions)
+    LmStudioTemplateTransactionStore transactions,
+    ILmStudioModelFileLocator? modelFileLocator = null)
 {
+    private readonly ILmStudioModelFileLocator modelFileLocator = modelFileLocator ?? new LmStudioModelFileLocator();
     public async Task<LmStudioTemplateRepairPlan> CreatePlanAsync(
         ModelProfile selectedModel,
         CodexInstructionHierarchyProbeResult originalProbe,
@@ -47,11 +49,15 @@ public sealed class LmStudioTemplateRepairPlanner(
             AvailableVariants = snapshot.LoadTarget?.AvailableVariants,
             Format = snapshot.LoadTarget?.Format,
         };
-        LmStudioModelFileResolution? resolution = await LmStudioModelFileLocator.TryResolveDetailedAsync(authoritative, cancellationToken).ConfigureAwait(false);
-        if (resolution is null)
+        LmStudioModelFileResolutionAttempt resolutionAttempt = await modelFileLocator
+            .ResolveAsync(authoritative, snapshot.Endpoint, cancellationToken)
+            .ConfigureAwait(false);
+        if (!resolutionAttempt.Succeeded || resolutionAttempt.Resolution is null)
         {
-            throw new FileNotFoundException("无法从 lms ls --json --variants 唯一定位当前 loaded instance 对应的 GGUF；自动修复已阻断，请使用只读手工选择/导出流程。");
+            throw new FileNotFoundException($"无法唯一定位当前 loaded instance 对应的 GGUF；自动修复已阻断。{resolutionAttempt.Diagnostic} 请使用只读手工选择/导出流程。");
         }
+
+        LmStudioModelFileResolution resolution = resolutionAttempt.Resolution;
 
         if (!string.Equals(resolution.SourceModelKey, snapshot.SourceModelKey, StringComparison.OrdinalIgnoreCase) ||
             !CompatibleExact(snapshot.SelectedVariant, resolution.SelectedVariant) ||
@@ -154,10 +160,25 @@ public sealed class LmStudioTemplateRepairPlanner(
     private static (LmStudioRuntimeTemplateProvenance Provenance, string? Template) ResolveBuiltInProvenance(
         CodexInstructionHierarchyProbeResult originalProbe)
     {
-        if (!originalProbe.Control.Passed || originalProbe.LeadingDeveloper.Passed ||
-            originalProbe.FailureCode is not (CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder or CompatibilityFailureCodes.LmStudioChatTemplateDeveloperRole))
+        bool leadingInstructionFailure =
+            originalProbe.Control.Passed &&
+            !originalProbe.LeadingDeveloper.Passed &&
+            originalProbe.LeadingDeveloper.HttpStatus is not null &&
+            !originalProbe.ConversationControl.Passed &&
+            originalProbe.ConversationControl.HttpStatus is null &&
+            !originalProbe.ContinuationDeveloper.Passed &&
+            originalProbe.ContinuationDeveloper.HttpStatus is null &&
+            originalProbe.FailureCode is CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder or CompatibilityFailureCodes.LmStudioChatTemplateDeveloperRole;
+        bool prefixOnlyContinuationFailure =
+            originalProbe.Control.Passed &&
+            originalProbe.LeadingDeveloper.Passed &&
+            originalProbe.ConversationControl.Passed &&
+            !originalProbe.ContinuationDeveloper.Passed &&
+            originalProbe.ContinuationDeveloper.HttpStatus is not null &&
+            string.Equals(originalProbe.FailureCode, CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder, StringComparison.Ordinal);
+        if (!leadingInstructionFailure && !prefixOnlyContinuationFailure)
         {
-            throw new InvalidDataException("当前失败没有形成受支持的内置 Qwen 模板行为签名；卸载前已阻断。");
+            throw new InvalidDataException("当前失败没有形成受支持的内置 Qwen 模板精确四阶段行为签名；卸载前已阻断。");
         }
 
         return (new LmStudioRuntimeTemplateProvenance(LmStudioRuntimeTemplateMode.BuiltIn), null);

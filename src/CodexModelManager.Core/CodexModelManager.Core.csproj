@@ -7,6 +7,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="LmStudio\Templates\qwen-prefix-merged-system-source.jinja" LogicalName="CodexModelManager.Core.LmStudio.Templates.qwen-prefix-merged-system-source.jinja" />
     <EmbeddedResource Include="Catalogs\deepseek-models.official-snapshot.json" />
     <EmbeddedResource Include="Catalogs\deepseek-models.official-snapshot.provenance.json" />
   </ItemGroup>

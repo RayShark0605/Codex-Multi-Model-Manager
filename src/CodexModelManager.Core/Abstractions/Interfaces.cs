@@ -112,6 +112,14 @@ public interface IGgufChatTemplateReader
         CancellationToken cancellationToken = default);
 }
 
+public interface ILmStudioModelFileLocator
+{
+    Task<LmStudioModelFileResolutionAttempt> ResolveAsync(
+        ModelProfile model,
+        Uri endpoint,
+        CancellationToken cancellationToken = default);
+}
+
 public interface IPromptTemplateRepairService
 {
     PromptTemplateRepairPreview CreatePreview(GgufChatTemplateAnalysis analysis);

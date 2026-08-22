@@ -87,6 +87,8 @@ public sealed class ResponsesCompatibilityTests
         Assert.Equal(CompatibilityStatus.Failed, report.Results.Single(item => item.Capability == "Codex Agent").Status);
         Assert.Equal(CompatibilityStatus.Untested, report.Results.Single(item => item.Capability == "Streaming").Status);
         Assert.DoesNotContain(report.Results, item => item.Detail.Contains("Jinja Exception", StringComparison.Ordinal));
+        Assert.Contains("前导独立 developer", hierarchy.Detail, StringComparison.Ordinal);
+        Assert.DoesNotContain("后置 developer", hierarchy.Detail, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -202,6 +204,27 @@ public sealed class ResponsesCompatibilityTests
         Assert.False(result.IsCompatible);
     }
 
+    [Fact]
+    public async Task PrefixOnlySystemOrderFailureAtContinuationHasStageSpecificDetail()
+    {
+        int request = 0;
+        using var http = new HttpClient(new StubHttpHandler(_ => ++request < 4
+            ? StubHttpHandler.Json("{\"output\":[]}")
+            : StubHttpHandler.Json("{\"error\":{\"message\":\"System message must be at the beginning.\"}}", HttpStatusCode.InternalServerError)));
+        var probe = new CodexInstructionHierarchyProbe(http, new Uri("http://127.0.0.1:1234/"));
+
+        CodexInstructionHierarchyProbeResult result = await probe.ProbeAsync("fixture");
+
+        Assert.Equal(4, request);
+        Assert.True(result.Control.Passed);
+        Assert.True(result.LeadingDeveloper.Passed);
+        Assert.True(result.ConversationControl.Passed);
+        Assert.False(result.ContinuationDeveloper.Passed);
+        Assert.Equal(CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder, result.FailureCode);
+        Assert.Contains("只接受开头连续", result.Detail, StringComparison.Ordinal);
+        Assert.Contains("后置 developer", result.Detail, StringComparison.Ordinal);
+        Assert.DoesNotContain("第二条前导", result.Detail, StringComparison.Ordinal);
+    }
     [Fact]
     public async Task ConversationControlFailureIsNotMisclassifiedAsContinuationOrder()
     {

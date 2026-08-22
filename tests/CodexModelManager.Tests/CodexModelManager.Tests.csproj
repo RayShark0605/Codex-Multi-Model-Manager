@@ -17,4 +17,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\CodexModelManager.Core\CodexModelManager.Core.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <None Include="Fixtures\unsloth-qwen3.8-prefix-template.jinja" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 </Project>

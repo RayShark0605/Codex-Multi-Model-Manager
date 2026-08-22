@@ -84,6 +84,25 @@ public static class CompatibilityFailureCodes
     public const string LmStudioLifecycleFailed = "lmstudio-lifecycle-failed";
 }
 
+public enum LmStudioModelFileResolutionStatus
+{
+    Success,
+    InvalidModelSnapshot,
+    UnsupportedEndpoint,
+    CliUnavailable,
+    CliTimedOut,
+    CliFailed,
+    InvalidJson,
+    InvalidSettings,
+    IdentityMismatch,
+    UnsafePath,
+    MissingFile,
+    UnsupportedFileType,
+    Ambiguous,
+    Conflict,
+    NoMatch
+}
+
 public enum ConfigMutationKind
 {
     Add,
@@ -215,6 +234,14 @@ public sealed record LmStudioModelFileResolution(
     string? Architecture,
     string? Quantization,
     string Source);
+
+public sealed record LmStudioModelFileResolutionAttempt(
+    LmStudioModelFileResolutionStatus Status,
+    LmStudioModelFileResolution? Resolution,
+    string Diagnostic)
+{
+    public bool Succeeded => Status == LmStudioModelFileResolutionStatus.Success && Resolution is not null;
+}
 
 public sealed record ModelProfile(
     string Id,

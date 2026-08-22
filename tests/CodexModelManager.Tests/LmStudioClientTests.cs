@@ -239,11 +239,14 @@ public sealed class LmStudioClientTests
     }
 
     [Fact]
-    public void LocatorSupportsLegacyAbsoluteGgufPath()
+    public void LocatorSupportsOnlyControlledAbsoluteGgufPath()
     {
         using var temporary = new TemporaryDirectory();
-        string gguf = Path.Combine(temporary.Path, "absolute-Q8_0.gguf");
+        string downloads = Path.Combine(temporary.Path, "downloads");
+        Directory.CreateDirectory(downloads);
+        string gguf = Path.Combine(downloads, "absolute-Q8_0.gguf");
         File.WriteAllText(gguf, "fixture");
+        string settings = JsonSerializer.Serialize(new { downloadsFolder = downloads });
         string variants = JsonSerializer.Serialize(new[]
         {
             new
@@ -258,11 +261,20 @@ public sealed class LmStudioClientTests
         LmStudioModelFileResolution? resolution = LmStudioModelFileLocator.ResolveFromJson(
             CreateLocatorModel(),
             variants,
-            null,
+            settings,
             temporary.Path);
 
         Assert.NotNull(resolution);
         Assert.Equal(Path.GetFullPath(gguf), resolution.FilePath);
+
+        string outside = Path.Combine(temporary.Path, "outside-Q8_0.gguf");
+        File.WriteAllText(outside, "fixture");
+        string outsideVariants = JsonSerializer.Serialize(new[] { new { modelKey = "qwen/root@q8_0", path = outside, architecture = "qwen35", quantization = new { name = "Q8_0" } } });
+        Assert.Null(LmStudioModelFileLocator.ResolveFromJson(
+            CreateLocatorModel(),
+            outsideVariants,
+            settings,
+            temporary.Path));
     }
 
     [Fact]
