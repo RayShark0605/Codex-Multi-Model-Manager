@@ -170,3 +170,67 @@ native `/api/v1/models` 仍是 loaded instance 和实际 context 的权威来源
 | 真实 Codex Provider 切换 | **Untested** |
 
 因此，本轮已经完成并验证了**定位器、模板识别/生成、探测分类、provenance、恢复强度、测试与重新发布**；但没有声称当前正在运行的 Codex 已切换到 LM Studio，也没有声称真实运行时模板已被修补。
+## 2026-08-23：上下文溢出与工具调用 JSON 截断修复
+
+### 根因证据
+
+本轮交叉核对了以下现场工件：
+
+- `C:\Users\xr\.lmstudio\server-logs\2026-08\2026-08-23.1.log`
+- `C:\Users\xr\.codex\sessions\2026\08\22\rollout-2026-08-22T21-59-05-01a029c4-9993-7393-9f7e-b92a7fb0d722.jsonl`
+
+失败链已确认为：模型生成到 `n_tokens=120063`、`truncated=1`，正在生成的 tool-call arguments JSON 在 `120064` 硬窗口处被截断，LM Studio 的 `handleToolCallGenerationFailed` 随后报告 `Unterminated string in JSON`。Codex UI 的 `stream disconnected before completion` 是 `response.failed` 的上层包装；提高 stream retry/timeout 不会修复已被截断的 JSON。
+
+### 实现与自动化结果
+
+- Auto Compact policy v2：`min(floor(L × 0.80), L - min(24576, floor(L / 2)))`；`L=120064` 得到 `95488`。
+- Tool Output：`clamp(floor(L / 50), 2048, 4096)`，并带极小窗口比例保护；`L=120064` 得到 `2401`。
+- LM Studio 候选显式写入 `model_auto_compact_token_limit_scope="total"`。
+- 偏好 schema 升至 v2；旧公式精确值迁移为 Automatic，其他旧值迁移为 Manual，loaded context 改变时不复用旧手动值。
+- `tool_output_token_limit` 已进入受控 root key；Local → OpenAI/DeepSeek 会逐字恢复 provider 历史值，原先不存在则删除本地专用值。
+- 手动 compact 高于平衡建议时只警告；达到/超过 context 或不足 1,024 tokens 硬余量仍拒绝。
+
+| 检查 | 结果 |
+|---|---|
+| 修改前基线 | 190 PASS / 0 FAIL / 7 SKIP |
+| 最终 Debug 全量测试 | 206 PASS / 0 FAIL / 7 SKIP |
+| 最终 Release 全量测试 | 206 PASS / 0 FAIL / 7 SKIP |
+| 隔离 Codex Home SwitchMatrix | 42 PASS / 0 FAIL / 0 SKIP |
+| Debug/Release build | PASS，0 warning / 0 error |
+| `dotnet format --verify-no-changes --no-restore` | PASS |
+| `git diff --check` | PASS |
+
+测试工件：
+
+- `D:\MyProjects\Codex Multi-Model Manager\artifacts\test-results\context-overflow-debug-final.trx`
+- `D:\MyProjects\Codex Multi-Model Manager\artifacts\test-results\context-overflow-release.trx`
+- `D:\MyProjects\Codex Multi-Model Manager\artifacts\test-results\context-overflow-isolated-roundtrip.trx`
+
+### 真实状态零写入预览
+
+只读验证重新读取 native `/api/v1/models`，当前唯一 loaded LLM 为 `qwen3.8-27b@q6_k_xl`，`context_length=120064`、Max `262144`。使用实际 `ConfigurationSwitchService.CreatePlanAsync` 和实际 LM Studio instruction-hierarchy preflight 生成预览，preflight 为 PASS，候选语义精确为：
+
+```toml
+model = "qwen3.8-27b@q6_k_xl"
+model_provider = "lmstudio"
+model_context_window = 120064
+model_auto_compact_token_limit = 95488
+model_auto_compact_token_limit_scope = "total"
+tool_output_token_limit = 2401
+```
+
+验证程序从未调用 `CommitAsync`。真实 `C:\Users\xr\.codex\config.toml` 在预览前后均为 5,542 bytes，SHA-256 均为 `969B94165B0DF735FBE1D769DB12C06D14557DE5D5011B97D94548E6EA63F48D`；provider 仍是隐式 `openai`，model 仍是 `gpt-5.6-sol`。结构化证据：
+
+`D:\MyProjects\Codex Multi-Model Manager\artifacts\test-results\context-overflow-readonly-preview.json`
+
+### 发布工件
+
+| 文件 | Bytes | SHA-256 |
+|---|---:|---|
+| `D:\MyProjects\Codex Multi-Model Manager\artifacts\publish\win-x64\CodexModelManager.exe` | 71,988,411 | `C8915E37A685598E22596C4585D411B2936CE56BE876D154D3A3D6EB3D3AFDB4` |
+| `D:\MyProjects\Codex Multi-Model Manager\artifacts\publish\win-x64\helpers\credential\CodexModelManager.CredentialHelper.exe` | 35,441,726 | `23D7473F2ABC48D515664D3C87028125CB8DE9D888D8030FA7667148819D4187` |
+| `D:\MyProjects\Codex Multi-Model Manager\artifacts\publish\win-x64\helpers\mcp\CodexModelManager.TestMcpServer.exe` | 35,092,605 | `2549EA8F0AEF26FA82822925D34E4EC4CEA326D64069440D3413459FB14C9A9C` |
+
+### 尚未验证的运行时边界
+
+按用户要求，本轮没有把候选提交到真实 Codex 配置，也没有把当前 provider 从 OpenAI 切换到 LM Studio。因此“真实长任务能否在约 95.5k 附近及时 compact，且日志不再出现 `120063 / truncated=1 / handleToolCallGenerationFailed / Unterminated string`”仍明确标记为 **Untested**。下次主动切换后应使用新任务或克隆任务验证；如果平衡阈值仍复现，下一档使用安全优先值 `87296`，不要增加 stream retries。

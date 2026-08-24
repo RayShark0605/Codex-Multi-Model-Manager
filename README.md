@@ -98,24 +98,38 @@ Continuation:  与 Conversation 相同，仅在最后一个 user 前增加 devel
 
 运行时修复在 `%LOCALAPPDATA%\CodexModelManager\transactions` 中先写不含模板正文和 Token 的 schema-v3 恢复记录，保存最后稳定阶段、失败阶段、脱敏 API 错误、load 前后候选 ID、原运行时模板来源/规则/SHA/evidence transaction、目标规则和原四阶段摘要。load、配置对比、层级探测、最终 Codex 配置确认或 Commit 任一步失败/取消，都会卸载可唯一归因的补丁实例并恢复事务记录证明的原运行时模板。schema-v1/v2 继续只读兼容。程序异常退出后不会静默重载；下次启动会先只读评估，并在 LM Studio 页启用 **检查/恢复未完成事务**。如果唯一当前实例已经与原始快照和原四阶段签名完全一致，确认后只关闭 journal，不做昂贵的重复 unload/load；schema 3 比较四个步骤各自的 PASS/HTTP 状态及 failure code，不再只看某一个失败标签。schema 1/2 仅兼容旧记录，状态仍有歧义时继续阻断而不猜测。
 
-## Local Context、Max Context 与 Auto Compact
+## Local Context、Max Context、Auto Compact 与 Tool Output Limit
 
-`max_context_length` 是模型理论上限；`loaded_instances[].config.context_length` 才是当前 LM Studio 实例真正分配的上下文。管理器强制：
+`max_context_length` 是模型理论上限；`loaded_instances[].config.context_length` 才是当前 LM Studio 实例真正分配的上下文。管理器保持真实窗口，不把 Codex 的说明性有效窗口伪装成服务端硬窗口，并强制：
 
 ```text
 model_context_window = actual loaded context
-0 < model_auto_compact_token_limit < model_context_window
+0 < tool_output_token_limit < model_auto_compact_token_limit < model_context_window
+model_context_window - model_auto_compact_token_limit >= 1024
+model_auto_compact_token_limit_scope = "total"
 ```
 
-默认 compact 建议值为：
+平衡模式的 Auto Compact 建议值为：
 
 ```text
-min(floor(loadedContext * 0.90), loadedContext - 8192)
+autoCompact = min(
+    floor(loadedContext * 0.80),
+    loadedContext - min(24576, floor(loadedContext / 2)))
 ```
 
-它是**管理器安全建议值**，不是 Codex 官方百分比标准。每个 local model 的 loaded context 与 compact 偏好保存在管理器自己的 `appsettings.json`；如果实际 loaded context 改变，旧偏好不会被盲目套用。
+这会同时保留至少 20% 的比例余量和最多 24,576 tokens 的绝对余量约束。对于 `loadedContext=120064`，建议值是 `95488`，到 LM Studio 硬窗口还剩 `24576`；Codex 对未知/本地模型按默认 95% 估算的有效窗口为 `floor(120064 × 0.95)=114060`（UI 约 `114k`），因此到该说明性边界还剩 `18572`。
 
-2026-08-22 本轮只读审计执行时，native `/api/v1/models` 报告 `qwen3.8-27b@q6_k_xl` 已加载，architecture/quantization 为 `qwen35` / `Q6_K_XL`，实际 `context_length=161024`、Max `262144`；这些是本次现场快照，不是代码常量。管理器在预览、卸载前、补丁加载后和 Codex Commit 前重新读取 native 状态，始终使用当时真实的 `loaded_instances[].config.context_length`，不会把 `lms ps`、模型理论 Max、截图或缓存猜作 loaded context。
+单个工具结果写回历史的建议值为：
+
+```text
+toolOutputLimit = clamp(floor(loadedContext / 50), 2048, 4096)
+```
+
+极小窗口还会受 Auto Compact 的额外比例保护。对于 `120064`，写入 `tool_output_token_limit=2401`。该键只限制**单个 tool/function 输出进入 context manager 的规模**，不限制模型 reasoning、assistant 文本、正在生成的函数参数 JSON，也不是 LM Studio `/v1/responses` 的模型输出上限；它只是减缓后续历史膨胀的第二道防线。
+
+这些数值是**管理器策略**，不是 Codex 官方固定百分比。默认选择“自动建议”；用户可切到 Manual 并保留合法自定义值。手动值高于平衡建议时只显示风险警告，不静默改写；达到/超过 loaded context 或余量小于 1,024 tokens 时仍会阻止切换。偏好 schema v2 会把同一 loaded context 下精确等于旧 `90% / 8192` 公式的值迁移为 Automatic 新建议，把其他旧值视为 Manual 原样保留；loaded context 改变后不会跨窗口复用旧手动值。
+
+2026-08-23 本轮只读审计时，native `/api/v1/models` 报告 `qwen3.8-27b@q6_k_xl` 已加载，实际 `context_length=120064`、Max `262144`；这些是现场快照，不是代码常量。管理器在预览、卸载前、补丁加载后和 Codex Commit 前重新读取 native 状态，始终使用当时真实的 `loaded_instances[].config.context_length`，不会把 `lms ps`、模型理论 Max、截图或缓存猜作 loaded context。
 
 本机只读 GGUF 检查确认了三个不同的源模板结构：Qwen3.6 的模板 SHA-256 为 `E84F32A23FDDA27689F868AA4A1A5621F41133E51A48D7F3EFCBEA2839574259`，对应 v3 为 `235C3E8D316D80E23827174F1A8CEF37B1E5018CF70ED8F52F2C6FB9C0E233CD`；两个较早检查的 Qwen3.8-27B Q6_K/Q8_0 文件共享源 SHA `C3CF9E34ABF4F9E36C2D72165AA9C132D3E2A725B6C2586AAA3A8AF9D7A81041`，对应 v3 为 `4AA5CC42C084FCC8235AAF0500835F4F9419A72280EA7E02D08EEE9A97807D8B`；当前 Unsloth `Qwen3.8-27B-UD-Q6_K_XL.gguf` 的 184 行 prefix-merged-system 源 SHA 为 `12827F24B742EA4E80CDC12DBCF9622227056B9F797252A3149263D4F9AAADCE`，确定性 v3 SHA 为 `9DC0DA000D1DF280BE9F6F64D314EB52879C0DF5C3C951F74105964136592F85`。v3 在主 conversation 循环中对已经合并的 system/developer 连 `render_content` 都不再调用，避免 vision 计数等隐藏副作用。所有 SHA 仅用于审计、重建与漂移检测；`qwen-interleaved-instructions-v3` 仍按各模板族完整精确结构放行，未知结构或 Marker 保守返回 `Unsupported Template`。旧 v2 只用于精确识别、升级和事务回滚。
 
@@ -129,6 +143,7 @@ min(floor(loadedContext * 0.90), loadedContext - 8192)
 - `model_context_window`
 - `model_auto_compact_token_limit`
 - `model_auto_compact_token_limit_scope`（Local 建议值按当前官方 `total` 语义计算；切回 OpenAI 时恢复原状态）
+- `tool_output_token_limit`（Local 写入自适应值；切回 OpenAI/DeepSeek 时恢复原值或删除原先不存在的键）
 - `model_reasoning_effort`
 - `preferred_auth_method`（只用于识别/清理 legacy 冲突）
 - `forced_login_method`

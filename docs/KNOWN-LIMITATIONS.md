@@ -23,6 +23,13 @@
 4. **MCP 保持 Known Limitation/Untested。**
    - 只有真实 `cmm_ping` 临时 MCP 测试通过后，当前模型的本次报告才可升级；不会据此修改用户 MCP。
 
+5. **长上下文工具调用 JSON 截断已定位，但新预算的真实长任务效果仍是 Untested。**
+   - 2026-08-23 的 Codex session 与 LM Studio server log 交叉证明：失败采样达到 `n_tokens=120063`、`truncated=1` 后，`handleToolCallGenerationFailed` 因不完整 arguments 抛出 `Unterminated string in JSON`；Codex UI 的 `stream disconnected before completion` 是上层包装，不是普通网络抖动。
+   - 故障链是长 reasoning/assistant 生成进入 tool-call arguments 后撞上 `120064` 硬窗口，JSON 被截断并解析失败。增加 retry 或 stream timeout 只会重复同一边界失败，不能修复已被截断的 JSON。
+   - 新平衡值 `95488` 为本次 `120064` 窗口留下 `24576` tokens，比现场单次约 1.88 万 tokens 的增长多约 5.7k，但不对无限长 reasoning 提供数学保证。若仍复现，安全优先建议为 `87296`，而不是继续增加重试次数。
+   - `tool_output_token_limit=2401` 仅限制单个工具结果写回历史，不能限制 reasoning、assistant 文本或函数 arguments 的生成长度，也不能替代模型输出上限。
+   - 本轮按要求不切换真实 Provider；在使用新配置完成一次真实长上下文任务并检查 LM Studio 日志前，运行时结论必须保持 **Untested**。
+
 ## 设计边界
 
 - 常规发现、刷新、测试与 Preview 不自动 load/unload。只有失败码为 `lmstudio-chat-template-system-order`、`lmstudio-chat-template-developer-role` 或 `lmstudio-chat-template-continuation-instruction-order`，精确变体与 GGUF 均可证明且用户确认后，Switch 才执行事务式 unload/load；它保留 native API 暴露的加载配置，而不是选择新的 context、量化、GPU/KV 或 speculative 参数。
@@ -30,7 +37,7 @@
 - 运行时 `prompt_template` 对象已由本机 LM Studio 0.4.21 schema 证实，但尚未进入公开 REST 参数文档，属于版本相关能力。请求被拒绝、响应不回显 `load_config`、重载配置漂移或 hierarchy 不 PASS 时自动回滚；未知版本不会仅凭版本号放行。
 - 自动路径不写 GGUF 或持久化 LM Studio per-model override；补丁只属于当前加载实例。手工导出路径仍只读 GGUF 并输出独立工件，手工 override 的撤销仍由用户在 LM Studio 中明确操作。
 - `/load.model` 只接受 native model `key` 的行为以 LM Studio 0.4.21 实测为准；`selected_variant` 不是 load ID。管理器仍要求 load 前后 `selected_variant`、量化、架构、max context 和完整配置一致，因此使用源 key 不代表允许静默回退到默认量化。
-- LM Studio native API 与 `lms ps` 可能短暂显示不同 loaded 状态。安全切换只信任 `/api/v1/models` 的 loaded instance/config；`lms ps` 只贡献严格匹配后的本机文件路径证据。2026-08-22 只读实测为 Unsloth Qwen3.8 Q6_K_XL、实际 context `161024`、Max `262144`；这些不会成为固定值，也不会由 CLI 反向覆盖 native。`lms ls` 与 `lms ps` 的两个有效路径冲突、任一 CLI 失败/超时/非法 JSON、字段冲突、歧义、越界或非 GGUF 时自动定位均 fail closed，手工选择仍可用。
+- LM Studio native API 与 `lms ps` 可能短暂显示不同 loaded 状态。安全切换只信任 `/api/v1/models` 的 loaded instance/config；`lms ps` 只贡献严格匹配后的本机文件路径证据。2026-08-23 只读实测为 Unsloth Qwen3.8 Q6_K_XL、实际 context `120064`、Max `262144`；这些不会成为固定值，也不会由 CLI 反向覆盖 native。`lms ls` 与 `lms ps` 的两个有效路径冲突、任一 CLI 失败/超时/非法 JSON、字段冲突、歧义、越界或非 GGUF 时自动定位均 fail closed，手工选择仍可用。
 - 崩溃恢复事务不会在应用启动时静默重载；存在未完成/回滚失败事务时会阻止新的 Preview/Switch，但刷新 native 状态及 **检查/恢复未完成事务** 始终可用。schema-v1/v2 旧 journal 的 provenance 可能不完整；schema-v3 会记录 BuiltIn/ManagerRule、规则/SHA/evidence transaction 和原四阶段摘要。只有唯一归因、完整配置一致、GGUF 未变且原运行时签名精确复现时才允许关闭；若 native 状态出现无法归因的多实例歧义，恢复会停止而不是猜测卸载目标。
 - 不执行 DeepSeek 官方 setup script；在线下载失败时使用带 provenance 的发行快照，用户应关注缓存抓取时间。
 - OpenAI App Server 不可达时 model cache 可能过期，UI 会标记 stale。

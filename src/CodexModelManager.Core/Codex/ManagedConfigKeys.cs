@@ -22,6 +22,7 @@ public static class ManagedConfigKeys
         "model_context_window",
         "model_auto_compact_token_limit",
         "model_auto_compact_token_limit_scope",
+        "tool_output_token_limit",
         "model_reasoning_effort",
         "preferred_auth_method",
         "forced_login_method",

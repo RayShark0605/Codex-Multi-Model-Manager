@@ -118,6 +118,12 @@ public enum SecondaryOverridePolicy
     RestoreOriginal
 }
 
+public enum AutoCompactMode
+{
+    Automatic,
+    Manual
+}
+
 public enum BackupOperation
 {
     InitialSnapshot,
@@ -392,7 +398,9 @@ public sealed record SwitchRequest(
     bool? TargetSupportsReasoning = null,
     string? TargetModelType = null,
     string? SecondaryOverrideSelectionJson = null,
-    string? TargetAllowedCodexReasoningEfforts = null);
+    string? TargetAllowedCodexReasoningEfforts = null,
+    int? ToolOutputTokenLimit = null,
+    AutoCompactMode? AutoCompactMode = null);
 
 public sealed record PlannedFileChange(
     string Path,
@@ -532,7 +540,7 @@ public sealed record ProviderState(
 
 public sealed class AppSettings
 {
-    public int SchemaVersion { get; set; } = 1;
+    public int SchemaVersion { get; set; } = 2;
 
     public string? CodexHomeOverride { get; set; }
 
@@ -558,6 +566,12 @@ public sealed class ModelPreference
     public int? CodexContext { get; set; }
 
     public int? AutoCompactTokenLimit { get; set; }
+
+    public AutoCompactMode? AutoCompactMode { get; set; }
+
+    public int? AutoCompactPolicyVersion { get; set; }
+
+    public int? ToolOutputTokenLimit { get; set; }
 }
 
 public sealed class BackupManifest

@@ -136,6 +136,8 @@ public sealed class CodexSmokeTestService
             builder.Append("model_provider = ").AppendLine(JsonSerializer.Serialize(provider));
             if (request.ContextWindow is int context) builder.Append("model_context_window = ").AppendLine(context.ToString(System.Globalization.CultureInfo.InvariantCulture));
             if (request.AutoCompactTokenLimit is int compact) builder.Append("model_auto_compact_token_limit = ").AppendLine(compact.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            if (request.AutoCompactTokenLimit is not null) builder.AppendLine("model_auto_compact_token_limit_scope = \"total\"");
+            if (request.ToolOutputTokenLimit is int toolOutput) builder.Append("tool_output_token_limit = ").AppendLine(toolOutput.ToString(System.Globalization.CultureInfo.InvariantCulture));
             if (provider != "lmstudio")
             {
                 Uri endpoint = request.LmStudioEndpoint ?? new Uri("http://127.0.0.1:1234");

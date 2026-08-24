@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json;
 using CodexModelManager.Core.Abstractions;
 using CodexModelManager.Core.Codex;
+using CodexModelManager.Core.Infrastructure;
 using CodexModelManager.Core.LmStudio;
 using CodexModelManager.Core.Models;
 
@@ -9,6 +10,16 @@ namespace CodexModelManager.Tests;
 
 public sealed class SwitchMatrixTests
 {
+    [Theory]
+    [InlineData(120_064, 95_488, 2_401)]
+    [InlineData(65_536, 40_960, 2_048)]
+    [InlineData(32_768, 16_384, 2_048)]
+    [InlineData(262_144, 209_715, 4_096)]
+    public void LocalContextPoliciesReserveBalancedHeadroom(int contextWindow, int expectedCompact, int expectedToolOutput)
+    {
+        Assert.Equal(expectedCompact, ConfigurationSwitchService.SuggestAutoCompact(contextWindow));
+        Assert.Equal(expectedToolOutput, ConfigurationSwitchService.SuggestToolOutputLimit(contextWindow));
+    }
     public static TheoryData<ProviderKind, ProviderKind> Transitions => new()
     {
         { ProviderKind.OpenAI, ProviderKind.DeepSeek },
@@ -88,9 +99,30 @@ public sealed class SwitchMatrixTests
         Assert.Contains("model_context_window = 65536", text, StringComparison.Ordinal);
         Assert.Contains($"model_auto_compact_token_limit = {ConfigurationSwitchService.SuggestAutoCompact(65_536)}", text, StringComparison.Ordinal);
         Assert.Contains("model_auto_compact_token_limit_scope = \"total\"", text, StringComparison.Ordinal);
+        Assert.Contains($"tool_output_token_limit = {ConfigurationSwitchService.SuggestToolOutputLimit(65_536)}", text, StringComparison.Ordinal);
         Assert.DoesNotContain("262144", text, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task Qwen120064CandidateUsesBalancedExactValues()
+    {
+        using var harness = new SwitchHarness(SwitchHarness.BaseConfig);
+        SwitchRequest request = harness.Request(ProviderKind.LmStudio) with
+        {
+            ContextWindow = 120_064,
+            AutoCompactTokenLimit = 95_488,
+            ToolOutputTokenLimit = 2_401,
+            AutoCompactMode = AutoCompactMode.Automatic,
+        };
+
+        SwitchPlan plan = await harness.Service.CreatePlanAsync(request);
+        string text = Encoding.UTF8.GetString(Assert.Single(plan.Files).CandidateBytes!);
+
+        Assert.Contains("model_context_window = 120064", text, StringComparison.Ordinal);
+        Assert.Contains("model_auto_compact_token_limit = 95488", text, StringComparison.Ordinal);
+        Assert.Contains("model_auto_compact_token_limit_scope = \"total\"", text, StringComparison.Ordinal);
+        Assert.Contains("tool_output_token_limit = 2401", text, StringComparison.Ordinal);
+    }
     [Fact]
     public async Task LocalContextPreferenceAndEndpointArePersistedOutsideCodexConfig()
     {
@@ -102,6 +134,10 @@ public sealed class SwitchMatrixTests
         Assert.Equal(65_536, preference.LastLoadedContext);
         Assert.Equal(65_536, preference.CodexContext);
         Assert.Equal(ConfigurationSwitchService.SuggestAutoCompact(65_536), preference.AutoCompactTokenLimit);
+        Assert.Equal(AutoCompactMode.Automatic, preference.AutoCompactMode);
+        Assert.Equal(ConfigurationSwitchService.AutoCompactPolicyVersion, preference.AutoCompactPolicyVersion);
+        Assert.Equal(ConfigurationSwitchService.SuggestToolOutputLimit(65_536), preference.ToolOutputTokenLimit);
+        Assert.Equal(AppSettingsRepository.CurrentSchemaVersion, saved.SchemaVersion);
         Assert.Equal("http://127.0.0.1:1234", saved.LmStudioEndpoint);
     }
 
@@ -113,6 +149,41 @@ public sealed class SwitchMatrixTests
         await Assert.ThrowsAsync<InvalidOperationException>(() => harness.Service.CreatePlanAsync(invalid));
     }
 
+    [Fact]
+    public async Task CompactionWithLessThan1024TokensHeadroomIsRejected()
+    {
+        using var harness = new SwitchHarness(SwitchHarness.BaseConfig);
+        SwitchRequest invalid = harness.Request(ProviderKind.LmStudio) with { AutoCompactTokenLimit = 64_513 };
+        await Assert.ThrowsAsync<InvalidOperationException>(() => harness.Service.CreatePlanAsync(invalid));
+    }
+
+    [Fact]
+    public async Task InvalidToolOutputLimitIsRejected()
+    {
+        using var harness = new SwitchHarness(SwitchHarness.BaseConfig);
+        SwitchRequest invalid = harness.Request(ProviderKind.LmStudio) with
+        {
+            ToolOutputTokenLimit = ConfigurationSwitchService.SuggestAutoCompact(65_536),
+        };
+        await Assert.ThrowsAsync<InvalidOperationException>(() => harness.Service.CreatePlanAsync(invalid));
+    }
+
+    [Fact]
+    public async Task ManualCompactAboveBalancedSuggestionWarnsWithoutChangingValue()
+    {
+        using var harness = new SwitchHarness(SwitchHarness.BaseConfig);
+        SwitchRequest manual = harness.Request(ProviderKind.LmStudio) with
+        {
+            AutoCompactTokenLimit = 50_000,
+            AutoCompactMode = AutoCompactMode.Manual,
+        };
+
+        SwitchPlan plan = await harness.Service.CreatePlanAsync(manual);
+        string text = Encoding.UTF8.GetString(Assert.Single(plan.Files).CandidateBytes!);
+
+        Assert.Contains("model_auto_compact_token_limit = 50000", text, StringComparison.Ordinal);
+        Assert.Contains(plan.Warnings, warning => warning.Contains("高于平衡策略建议值", StringComparison.Ordinal));
+    }
     [Fact]
     public async Task UnsupportedLocalReasoningEffortIsRejected()
     {
@@ -193,6 +264,43 @@ public sealed class SwitchMatrixTests
         Assert.Contains("[mcp_servers.demo]", restored, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task LocalToolOutputLimitIsRemovedWhenOpenAiOriginallyHadNoValue()
+    {
+        const string initial = "model = \"gpt-custom\"\n";
+        using var harness = new SwitchHarness(initial);
+
+        await harness.Service.CommitAsync(await harness.Service.CreatePlanAsync(harness.Request(ProviderKind.LmStudio)));
+        Assert.Contains("tool_output_token_limit = 2048", harness.ReadConfig(), StringComparison.Ordinal);
+
+        await harness.Service.CommitAsync(await harness.Service.CreatePlanAsync(harness.Request(ProviderKind.OpenAI)));
+        Assert.DoesNotContain("tool_output_token_limit", harness.ReadConfig(), StringComparison.Ordinal);
+    }
+    [Fact]
+    public async Task LocalToolOutputLimitRestoresExactOpenAiValue()
+    {
+        const string initial = "model = \"gpt-custom\"\ntool_output_token_limit = 7777\n";
+        using var harness = new SwitchHarness(initial);
+
+        await harness.Service.CommitAsync(await harness.Service.CreatePlanAsync(harness.Request(ProviderKind.LmStudio)));
+        Assert.Contains("tool_output_token_limit = 2048", harness.ReadConfig(), StringComparison.Ordinal);
+
+        await harness.Service.CommitAsync(await harness.Service.CreatePlanAsync(harness.Request(ProviderKind.OpenAI)));
+        Assert.Contains("tool_output_token_limit = 7777", harness.ReadConfig(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task LocalToolOutputLimitRestoresExactDeepSeekValue()
+    {
+        string initial = SourceConfig(ProviderKind.DeepSeek).Replace("model_reasoning_effort = \"max\"", "model_reasoning_effort = \"high\"\ntool_output_token_limit = 3333", StringComparison.Ordinal);
+        using var harness = new SwitchHarness(initial);
+
+        await harness.Service.CommitAsync(await harness.Service.CreatePlanAsync(harness.Request(ProviderKind.LmStudio)));
+        Assert.Contains("tool_output_token_limit = 2048", harness.ReadConfig(), StringComparison.Ordinal);
+
+        await harness.Service.CommitAsync(await harness.Service.CreatePlanAsync(harness.Request(ProviderKind.DeepSeek)));
+        Assert.Contains("tool_output_token_limit = 3333", harness.ReadConfig(), StringComparison.Ordinal);
+    }
     [Fact]
     public async Task FollowMainSecondaryOverrideAndRestoreOriginal()
     {

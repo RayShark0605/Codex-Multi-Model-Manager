@@ -45,8 +45,45 @@ public sealed class ConfigurationSwitchService
         this.lmStudioPreflight = lmStudioPreflight;
     }
 
-    public static int SuggestAutoCompact(int contextWindow) =>
-        Math.Min((int)Math.Floor(contextWindow * 0.90), contextWindow - 8192);
+    public const int AutoCompactPolicyVersion = 2;
+
+    public static int SuggestAutoCompact(int contextWindow)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(contextWindow, 2_048);
+        const int absoluteReserve = 24_576;
+        const double maximumUsageRatio = 0.80;
+        int proportionalLimit = (int)Math.Floor(contextWindow * maximumUsageRatio);
+        int boundedAbsoluteReserve = Math.Min(absoluteReserve, contextWindow / 2);
+        return Math.Min(proportionalLimit, contextWindow - boundedAbsoluteReserve);
+    }
+
+    public static int SuggestToolOutputLimit(int contextWindow)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(contextWindow, 2_048);
+        int adaptiveLimit = Math.Clamp(contextWindow / 50, 2_048, 4_096);
+        int compactLimit = SuggestAutoCompact(contextWindow);
+        int smallContextLimit = Math.Max(256, compactLimit / 4);
+        return Math.Min(adaptiveLimit, smallContextLimit);
+    }
+
+    public static (int Limit, AutoCompactMode Mode) ResolveAutoCompactPreference(ModelPreference? preference, int contextWindow)
+    {
+        int suggestedCompact = SuggestAutoCompact(contextWindow);
+        if (preference?.LastLoadedContext == contextWindow &&
+            preference.AutoCompactMode == AutoCompactMode.Manual &&
+            preference.AutoCompactTokenLimit is int manualCompact &&
+            manualCompact > 0 && manualCompact < contextWindow && contextWindow - manualCompact >= 1_024)
+        {
+            return (manualCompact, AutoCompactMode.Manual);
+        }
+
+        return (suggestedCompact, AutoCompactMode.Automatic);
+    }
+    internal static int SuggestLegacyAutoCompact(int contextWindow)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(contextWindow, 2_048);
+        return Math.Min((int)Math.Floor(contextWindow * 0.90), contextWindow - 8_192);
+    }
 
     public async Task<SwitchPlan> CreatePlanAsync(SwitchRequest request, CancellationToken cancellationToken = default)
     {
@@ -79,7 +116,7 @@ public sealed class ConfigurationSwitchService
                 ConfigureOpenAi(roots, tables, removeTables, read, settings, request, warnings);
                 break;
             case ProviderKind.DeepSeek:
-                await ConfigureDeepSeekAsync(roots, tables, removeTables, read, request, warnings, cancellationToken).ConfigureAwait(false);
+                await ConfigureDeepSeekAsync(roots, tables, removeTables, read, settings, request, warnings, cancellationToken).ConfigureAwait(false);
                 break;
             case ProviderKind.LmStudio:
                 ConfigureLmStudio(roots, tables, removeTables, read, request, warnings);
@@ -204,9 +241,9 @@ public sealed class ConfigurationSwitchService
         TextFileSnapshot before = await TextFileCodec.ReadAsync(configChange.Path, cancellationToken).ConfigureAwait(false);
         ConfigReadResult beforeRead = patchEngine.Read(before.Text);
         AppSettings settings = await settingsRepository.LoadAsync(cancellationToken).ConfigureAwait(false);
-        if (regenerated.SourceProvider == ProviderKind.OpenAI)
+        if (regenerated.SourceProvider is ProviderKind.OpenAI or ProviderKind.DeepSeek)
         {
-            settings.ProviderStates[ProviderKind.OpenAI.ToString()] = CaptureOpenAiState(beforeRead, before.Fingerprint.Sha256);
+            settings.ProviderStates[regenerated.SourceProvider.ToString()] = CaptureProviderState(regenerated.SourceProvider, beforeRead, before.Fingerprint.Sha256);
         }
 
         if (regenerated.Request.SecondaryOverridePolicy == SecondaryOverridePolicy.FollowMain)
@@ -231,11 +268,16 @@ public sealed class ConfigurationSwitchService
         if (regenerated.Request.TargetProvider == ProviderKind.LmStudio && regenerated.Request.ContextWindow is int context)
         {
             settings.LmStudioEndpoint = regenerated.Request.LmStudioEndpoint?.AbsoluteUri.TrimEnd('/') ?? settings.LmStudioEndpoint;
+            AutoCompactMode compactMode = regenerated.Request.AutoCompactMode ??
+                (regenerated.Request.AutoCompactTokenLimit == SuggestAutoCompact(context) ? AutoCompactMode.Automatic : AutoCompactMode.Manual);
             settings.ModelPreferences[regenerated.Request.TargetModel] = new ModelPreference
             {
                 LastLoadedContext = context,
                 CodexContext = context,
                 AutoCompactTokenLimit = regenerated.Request.AutoCompactTokenLimit,
+                AutoCompactMode = compactMode,
+                AutoCompactPolicyVersion = AutoCompactPolicyVersion,
+                ToolOutputTokenLimit = regenerated.Request.ToolOutputTokenLimit,
             };
         }
 
@@ -312,6 +354,7 @@ public sealed class ConfigurationSwitchService
         Dictionary<string, string?> tables,
         List<string> removeTables,
         ConfigReadResult read,
+        AppSettings settings,
         SwitchRequest request,
         List<string> warnings,
         CancellationToken cancellationToken)
@@ -343,6 +386,7 @@ public sealed class ConfigurationSwitchService
         roots["preferred_auth_method"] = null;
         roots["model_context_window"] = null;
         roots["model_auto_compact_token_limit"] = null;
+        roots["tool_output_token_limit"] = GetSavedProviderRoot(settings, ProviderKind.DeepSeek, "tool_output_token_limit");
         string effort = request.ReasoningEffort ?? GetDefaultReasoning(selected.Value) ?? "high";
         HashSet<string> allowed = GetReasoningLevels(selected.Value);
         if (!allowed.Contains(effort)) throw new InvalidOperationException($"DeepSeek catalog 不支持 reasoning effort: {effort}");
@@ -382,8 +426,18 @@ public sealed class ConfigurationSwitchService
         if (request.TargetModelType is not null && !request.TargetModelType.Equals("llm", StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException($"所选 LM Studio instance 类型为 {request.TargetModelType}，禁止将非 LLM 模型配置给 Codex。");
         if (request.ContextWindow is null or <= 0) throw new InvalidOperationException("LM Studio 未返回实际 loaded context；禁止安全切换。");
         int context = request.ContextWindow.Value;
-        int compact = request.AutoCompactTokenLimit ?? SuggestAutoCompact(context);
+        int suggestedCompact = SuggestAutoCompact(context);
+        int compact = request.AutoCompactTokenLimit ?? suggestedCompact;
         if (compact <= 0 || compact >= context || context - compact < 1024) throw new InvalidOperationException("Auto Compact 必须小于实际 context，并保留安全余量。");
+        if (request.ToolOutputTokenLimit is not int toolOutput || toolOutput <= 0 || toolOutput >= compact)
+        {
+            throw new InvalidOperationException("Tool Output Limit 必须为正数且小于 Auto Compact。");
+        }
+
+        if (compact > suggestedCompact)
+        {
+            warnings.Add($"手动 Auto Compact {compact:N0} 高于平衡策略建议值 {suggestedCompact:N0}；本次仍允许切换，但仅剩 {context - compact:N0} tokens 硬窗口余量。");
+        }
         string providerId = request.LmStudioProviderId ?? "lmstudio";
         if (providerId is not ("lmstudio" or "lmstudio_local_cmm")) throw new InvalidOperationException("LM Studio provider ID 不受支持。");
         if (request.LmStudioEndpoint is null) throw new InvalidOperationException("LM Studio endpoint 缺失。");
@@ -399,6 +453,7 @@ public sealed class ConfigurationSwitchService
         roots["model_context_window"] = context.ToString(CultureInfo.InvariantCulture);
         roots["model_auto_compact_token_limit"] = compact.ToString(CultureInfo.InvariantCulture);
         roots["model_auto_compact_token_limit_scope"] = Quote("total");
+        roots["tool_output_token_limit"] = toolOutput.ToString(CultureInfo.InvariantCulture);
         roots["model_catalog_json"] = null;
         roots["model_reasoning_effort"] = string.IsNullOrWhiteSpace(request.ReasoningEffort) ? null : Quote(request.ReasoningEffort);
         roots["forced_login_method"] = null;
@@ -582,10 +637,13 @@ public sealed class ConfigurationSwitchService
 
         if (request.TargetProvider == ProviderKind.LmStudio)
         {
+            string? compactScope = CodexRuntimeProbe.Unquote(read.RootValues.GetValueOrDefault("model_auto_compact_token_limit_scope"));
             if (!int.TryParse(read.RootValues.GetValueOrDefault("model_context_window"), CultureInfo.InvariantCulture, out int context) || context != request.ContextWindow ||
-                !int.TryParse(read.RootValues.GetValueOrDefault("model_auto_compact_token_limit"), CultureInfo.InvariantCulture, out int compact) || compact <= 0 || compact >= context)
+                !int.TryParse(read.RootValues.GetValueOrDefault("model_auto_compact_token_limit"), CultureInfo.InvariantCulture, out int compact) || compact != request.AutoCompactTokenLimit ||
+                !int.TryParse(read.RootValues.GetValueOrDefault("tool_output_token_limit"), CultureInfo.InvariantCulture, out int toolOutput) || toolOutput != request.ToolOutputTokenLimit ||
+                !string.Equals(compactScope, "total", StringComparison.Ordinal))
             {
-                throw new InvalidDataException("候选配置语义检查失败：Local context/compaction 不一致。");
+                throw new InvalidDataException("候选配置语义检查失败：Local context/compaction/tool output 不一致。");
             }
         }
 
@@ -599,8 +657,18 @@ public sealed class ConfigurationSwitchService
         }
     }
 
-    private static ProviderState CaptureOpenAiState(ConfigReadResult read, string sha)
+    private static string? GetSavedProviderRoot(AppSettings settings, ProviderKind provider, string key) =>
+        settings.ProviderStates.TryGetValue(provider.ToString(), out ProviderState? state)
+            ? state.RootValues.GetValueOrDefault(key)
+            : null;
+
+    private static ProviderState CaptureProviderState(ProviderKind provider, ConfigReadResult read, string sha)
     {
+        if (provider is not (ProviderKind.OpenAI or ProviderKind.DeepSeek))
+        {
+            throw new ArgumentOutOfRangeException(nameof(provider), provider, "只允许持久化 OpenAI 或 DeepSeek provider state。");
+        }
+
         Dictionary<string, string?> roots = ManagedConfigKeys.Root.ToDictionary(key => key, key => read.RootValues.TryGetValue(key, out string? value) ? value : null, StringComparer.Ordinal);
         if (ContainsSensitiveUrlQuery(roots.GetValueOrDefault("openai_base_url")))
         {
@@ -609,9 +677,9 @@ public sealed class ConfigurationSwitchService
 
         // Provider tables can contain an official DeepSeek plaintext bearer token.
         // They are deliberately never copied into appsettings; only non-secret root
-        // values required to restore OpenAI authentication/provider semantics are kept.
+        // values needed for exact provider-specific restoration are kept.
         Dictionary<string, string?> tables = ManagedConfigKeys.ProviderTables.ToDictionary(key => key, _ => (string?)null, StringComparer.Ordinal);
-        return new ProviderState(ProviderKind.OpenAI, DateTimeOffset.Now, roots, tables, sha);
+        return new ProviderState(provider, DateTimeOffset.Now, roots, tables, sha);
     }
 
     private static bool ContainsSensitiveUrlQuery(string? rawValue)

@@ -21,9 +21,17 @@ public sealed class LmStudioControl : UserControl
         ReasoningValue = UiFactory.Label("未知");
         MaxContextValue = UiFactory.Label("未知");
         LoadedContextValue = UiFactory.Label("未知");
+        EffectiveContextValue = UiFactory.Label("未知");
         CodexContextInput = new NumericUpDown { Minimum = 1, Maximum = 4_000_000, Width = 180, ThousandsSeparator = true };
-        AutoCompactInput = new NumericUpDown { Minimum = 1, Maximum = 4_000_000, Width = 180, ThousandsSeparator = true };
+        AutoCompactInput = new NumericUpDown { Minimum = 1, Maximum = 4_000_000, Width = 180, ThousandsSeparator = true, Enabled = false };
+        AutoCompactAutomaticCheckBox = new CheckBox { Text = "自动建议", AutoSize = true, Checked = true, Margin = new Padding(10, 8, 6, 6) };
+        ResetAutoCompactButton = UiFactory.Button("恢复建议值", 110);
+        var autoCompactPanel = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = false };
+        autoCompactPanel.Controls.AddRange([AutoCompactInput, AutoCompactAutomaticCheckBox, ResetAutoCompactButton]);
+        ToolOutputLimitValue = UiFactory.Label("未知（自动）");
+        ToolOutputLimitValue.MaximumSize = new Size(760, 0);
         ContextWarningValue = UiFactory.Label("请选择 loaded model。");
+        ContextWarningValue.MaximumSize = new Size(760, 0);
         ContextWarningValue.ForeColor = Color.DarkOrange;
         DiscoverySourceValue = UiFactory.Label("未知");
         HierarchyStatusValue = UiFactory.Label("Untested", true);
@@ -59,8 +67,10 @@ public sealed class LmStudioControl : UserControl
         UiFactory.AddRow(table, "Reasoning", ReasoningValue);
         UiFactory.AddRow(table, "Model Max Context", MaxContextValue);
         UiFactory.AddRow(table, "Loaded Context", LoadedContextValue);
+        UiFactory.AddRow(table, "Codex Effective Context（95%）", EffectiveContextValue);
         UiFactory.AddRow(table, "Codex Configured Context", CodexContextInput);
-        UiFactory.AddRow(table, "Auto Compact（建议值）", AutoCompactInput);
+        UiFactory.AddRow(table, "Auto Compact", autoCompactPanel);
+        UiFactory.AddRow(table, "Tool Output Limit（自动）", ToolOutputLimitValue);
         UiFactory.AddRow(table, "Context 检查", ContextWarningValue);
         UiFactory.AddRow(table, "发现来源", DiscoverySourceValue);
         UiFactory.AddRow(table, "Codex Instruction Hierarchy", HierarchyStatusValue);
@@ -94,8 +104,12 @@ public sealed class LmStudioControl : UserControl
     public Label ReasoningValue { get; }
     public Label MaxContextValue { get; }
     public Label LoadedContextValue { get; }
+    public Label EffectiveContextValue { get; }
     public NumericUpDown CodexContextInput { get; }
     public NumericUpDown AutoCompactInput { get; }
+    public CheckBox AutoCompactAutomaticCheckBox { get; }
+    public Button ResetAutoCompactButton { get; }
+    public Label ToolOutputLimitValue { get; }
     public Label ContextWarningValue { get; }
     public Label DiscoverySourceValue { get; }
     public Label HierarchyStatusValue { get; }

@@ -21,7 +21,7 @@ public sealed class LiveCodexSmokeIntegrationTests
         string mcp = FindHelper(repository, "CodexModelManager.TestMcpServer", "mcp", "CodexModelManager.TestMcpServer.exe");
         var smoke = new CodexSmokeTestService(credential, mcp);
         int context = loaded.LoadedContextLength.Value;
-        var request = new SwitchRequest(ProviderKind.LmStudio, loaded.Id, null, context, ConfigurationSwitchService.SuggestAutoCompact(context), LmStudioProviderId: "lmstudio", LmStudioEndpoint: new Uri("http://127.0.0.1:1234"));
+        var request = new SwitchRequest(ProviderKind.LmStudio, loaded.Id, null, context, ConfigurationSwitchService.SuggestAutoCompact(context), LmStudioProviderId: "lmstudio", LmStudioEndpoint: new Uri("http://127.0.0.1:1234"), ToolOutputTokenLimit: ConfigurationSwitchService.SuggestToolOutputLimit(context), AutoCompactMode: AutoCompactMode.Automatic);
         SmokeTestResult result = await smoke.RunAsync(request, TestContext.Current.CancellationToken);
         Assert.True(result.Passed, result.Summary + " directory=" + result.Directory);
     }

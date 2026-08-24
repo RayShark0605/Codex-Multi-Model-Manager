@@ -24,6 +24,7 @@ internal sealed class MainController : IDisposable
     private int uiActionRunning;
     private AppSettings appSettings = new();
     private bool updating;
+    private AutoCompactMode autoCompactMode = AutoCompactMode.Automatic;
     private bool lmRequiresAuthentication;
     private string? credentialHelperPath;
     private string? mcpServerPath;
@@ -115,8 +116,25 @@ internal sealed class MainController : IDisposable
             UpdateLocalModelDetails();
             SyncMainLocalSelection();
         };
-        form.LmStudio.CodexContextInput.ValueChanged += (_, _) => { InvalidatePreview(); UpdateContextWarning(); };
-        form.LmStudio.AutoCompactInput.ValueChanged += (_, _) => { InvalidatePreview(); UpdateContextWarning(); };
+        form.LmStudio.CodexContextInput.ValueChanged += (_, _) =>
+        {
+            if (updating) return;
+            InvalidatePreview();
+            UpdateContextWarning();
+        };
+        form.LmStudio.AutoCompactInput.ValueChanged += (_, _) =>
+        {
+            if (updating) return;
+            autoCompactMode = AutoCompactMode.Manual;
+            InvalidatePreview();
+            UpdateContextWarning();
+        };
+        form.LmStudio.AutoCompactAutomaticCheckBox.CheckedChanged += (_, _) =>
+        {
+            if (updating) return;
+            SetAutoCompactMode(form.LmStudio.AutoCompactAutomaticCheckBox.Checked ? AutoCompactMode.Automatic : AutoCompactMode.Manual);
+        };
+        form.LmStudio.ResetAutoCompactButton.Click += (_, _) => SetAutoCompactMode(AutoCompactMode.Automatic);
         form.LmStudio.BrowseGgufButton.Click += (_, _) => BrowseForGguf();
         form.LmStudio.GgufPathText.TextChanged += (_, _) => InvalidateTemplateAnalysis();
         form.LmStudio.AnalyzeTemplateButton.Click += async (_, _) => await RunUiActionAsync(AnalyzePromptTemplateAsync);
@@ -339,20 +357,39 @@ internal sealed class MainController : IDisposable
         form.LmStudio.DiscoverySourceValue.Text = model?.Source ?? "未知";
         if (model?.LoadedContextLength is int context)
         {
-            int compact = ConfigurationSwitchService.SuggestAutoCompact(context);
-            if (appSettings.ModelPreferences.TryGetValue(model.Id, out ModelPreference? preference) &&
-                preference.LastLoadedContext == context &&
-                preference.AutoCompactTokenLimit is int preferredCompact &&
-                preferredCompact > 0 && preferredCompact < context && context - preferredCompact >= 1024)
-            {
-                compact = preferredCompact;
-            }
+            appSettings.ModelPreferences.TryGetValue(model.Id, out ModelPreference? preference);
+            (int compact, AutoCompactMode resolvedMode) = ConfigurationSwitchService.ResolveAutoCompactPreference(preference, context);
+            int toolOutput = ConfigurationSwitchService.SuggestToolOutputLimit(context);
+            int effectiveContext = (int)((long)context * 95 / 100);
 
+            autoCompactMode = resolvedMode;
             updating = true;
             try
             {
+                form.LmStudio.EffectiveContextValue.Text = $"{effectiveContext:N0}（约 {effectiveContext / 1000:N0}k）";
+                form.LmStudio.ToolOutputLimitValue.Text = $"{toolOutput:N0} tokens；仅限制单个工具结果写回历史，不限制 reasoning 或函数参数生成。";
                 form.LmStudio.CodexContextInput.Value = Math.Clamp(context, (int)form.LmStudio.CodexContextInput.Minimum, (int)form.LmStudio.CodexContextInput.Maximum);
                 form.LmStudio.AutoCompactInput.Value = Math.Clamp(compact, (int)form.LmStudio.AutoCompactInput.Minimum, (int)form.LmStudio.AutoCompactInput.Maximum);
+                form.LmStudio.AutoCompactAutomaticCheckBox.Checked = resolvedMode == AutoCompactMode.Automatic;
+                form.LmStudio.AutoCompactInput.Enabled = resolvedMode == AutoCompactMode.Manual && !lmStudioLifecycleBusy;
+                form.LmStudio.ResetAutoCompactButton.Enabled = !lmStudioLifecycleBusy;
+            }
+            finally
+            {
+                updating = false;
+            }
+        }
+        else
+        {
+            autoCompactMode = AutoCompactMode.Automatic;
+            updating = true;
+            try
+            {
+                form.LmStudio.EffectiveContextValue.Text = "未知";
+                form.LmStudio.ToolOutputLimitValue.Text = "未知（需要实际 loaded context）";
+                form.LmStudio.AutoCompactAutomaticCheckBox.Checked = true;
+                form.LmStudio.AutoCompactInput.Enabled = false;
+                form.LmStudio.ResetAutoCompactButton.Enabled = false;
             }
             finally
             {
@@ -363,6 +400,36 @@ internal sealed class MainController : IDisposable
         UpdateContextWarning();
     }
 
+    private void SetAutoCompactMode(AutoCompactMode mode)
+    {
+        if (lmStudioLifecycleBusy) return;
+        ModelProfile? model = form.LmStudio.ModelCombo.SelectedItem as ModelProfile;
+        if (model?.IsLoaded != true || model.LoadedContextLength is not int context)
+        {
+            return;
+        }
+
+        autoCompactMode = mode;
+        updating = true;
+        try
+        {
+            form.LmStudio.AutoCompactAutomaticCheckBox.Checked = mode == AutoCompactMode.Automatic;
+            if (mode == AutoCompactMode.Automatic)
+            {
+                int compact = ConfigurationSwitchService.SuggestAutoCompact(context);
+                form.LmStudio.AutoCompactInput.Value = Math.Clamp(compact, (int)form.LmStudio.AutoCompactInput.Minimum, (int)form.LmStudio.AutoCompactInput.Maximum);
+            }
+
+            form.LmStudio.AutoCompactInput.Enabled = mode == AutoCompactMode.Manual;
+        }
+        finally
+        {
+            updating = false;
+        }
+
+        InvalidatePreview();
+        UpdateContextWarning();
+    }
     private void InvalidateLmStudioCompatibilityForSelection()
     {
         form.LmStudio.HierarchyStatusValue.Text = "Untested";
@@ -615,19 +682,44 @@ internal sealed class MainController : IDisposable
         {
             form.LmStudio.ContextWarningValue.Text = "Codex Context 必须等于 Loaded Context；理论 Max 不能替代实际值。";
             form.LmStudio.ContextWarningValue.ForeColor = Color.Firebrick;
+            return;
         }
-        else if (compact <= 0 || compact >= codex || codex - compact < 1024)
+
+        if (codex < 2_048)
+        {
+            form.LmStudio.ContextWarningValue.Text = "Loaded Context 小于 2,048，无法应用安全的本地上下文预算。";
+            form.LmStudio.ContextWarningValue.ForeColor = Color.Firebrick;
+            return;
+        }
+
+        int suggestedCompact = ConfigurationSwitchService.SuggestAutoCompact(codex);
+        int toolOutput = ConfigurationSwitchService.SuggestToolOutputLimit(codex);
+        int effectiveContext = (int)((long)codex * 95 / 100);
+        int hardReserve = codex - compact;
+        int effectiveReserve = effectiveContext - compact;
+        if (compact <= 0 || compact >= codex || hardReserve < 1024)
         {
             form.LmStudio.ContextWarningValue.Text = "Auto Compact 必须小于 context，并至少保留 1,024 tokens 余量。";
             form.LmStudio.ContextWarningValue.ForeColor = Color.Firebrick;
         }
+        else if (toolOutput >= compact)
+        {
+            form.LmStudio.ContextWarningValue.Text = "Tool Output Limit 必须小于 Auto Compact；请提高手动压缩阈值或恢复自动建议。";
+            form.LmStudio.ContextWarningValue.ForeColor = Color.Firebrick;
+        }
+        else if (compact > suggestedCompact)
+        {
+            form.LmStudio.ContextWarningValue.Text =
+                $"手动值 {compact:N0} 高于平衡建议 {suggestedCompact:N0}，仍允许切换但风险较高；硬窗口余量 {hardReserve:N0}，95% 有效窗口余量 {effectiveReserve:N0}，Tool Output {toolOutput:N0}。";
+            form.LmStudio.ContextWarningValue.ForeColor = Color.DarkOrange;
+        }
         else
         {
-            form.LmStudio.ContextWarningValue.Text = $"一致：Max {model.MaxContextLength?.ToString("N0", CultureInfo.CurrentCulture) ?? "未知"} / Loaded {codex:N0} / Codex {codex:N0}";
+            form.LmStudio.ContextWarningValue.Text =
+                $"平衡预算：Loaded {codex:N0} / Effective {effectiveContext:N0} / Compact {compact:N0} / 硬窗口余量 {hardReserve:N0} / 有效窗口余量 {effectiveReserve:N0} / Tool Output {toolOutput:N0}。";
             form.LmStudio.ContextWarningValue.ForeColor = Color.DarkGreen;
         }
     }
-
     private void SyncLocalSelection()
     {
         if (form.Current.ProviderCombo.SelectedItem is not ProviderKind.LmStudio || form.Current.ModelCombo.SelectedItem is not ModelProfile selected) return;
@@ -718,7 +810,8 @@ internal sealed class MainController : IDisposable
                     form.LmStudio.RuntimeRepairStatusValue.Text = $"PatchedAndVerified — {repairResult.PatchedInstance.InstanceId}";
                     form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.DarkGreen;
                     int? requestedCompact = request.AutoCompactTokenLimit;
-                    await RefreshAndSelectLmStudioInstanceAsync(repairResult.PatchedInstance.InstanceId, requestedCompact);
+                    AutoCompactMode? requestedCompactMode = request.AutoCompactMode;
+                    await RefreshAndSelectLmStudioInstanceAsync(repairResult.PatchedInstance.InstanceId, requestedCompact, requestedCompactMode);
                     DisplayHierarchyProbe(repairResult.HierarchyProbe);
 
                     request = await CreateRequestAsync();
@@ -954,7 +1047,7 @@ internal sealed class MainController : IDisposable
         }
     }
 
-    private async Task RefreshAndSelectLmStudioInstanceAsync(string instanceId, int? requestedCompact)
+    private async Task RefreshAndSelectLmStudioInstanceAsync(string instanceId, int? requestedCompact, AutoCompactMode? requestedMode)
     {
         await RefreshLmStudioAsync();
         ModelProfile selected = lmModels.FirstOrDefault(model => model.IsLoaded == true && model.Id.Equals(instanceId, StringComparison.Ordinal))
@@ -975,9 +1068,22 @@ internal sealed class MainController : IDisposable
 
         UpdateLocalModelDetails();
         UpdateReasoningChoices();
-        if (requestedCompact is > 0 && selected.LoadedContextLength is int context && requestedCompact < context && context - requestedCompact >= 1024)
+        if (requestedMode == AutoCompactMode.Manual && requestedCompact is > 0 && selected.LoadedContextLength is int context && requestedCompact < context && context - requestedCompact >= 1024)
         {
-            form.LmStudio.AutoCompactInput.Value = Math.Clamp(requestedCompact.Value, (int)form.LmStudio.AutoCompactInput.Minimum, (int)form.LmStudio.AutoCompactInput.Maximum);
+            autoCompactMode = AutoCompactMode.Manual;
+            updating = true;
+            try
+            {
+                form.LmStudio.AutoCompactAutomaticCheckBox.Checked = false;
+                form.LmStudio.AutoCompactInput.Value = Math.Clamp(requestedCompact.Value, (int)form.LmStudio.AutoCompactInput.Minimum, (int)form.LmStudio.AutoCompactInput.Maximum);
+                form.LmStudio.AutoCompactInput.Enabled = !lmStudioLifecycleBusy;
+            }
+            finally
+            {
+                updating = false;
+            }
+
+            UpdateContextWarning();
         }
     }
 
@@ -1320,6 +1426,8 @@ internal sealed class MainController : IDisposable
             form.LmStudio.ModelCombo,
             form.LmStudio.CodexContextInput,
             form.LmStudio.AutoCompactInput,
+            form.LmStudio.AutoCompactAutomaticCheckBox,
+            form.LmStudio.ResetAutoCompactButton,
             form.LmStudio.GgufPathText,
             form.LmStudio.BrowseGgufButton,
             form.LmStudio.AnalyzeTemplateButton,
@@ -1402,6 +1510,8 @@ internal sealed class MainController : IDisposable
         string? lmProvider = null;
         int? context = null;
         int? compact = null;
+        int? toolOutput = null;
+        AutoCompactMode? requestedCompactMode = null;
         string? allowedCodexReasoningEfforts = null;
         bool requestRequiresAuthentication = false;
         if (provider == ProviderKind.LmStudio)
@@ -1441,8 +1551,12 @@ internal sealed class MainController : IDisposable
             }
 
             context = (int)form.LmStudio.CodexContextInput.Value;
-            compact = (int)form.LmStudio.AutoCompactInput.Value;
             if (context != model.LoadedContextLength) throw new InvalidOperationException("Codex Local Context 必须与 LM Studio 实际 Loaded Context 一致。");
+            requestedCompactMode = autoCompactMode;
+            compact = requestedCompactMode == AutoCompactMode.Automatic
+                ? ConfigurationSwitchService.SuggestAutoCompact(context.Value)
+                : (int)form.LmStudio.AutoCompactInput.Value;
+            toolOutput = ConfigurationSwitchService.SuggestToolOutputLimit(context.Value);
             bool redirected = Environment.GetEnvironmentVariables().Keys.Cast<object>().Select(key => key.ToString()).Any(key => key?.StartsWith("CODEX_OSS_", StringComparison.OrdinalIgnoreCase) == true);
             lmProvider = endpoint.IsLoopback && endpoint.Port == 1234 && !lmRequiresAuthentication && !redirected ? "lmstudio" : "lmstudio_local_cmm";
         }
@@ -1457,7 +1571,7 @@ internal sealed class MainController : IDisposable
             }
         }
 
-        return new SwitchRequest(provider, model.Id, reasoning, context, compact, policy, lmProvider, endpoint, requestRequiresAuthentication, credentialHelperPath, catalog, model.TrainedForToolUse, model.SupportsReasoning, model.ModelType, overrideSelection, allowedCodexReasoningEfforts);
+        return new SwitchRequest(provider, model.Id, reasoning, context, compact, policy, lmProvider, endpoint, requestRequiresAuthentication, credentialHelperPath, catalog, model.TrainedForToolUse, model.SupportsReasoning, model.ModelType, overrideSelection, allowedCodexReasoningEfforts, toolOutput, requestedCompactMode);
     }
 
     private async Task ValidateCompatibilityAsync()

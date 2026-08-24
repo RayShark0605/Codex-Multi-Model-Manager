@@ -1,12 +1,15 @@
 # Official Compatibility Notes
 
-核对日期：2026-08-22。优先级为官方文档/当前源码 > 官方脚本 > 官方 issue。
+核对日期：2026-08-23。优先级为官方文档/当前源码 > 官方脚本 > 官方 issue。
 
 ## Codex Provider 与认证
 
 - 当前 Codex 源码将 `openai`、`ollama`、`lmstudio` 视为内置保留 Provider ID，custom provider 不能覆盖。默认 LM Studio 因此使用 `model_provider = "lmstudio"`；非默认 endpoint/认证使用 `lmstudio_local_cmm`。
 - 当前配置参考支持 provider command auth：`[model_providers.<id>.auth]` 下的 `command`、`args`、`cwd`、`timeout_ms`、`refresh_interval_ms`。本工具的新 DeepSeek/需认证 LM 配置采用这一机制。
 - 当前配置参考新增 `model_auto_compact_token_limit_scope = "total" | "body_after_prefix"`。Local 安全建议阈值按 `total` 计算并显式写入；OpenAI provider-specific state 会恢复该键原本的存在/缺失和值。
+- 当前 Codex 源码对未知/本地模型默认采用原始 context window 的 95% 作为说明性有效窗口；因此 `120064` 在 UI 中约为 `114k`，但 `model_context_window` 仍应保持服务端真实的 `120064`。
+- `tool_output_token_limit` 是模型 metadata/config override，用于限制单个 tool/function 输出写入上下文的规模；它不是模型 reasoning、assistant 文本或函数参数的输出上限。本工具把它纳入受控根键，并为 OpenAI/DeepSeek 分别恢复原值或原本缺失状态。
+- Codex turn loop 只有在模型返回仍需 follow-up 时才会在同一回合继续检查 rollover/compact；若该次采样已结束回合，下一用户回合的 pre-turn 检查才可能立刻压缩。因此需要在本地硬窗口之前留下足够的单次采样余量，不能依赖 tool output 计数更新后一定触发 mid-turn compact。
 - command auth 不能与 `env_key`、`experimental_bearer_token` 或 `requires_openai_auth` 混合。已有 DeepSeek 官方明文 bearer table 被当作不可见 opaque 片段继续兼容。
 - `preferred_auth_method` 已不在当前 Codex 配置参考中；DeepSeek 官方脚本仍会写它。本工具识别并在新 DeepSeek/Local 模式清理 legacy 冲突，但不会改写官方 backup。
 
@@ -15,6 +18,10 @@
 - [Configuration Reference](https://developers.openai.com/codex/config-reference)
 - [Advanced Configuration](https://developers.openai.com/codex/config-advanced)
 - [model-provider-info source](https://github.com/openai/codex/blob/main/codex-rs/model-provider-info/src/lib.rs)
+- [turn loop source](https://github.com/openai/codex/blob/main/codex-rs/core/src/session/turn.rs)
+- [fallback model metadata source](https://github.com/openai/codex/blob/main/codex-rs/protocol/src/openai_models.rs)
+- [configuration schema](https://github.com/openai/codex/blob/main/codex-rs/core/config.schema.json)
+- [model config override source](https://github.com/openai/codex/blob/main/codex-rs/models-manager/src/model_info.rs)
 
 ## OpenAI model catalog
 
