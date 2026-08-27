@@ -1,6 +1,36 @@
 # Final Verification
 
-主验证日期：2026-08-22；最新增量验证：2026-08-24（Asia/Shanghai）。
+主验证日期：2026-08-22；最新增量验证：2026-08-27（Asia/Shanghai）。
+
+## 2026-08-27：目录整理与提交前回归
+
+### 提交范围与目录边界
+
+- 本次从 `master @ 942007ea6c0b` 的既有未提交工作开始，清点了 45 个已跟踪修改和 17 个应纳入版本管理的新文件。原有审阅加固、NVFP4 定位、持久模板事务及配套 Core/App 测试、文档作为相互依赖的完整实现集提交为 `dc773548e67a2eb05cfaccfd28a460e33acf2026`；没有拆成不可构建的半成品提交。
+- 整理动作仅调整解决方案中 Core 测试项目的归属，让两个测试项目统一位于 `tests` solution folder，保留原有 BOM/CRLF。原有源码和测试文件经前后 SHA-256 复核，字节完全未改写；本次没有借整理目录扩展产品行为。
+- `.gitignore` 继续排除 `bin/obj`、NuGet/.NET/应用本地缓存、日志、测试原始工件及发布产物。根目录 `nul` 已确认只是 34 bytes 的命令错误输出；删除被本次工具执行策略阻止，因此保留本地，并新增精确的 `/nul` 忽略项，不能把 Git clean 解释成该文件已从磁盘删除。
+- 原始 tracked patch、17 个未跟踪源码/文档副本及文件 SHA 清单保留在 `artifacts\repository-cleanup-2026-08-27\`；`nul` 的逐字节副本为同目录的 `removed-nul-output.txt`。这些整理备份均被忽略，不进入提交。
+- 暂存只使用逐项核对的显式路径；没有纳入 EXE/DLL、真实用户配置、凭据、事务 journal、DPAPI 备份、TRX、日志或 `.user` 文件。高置信度凭据模式扫描唯一命中为拒绝 URL userinfo 的负例测试 `http://user:pass@localhost:1234/`，不是实际凭据。
+
+### 本轮重新执行的验证
+
+| 检查 | 命令 | 结果 |
+|---|---|---|
+| Core Release | `dotnet test .\tests\CodexModelManager.Tests\CodexModelManager.Tests.csproj -c Release` | **344 PASS / 0 FAIL / 8 opt-in SKIP** |
+| App Release | `dotnet test .\tests\CodexModelManager.App.Tests\CodexModelManager.App.Tests.csproj -c Release` | **13 PASS / 0 FAIL / 0 SKIP** |
+| Debug build | `dotnet build .\CodexModelManager.sln -c Debug --no-restore` | **PASS，0 warning / 0 error** |
+| Release build | `dotnet build .\CodexModelManager.sln -c Release --no-restore` | **PASS，0 warning / 0 error** |
+| 格式 | `dotnet format .\CodexModelManager.sln --verify-no-changes --no-restore` | **PASS** |
+| 差异空白 | `git diff --check`、`git diff --cached --check` | **PASS** |
+| 发布 | `.\publish.ps1` | **PASS**；重新运行 Release build 和两套测试后发布三个 EXE |
+
+本轮合计 **357 PASS / 0 FAIL / 8 预期 SKIP**。所有 live 开关在验证进程中关闭；8 个跳过全部来自现有显式 opt-in 用例，没有新增或放宽跳过条件。
+
+TRX、构建/格式/发布日志、按测试 outcome 汇总的 `test-summary.json` 和 `publish-artifacts.json` 位于 `artifacts\test-results\repository-cleanup-2026-08-27\`。本次重新发布的三个 EXE 的长度和 SHA-256 均与下方 2026-08-24 持久修复发布表一致；主程序仍为 `artifacts\publish\win-x64\CodexModelManager.exe`，72,041,391 bytes，SHA-256 `840E60F4768F39A02D231D62CB2CD0B3EEDCAC0189D809ADE459E282EFC95DDC`。发布产物只保留在本地，不跟踪到 Git。
+
+### 本轮未执行的行为
+
+本次只整理、验证和本地提交，没有推送，没有启动管理器可见窗口，没有写真实 Codex/LM Studio defaults、执行 Provider Commit、调用 LM Studio `/load` 或 `/unload`，也没有重启 Codex/LM Studio。下方 2026-08-24 的 live 模型、配置哈希和事务记录是当日历史证据，本次没有将其重新判定为当前状态。LM Studio 重启后的四阶段探针与全新 Codex Plan→执行端到端验收仍保持 **Untested**。
 
 ## 2026-08-24：NVFP4 Plan→执行持久 Prompt Template 修复
 

@@ -15,3 +15,6 @@ TestResults/
 *.tmp
 *.bak
 *.log
+
+# Accidental Windows shell redirection output; never a source file.
+/nul
