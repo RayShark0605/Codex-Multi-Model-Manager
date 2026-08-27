@@ -22,8 +22,8 @@ public sealed class LmStudioControl : UserControl
         MaxContextValue = UiFactory.Label("未知");
         LoadedContextValue = UiFactory.Label("未知");
         EffectiveContextValue = UiFactory.Label("未知");
-        CodexContextInput = new NumericUpDown { Minimum = 1, Maximum = 4_000_000, Width = 180, ThousandsSeparator = true };
-        AutoCompactInput = new NumericUpDown { Minimum = 1, Maximum = 4_000_000, Width = 180, ThousandsSeparator = true, Enabled = false };
+        CodexContextInput = new NumericUpDown { Minimum = 1, Maximum = int.MaxValue, Width = 180, ThousandsSeparator = true };
+        AutoCompactInput = new NumericUpDown { Minimum = 1, Maximum = int.MaxValue, Width = 180, ThousandsSeparator = true, Enabled = false };
         AutoCompactAutomaticCheckBox = new CheckBox { Text = "自动建议", AutoSize = true, Checked = true, Margin = new Padding(10, 8, 6, 6) };
         ResetAutoCompactButton = UiFactory.Button("恢复建议值", 110);
         var autoCompactPanel = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = false };
@@ -46,12 +46,16 @@ public sealed class LmStudioControl : UserControl
         var ggufPathPanel = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = false };
         ggufPathPanel.Controls.AddRange([GgufPathText, BrowseGgufButton]);
         TemplateStatusValue = UiFactory.Label("尚未分析");
+        PersistenceStatusValue = UiFactory.Label("Persistence State Ambiguous — 尚未刷新精确模型状态", true);
+        PersistenceStatusValue.MaximumSize = new Size(760, 0);
+        PersistenceStatusValue.ForeColor = Color.DarkOrange;
         RuntimeRepairStatusValue = UiFactory.Label("Idle");
         RuntimeRepairStatusValue.MaximumSize = new Size(760, 0);
         AnalyzeTemplateButton = UiFactory.Button("分析 Prompt Template", 165);
         ExportTemplateButton = UiFactory.Button("导出兼容模板", 145);
         CopyTemplateButton = UiFactory.Button("复制兼容模板", 145);
         RecheckHierarchyButton = UiFactory.Button("重新检测 Codex 指令层级", 205);
+        AnalyzeTemplateButton.Enabled = false;
         ExportTemplateButton.Enabled = false;
         CopyTemplateButton.Enabled = false;
         var templateButtons = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = true };
@@ -81,6 +85,7 @@ public sealed class LmStudioControl : UserControl
         UiFactory.AddRow(table, "层级检测详情", HierarchyDetailValue);
         UiFactory.AddRow(table, "对应 GGUF（只读）", ggufPathPanel);
         UiFactory.AddRow(table, "Prompt Template", TemplateStatusValue);
+        UiFactory.AddRow(table, "持久 Prompt Template", PersistenceStatusValue);
         UiFactory.AddRow(table, "运行时修复事务", RuntimeRepairStatusValue);
         UiFactory.AddRow(table, "模板修复操作", templateButtons);
 
@@ -90,8 +95,8 @@ public sealed class LmStudioControl : UserControl
         RecoverTransactionButton = UiFactory.Button("检查/恢复未完成事务", 190);
         RecoverTransactionButton.Enabled = false;
         buttons.Controls.AddRange([DetectButton, RefreshModelsButton, RecoverTransactionButton]);
-        Controls.Add(buttons);
         Controls.Add(table);
+        Controls.Add(buttons);
     }
 
     public TextBox EndpointText { get; }
@@ -120,6 +125,7 @@ public sealed class LmStudioControl : UserControl
     public Label HierarchyDetailValue { get; }
     public TextBox GgufPathText { get; }
     public Label TemplateStatusValue { get; }
+    public Label PersistenceStatusValue { get; }
     public Label RuntimeRepairStatusValue { get; }
     public Button DetectButton { get; }
     public Button RefreshModelsButton { get; }

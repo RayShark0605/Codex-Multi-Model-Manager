@@ -53,7 +53,9 @@ try {
 
     if (-not $SkipTests) {
         dotnet test (Join-Path $root 'tests\CodexModelManager.Tests\CodexModelManager.Tests.csproj') --configuration Release --no-build --no-restore
-        if ($LASTEXITCODE -ne 0) { throw 'Unit tests failed.' }
+        if ($LASTEXITCODE -ne 0) { throw 'Core unit tests failed.' }
+        dotnet test (Join-Path $root 'tests\CodexModelManager.App.Tests\CodexModelManager.App.Tests.csproj') --configuration Release --no-build --no-restore
+        if ($LASTEXITCODE -ne 0) { throw 'App unit tests failed.' }
     }
 
     New-Item -ItemType Directory -Force $stagingRoot | Out-Null

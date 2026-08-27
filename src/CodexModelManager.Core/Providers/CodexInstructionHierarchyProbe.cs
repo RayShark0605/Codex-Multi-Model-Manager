@@ -99,7 +99,7 @@ public sealed class CodexInstructionHierarchyProbe : ICodexInstructionHierarchyP
         {
             return Result(control, leadingDeveloper, conversationControl, continuationDeveloper, CompatibilityFailureCodes.Timeout, "Codex 指令层级预检超时。", checkedAt);
         }
-        catch (HttpRequestException)
+        catch (Exception exception) when (exception is HttpRequestException or IOException)
         {
             return Result(control, leadingDeveloper, conversationControl, continuationDeveloper, CompatibilityFailureCodes.OtherProviderError, "无法连接 LM Studio Responses endpoint。", checkedAt);
         }
@@ -162,7 +162,7 @@ public sealed class CodexInstructionHierarchyProbe : ICodexInstructionHierarchyP
 
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
         using HttpResponseMessage response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
-        string bodyText = await ReadLimitedBodyAsync(response.Content, cancellationToken).ConfigureAwait(false);
+        string bodyText = await ReadLimitedBodyAsync(response.Content, timeout.Token).ConfigureAwait(false);
         bool passed = response.IsSuccessStatusCode && HasOutputArray(bodyText);
         return new ProbeHttpResult(new CodexInstructionProbeStepResult(passed, (int)response.StatusCode), response.StatusCode, bodyText);
     }
@@ -255,7 +255,9 @@ public sealed class CodexInstructionHierarchyProbe : ICodexInstructionHierarchyP
         try
         {
             using JsonDocument document = JsonDocument.Parse(body);
-            return document.RootElement.TryGetProperty("output", out JsonElement output) && output.ValueKind == JsonValueKind.Array;
+            return document.RootElement.ValueKind == JsonValueKind.Object &&
+                document.RootElement.TryGetProperty("output", out JsonElement output) &&
+                output.ValueKind == JsonValueKind.Array;
         }
         catch (JsonException)
         {

@@ -87,8 +87,9 @@ public sealed class ConfigurationSwitchService
 
     public async Task<SwitchPlan> CreatePlanAsync(SwitchRequest request, CancellationToken cancellationToken = default)
     {
-        CodexInstructionHierarchyProbeResult? preflight = await EnsureLmStudioPreflightAsync(request, cancellationToken).ConfigureAwait(false);
-        return await CreatePlanCoreAsync(request, preflight, cancellationToken).ConfigureAwait(false);
+        SwitchRequest effectiveRequest = NormalizeSwitchRequest(request);
+        CodexInstructionHierarchyProbeResult? preflight = await EnsureLmStudioPreflightAsync(effectiveRequest, cancellationToken).ConfigureAwait(false);
+        return await CreatePlanCoreAsync(effectiveRequest, preflight, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<SwitchPlan> CreatePlanCoreAsync(
@@ -213,8 +214,9 @@ public sealed class ConfigurationSwitchService
         }
 
         await VerifyPreviewFingerprintsAsync(preview.Files, cancellationToken).ConfigureAwait(false);
-        CodexInstructionHierarchyProbeResult? preflight = await EnsureLmStudioPreflightAsync(preview.Request, cancellationToken).ConfigureAwait(false);
-        SwitchPlan regenerated = await CreatePlanCoreAsync(preview.Request, preflight, cancellationToken).ConfigureAwait(false);
+        SwitchRequest effectiveRequest = NormalizeSwitchRequest(preview.Request);
+        CodexInstructionHierarchyProbeResult? preflight = await EnsureLmStudioPreflightAsync(effectiveRequest, cancellationToken).ConfigureAwait(false);
+        SwitchPlan regenerated = await CreatePlanCoreAsync(effectiveRequest, preflight, cancellationToken).ConfigureAwait(false);
         if (!string.Equals(preview.PlanHash, regenerated.PlanHash, StringComparison.Ordinal))
         {
             throw new IOException("配置文件在预览后发生变化，请重新加载并再次预览。");
@@ -268,14 +270,12 @@ public sealed class ConfigurationSwitchService
         if (regenerated.Request.TargetProvider == ProviderKind.LmStudio && regenerated.Request.ContextWindow is int context)
         {
             settings.LmStudioEndpoint = regenerated.Request.LmStudioEndpoint?.AbsoluteUri.TrimEnd('/') ?? settings.LmStudioEndpoint;
-            AutoCompactMode compactMode = regenerated.Request.AutoCompactMode ??
-                (regenerated.Request.AutoCompactTokenLimit == SuggestAutoCompact(context) ? AutoCompactMode.Automatic : AutoCompactMode.Manual);
             settings.ModelPreferences[regenerated.Request.TargetModel] = new ModelPreference
             {
                 LastLoadedContext = context,
                 CodexContext = context,
                 AutoCompactTokenLimit = regenerated.Request.AutoCompactTokenLimit,
-                AutoCompactMode = compactMode,
+                AutoCompactMode = regenerated.Request.AutoCompactMode!.Value,
                 AutoCompactPolicyVersion = AutoCompactPolicyVersion,
                 ToolOutputTokenLimit = regenerated.Request.ToolOutputTokenLimit,
             };
@@ -424,10 +424,10 @@ public sealed class ConfigurationSwitchService
         List<string> warnings)
     {
         if (request.TargetModelType is not null && !request.TargetModelType.Equals("llm", StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException($"所选 LM Studio instance 类型为 {request.TargetModelType}，禁止将非 LLM 模型配置给 Codex。");
-        if (request.ContextWindow is null or <= 0) throw new InvalidOperationException("LM Studio 未返回实际 loaded context；禁止安全切换。");
+        if (request.ContextWindow is null or < 2_048) throw new InvalidOperationException("LM Studio 未返回有效的实际 loaded context；禁止安全切换。");
         int context = request.ContextWindow.Value;
         int suggestedCompact = SuggestAutoCompact(context);
-        int compact = request.AutoCompactTokenLimit ?? suggestedCompact;
+        int compact = request.AutoCompactTokenLimit ?? throw new InvalidOperationException("LM Studio 请求未完成 Auto Compact 标准化。");
         if (compact <= 0 || compact >= context || context - compact < 1024) throw new InvalidOperationException("Auto Compact 必须小于实际 context，并保留安全余量。");
         if (request.ToolOutputTokenLimit is not int toolOutput || toolOutput <= 0 || toolOutput >= compact)
         {
@@ -515,6 +515,72 @@ public sealed class ConfigurationSwitchService
         }
 
         return result;
+    }
+
+    internal static SwitchRequest NormalizeSwitchRequest(SwitchRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentException.ThrowIfNullOrWhiteSpace(request.TargetModel);
+        string? reasoningEffort = string.IsNullOrWhiteSpace(request.ReasoningEffort)
+            ? null
+            : request.ReasoningEffort.Trim().ToLowerInvariant();
+        if (request.TargetProvider != ProviderKind.LmStudio)
+        {
+            return request with { ReasoningEffort = reasoningEffort };
+        }
+
+        if (request.ContextWindow is not int context || context < 2_048)
+        {
+            throw new InvalidOperationException("LM Studio 未返回有效的实际 loaded context；禁止安全切换。");
+        }
+
+        int suggestedCompact = SuggestAutoCompact(context);
+        int compact;
+        AutoCompactMode compactMode;
+        switch (request.AutoCompactMode)
+        {
+            case null:
+                compact = request.AutoCompactTokenLimit ?? suggestedCompact;
+                compactMode = request.AutoCompactTokenLimit is null || compact == suggestedCompact
+                    ? AutoCompactMode.Automatic
+                    : AutoCompactMode.Manual;
+                break;
+            case AutoCompactMode.Automatic:
+                if (request.AutoCompactTokenLimit is int automaticLimit && automaticLimit != suggestedCompact)
+                {
+                    throw new InvalidOperationException($"Automatic Auto Compact 只能为空或等于当前建议值 {suggestedCompact:N0}。");
+                }
+
+                compact = suggestedCompact;
+                compactMode = AutoCompactMode.Automatic;
+                break;
+            case AutoCompactMode.Manual:
+                compact = request.AutoCompactTokenLimit ??
+                    throw new InvalidOperationException("Manual Auto Compact 必须提供明确的 token limit。");
+                compactMode = AutoCompactMode.Manual;
+                break;
+            default:
+                throw new InvalidOperationException("Auto Compact 模式无效。");
+        }
+
+        if (compact <= 0 || compact >= context || context - compact < 1_024)
+        {
+            throw new InvalidOperationException("Auto Compact 必须小于实际 context，并保留至少 1,024 tokens 安全余量。");
+        }
+
+        int toolOutput = request.ToolOutputTokenLimit ?? SuggestToolOutputLimit(context);
+        if (toolOutput <= 0 || toolOutput >= compact)
+        {
+            throw new InvalidOperationException("Tool Output Limit 必须为正数且小于 Auto Compact。");
+        }
+
+        return request with
+        {
+            ReasoningEffort = reasoningEffort,
+            AutoCompactTokenLimit = compact,
+            AutoCompactMode = compactMode,
+            ToolOutputTokenLimit = toolOutput,
+        };
     }
 
     private static Dictionary<string, Dictionary<string, SecondaryOverrideReplacement>> BuildSecondaryReplacements(
@@ -682,16 +748,42 @@ public sealed class ConfigurationSwitchService
         return new ProviderState(provider, DateTimeOffset.Now, roots, tables, sha);
     }
 
-    private static bool ContainsSensitiveUrlQuery(string? rawValue)
+    internal static bool ContainsSensitiveUrlQuery(string? rawValue)
     {
         string? value = CodexRuntimeProbe.Unquote(rawValue);
         if (!Uri.TryCreate(value, UriKind.Absolute, out Uri? uri) || string.IsNullOrEmpty(uri.Query)) return false;
         return uri.Query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries)
             .Select(part => part.Split('=', 2)[0])
-            .Any(name => name.Contains("token", StringComparison.OrdinalIgnoreCase) ||
-                         name.Contains("key", StringComparison.OrdinalIgnoreCase) ||
-                         name.Contains("secret", StringComparison.OrdinalIgnoreCase) ||
-                         name.Contains("password", StringComparison.OrdinalIgnoreCase));
+            .Any(IsSensitiveQueryParameterName);
+    }
+
+    private static bool IsSensitiveQueryParameterName(string encodedName)
+    {
+        string decoded;
+        try
+        {
+            decoded = Uri.UnescapeDataString(encodedName.Replace('+', ' ')).ToLowerInvariant();
+        }
+        catch (UriFormatException)
+        {
+            return true;
+        }
+
+        string[] tokens = decoded.Split(
+            decoded.Where(character => !char.IsLetterOrDigit(character)).Distinct().ToArray(),
+            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        HashSet<string> sensitiveTokens = new(StringComparer.Ordinal)
+        {
+            "key", "token", "secret", "password", "credential", "signature",
+        };
+        if (tokens.Any(sensitiveTokens.Contains))
+        {
+            return true;
+        }
+
+        string compact = string.Concat(decoded.Where(char.IsLetterOrDigit));
+        return compact is "key" or "apikey" or "accesstoken" or "token" or "secret" or
+            "clientsecret" or "password" or "credential" or "signature";
     }
 
     private static string? ComposeTableTree(ConfigReadResult read, string parent)

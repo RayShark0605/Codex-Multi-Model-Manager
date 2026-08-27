@@ -3,6 +3,8 @@ namespace CodexModelManager.App.UI;
 public sealed class MainForm : Form
 {
     private MainController? controller;
+    private bool controlledCloseApproved;
+    private bool controlledCloseInProgress;
 
     public MainForm()
     {
@@ -34,7 +36,30 @@ public sealed class MainForm : Form
     {
         controller = value;
         Shown += async (_, _) => await controller.InitializeAsync();
+        FormClosing += OnFormClosing;
         FormClosed += (_, _) => controller.Dispose();
+    }
+
+    private async void OnFormClosing(object? sender, FormClosingEventArgs eventArgs)
+    {
+        if (controlledCloseApproved || controller is null)
+        {
+            return;
+        }
+
+        eventArgs.Cancel = true;
+        if (controlledCloseInProgress)
+        {
+            return;
+        }
+
+        controlledCloseInProgress = true;
+        await controller.PrepareForCloseAsync();
+        controlledCloseApproved = true;
+        if (!IsDisposed && !Disposing)
+        {
+            Close();
+        }
     }
 
     private static TabPage CreateTab(string title, Control content)

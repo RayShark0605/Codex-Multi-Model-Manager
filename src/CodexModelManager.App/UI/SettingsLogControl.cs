@@ -27,6 +27,7 @@ public sealed class SettingsLogControl : UserControl
             Dock = DockStyle.Fill,
             Multiline = true,
             ReadOnly = true,
+            MaxLength = 1_000_000,
             ScrollBars = ScrollBars.Both,
             WordWrap = false,
             Font = new Font(FontFamily.GenericMonospace, 9),

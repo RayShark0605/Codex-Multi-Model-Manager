@@ -1,3 +1,5 @@
+using System.ComponentModel;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using CodexModelManager.Core.Abstractions;
 using CodexModelManager.Core.Models;
@@ -7,6 +9,20 @@ namespace CodexModelManager.Core.Infrastructure;
 public sealed class AtomicBatchWriter : IAtomicBatchWriter
 {
     private const string MutexName = "Local\\CodexMultiModelManager.ConfigWriter.v1";
+    private static readonly TimeSpan WriterWaitTimeout = TimeSpan.FromSeconds(15);
+    private readonly IAvailableDiskSpaceProvider diskSpaceProvider;
+    private readonly string mutexName;
+
+    public AtomicBatchWriter()
+        : this(new WindowsAvailableDiskSpaceProvider(), MutexName)
+    {
+    }
+
+    internal AtomicBatchWriter(IAvailableDiskSpaceProvider diskSpaceProvider, string? mutexName = null)
+    {
+        this.diskSpaceProvider = diskSpaceProvider ?? throw new ArgumentNullException(nameof(diskSpaceProvider));
+        this.mutexName = string.IsNullOrWhiteSpace(mutexName) ? MutexName : mutexName;
+    }
 
     public async Task WriteAsync(
         IReadOnlyList<PlannedFileChange> changes,
@@ -18,36 +34,71 @@ public sealed class AtomicBatchWriter : IAtomicBatchWriter
             return;
         }
 
-        using var semaphore = new Semaphore(1, 1, MutexName);
-        bool acquired = false;
+        // A Windows mutex is owned by the acquiring thread. Keep acquisition,
+        // the synchronous bridge over the async transaction, and release on one
+        // dedicated thread so an abandoned owner can be recovered safely.
+        await Task.Factory.StartNew(
+            () => WriteOnMutexOwnerThread(changes, cancellationToken),
+            CancellationToken.None,
+            TaskCreationOptions.LongRunning | TaskCreationOptions.DenyChildAttach,
+            TaskScheduler.Default).ConfigureAwait(false);
+    }
+
+    private void WriteOnMutexOwnerThread(
+        IReadOnlyList<PlannedFileChange> changes,
+        CancellationToken cancellationToken)
+    {
+        Mutex mutex;
         try
         {
-            int waitResult = await Task.Run(
-                () => WaitHandle.WaitAny([semaphore, cancellationToken.WaitHandle], TimeSpan.FromSeconds(15)),
-                CancellationToken.None).ConfigureAwait(false);
-            if (waitResult == 1)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-            }
-
-            acquired = waitResult == 0;
-            if (!acquired)
-            {
-                throw new IOException("另一个 Codex Multi-Model Manager 实例正在写配置。");
-            }
-
-            await WriteUnderLockAsync(changes, cancellationToken).ConfigureAwait(false);
+            mutex = new Mutex(false, mutexName);
         }
-        finally
+        catch (WaitHandleCannotBeOpenedException exception)
         {
-            if (acquired)
+            throw new IOException("检测到旧版本正在使用不兼容的配置写入锁。请关闭所有旧版本 Codex Multi-Model Manager 实例后重试。", exception);
+        }
+
+        using (mutex)
+        {
+            bool acquired = false;
+            try
             {
-                semaphore.Release();
+                int waitResult;
+                try
+                {
+                    waitResult = WaitHandle.WaitAny([mutex, cancellationToken.WaitHandle], WriterWaitTimeout);
+                }
+                catch (AbandonedMutexException exception) when (exception.MutexIndex is 0 or -1)
+                {
+                    // Ownership transfers to this thread. All ordinary fingerprint
+                    // and semantic checks still run below before any mutation.
+                    waitResult = 0;
+                }
+
+                if (waitResult == 1)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+
+                acquired = waitResult == 0;
+                if (!acquired)
+                {
+                    throw new IOException("另一个 Codex Multi-Model Manager 实例正在写配置。");
+                }
+
+                WriteUnderLockAsync(changes, cancellationToken).GetAwaiter().GetResult();
+            }
+            finally
+            {
+                if (acquired)
+                {
+                    mutex.ReleaseMutex();
+                }
             }
         }
     }
 
-    private static async Task WriteUnderLockAsync(
+    private async Task WriteUnderLockAsync(
         IReadOnlyList<PlannedFileChange> changes,
         CancellationToken cancellationToken)
     {
@@ -56,7 +107,7 @@ public sealed class AtomicBatchWriter : IAtomicBatchWriter
             .ToArray();
         EnsureUniqueTargets(ordered);
         await VerifyFingerprintsAsync(ordered, cancellationToken).ConfigureAwait(false);
-        VerifyAvailableSpace(ordered);
+        VerifyAvailableSpace(ordered, diskSpaceProvider);
 
         List<StagedChange> staged = [];
         List<StagedChange> committed = [];
@@ -138,7 +189,7 @@ public sealed class AtomicBatchWriter : IAtomicBatchWriter
                 SafeDelete(item.RollbackPath);
             }
         }
-        catch
+        catch (Exception primaryException)
         {
             cleanupRollbackFiles = false;
             // After File.Replace, a handle opened on the old target follows that
@@ -147,18 +198,32 @@ public sealed class AtomicBatchWriter : IAtomicBatchWriter
             DisposeLocks(targetLocks);
             targetLocks.Clear();
             List<FileStream> rollbackTargetLocks = [];
+            Exception? rollbackException = null;
             try
             {
                 rollbackTargetLocks = AcquireTargetLocks(committed.Select(item => item.Change));
                 RollBack(committed);
                 cleanupRollbackFiles = true;
             }
+            catch (Exception exception)
+            {
+                rollbackException = exception;
+            }
             finally
             {
                 DisposeLocks(rollbackTargetLocks);
             }
 
-            throw;
+            if (rollbackException is not null)
+            {
+                throw new AggregateException(
+                    "配置写入失败，且自动回滚未能完全完成。原始故障与回滚故障均已保留。",
+                    primaryException,
+                    rollbackException);
+            }
+
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(primaryException).Throw();
+            throw new InvalidOperationException("Unreachable");
         }
         finally
         {
@@ -287,13 +352,15 @@ public sealed class AtomicBatchWriter : IAtomicBatchWriter
         stream.Flush(true);
     }
 
-    private static void VerifyAvailableSpace(IEnumerable<PlannedFileChange> changes)
+    internal static void VerifyAvailableSpace(
+        IEnumerable<PlannedFileChange> changes,
+        IAvailableDiskSpaceProvider diskSpaceProvider)
     {
         foreach (IGrouping<string, PlannedFileChange> group in changes.GroupBy(change => Path.GetPathRoot(Path.GetFullPath(change.Path))!, StringComparer.OrdinalIgnoreCase))
         {
             long required = group.Sum(change => (change.CandidateBytes?.LongLength ?? 0) + (change.ExpectedFingerprint.Exists ? change.ExpectedFingerprint.Length : 0));
-            var drive = new DriveInfo(group.Key);
-            if (drive.IsReady && drive.AvailableFreeSpace < required + (4L * 1024 * 1024))
+            AvailableDiskSpace available = diskSpaceProvider.GetAvailableSpace(group.Key);
+            if (available.IsReady && available.AvailableBytes < required + (4L * 1024 * 1024))
             {
                 throw new IOException($"磁盘空间不足，事务至少还需要 {required:N0} 字节。");
             }
@@ -332,4 +399,46 @@ public sealed class AtomicBatchWriter : IAtomicBatchWriter
         string? TempPath,
         string RollbackPath,
         bool OriginalExisted = false);
+}
+
+internal readonly record struct AvailableDiskSpace(bool IsReady, long AvailableBytes);
+
+internal interface IAvailableDiskSpaceProvider
+{
+    AvailableDiskSpace GetAvailableSpace(string rootPath);
+}
+
+internal sealed class WindowsAvailableDiskSpaceProvider : IAvailableDiskSpaceProvider
+{
+    public AvailableDiskSpace GetAvailableSpace(string rootPath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(rootPath);
+        if (OperatingSystem.IsWindows() && rootPath.StartsWith("\\\\", StringComparison.Ordinal))
+        {
+            string queryPath = rootPath.EndsWith(Path.DirectorySeparatorChar) || rootPath.EndsWith(Path.AltDirectorySeparatorChar)
+                ? rootPath
+                : rootPath + Path.DirectorySeparatorChar;
+            if (!NativeMethods.GetDiskFreeSpaceEx(queryPath, out ulong available, out _, out _))
+            {
+                var inner = new Win32Exception(Marshal.GetLastWin32Error());
+                throw new IOException($"无法查询 UNC 路径可用空间: {rootPath}", inner);
+            }
+
+            return new AvailableDiskSpace(true, available > long.MaxValue ? long.MaxValue : (long)available);
+        }
+
+        var drive = new DriveInfo(rootPath);
+        return new AvailableDiskSpace(drive.IsReady, drive.IsReady ? drive.AvailableFreeSpace : 0);
+    }
+
+    private static class NativeMethods
+    {
+        [DllImport("kernel32.dll", EntryPoint = "GetDiskFreeSpaceExW", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool GetDiskFreeSpaceEx(
+            string directoryName,
+            out ulong freeBytesAvailable,
+            out ulong totalNumberOfBytes,
+            out ulong totalNumberOfFreeBytes);
+    }
 }

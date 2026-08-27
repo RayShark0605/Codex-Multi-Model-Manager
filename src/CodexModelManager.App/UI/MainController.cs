@@ -1,5 +1,5 @@
-using System.Diagnostics;
 using System.Globalization;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using CodexModelManager.Core.Abstractions;
@@ -15,13 +15,19 @@ namespace CodexModelManager.App.UI;
 internal sealed class MainController : IDisposable
 {
     private const string NoReasoningOverride = "（不写入）";
+    internal const int MaximumUiLogCharacters = 1_000_000;
+    internal const int RetainedUiLogCharacters = 750_000;
     private readonly MainForm form;
     private readonly AppComposition services;
     private readonly IAppLogger logger;
     private readonly HttpClient httpClient;
     private readonly CancellationTokenSource lifetime = new();
+    private readonly object actionGate = new();
     private readonly List<ModelProfile> lmModels = [];
     private int uiActionRunning;
+    private int closing;
+    private int disposed;
+    private TaskCompletionSource? activeActionCompletion;
     private AppSettings appSettings = new();
     private bool updating;
     private AutoCompactMode autoCompactMode = AutoCompactMode.Automatic;
@@ -33,6 +39,7 @@ internal sealed class MainController : IDisposable
     private GgufChatTemplateAnalysis? templateAnalysis;
     private PromptTemplateRepairPreview? templateRepairPreview;
     private string? templateModelId;
+    private LmStudioModelFileResolution? exactLmStudioModelFile;
     private bool lmStudioRecoveryPending;
     private bool lmStudioLifecycleBusy;
     private readonly Dictionary<Control, bool> lmStudioLifecycleControlStates = [];
@@ -45,6 +52,7 @@ internal sealed class MainController : IDisposable
         this.httpClient = httpClient;
         logger.MessageLogged += OnLogMessage;
         WireEvents();
+        UpdateTemplateAnalysisAvailability();
     }
 
     public async Task InitializeAsync()
@@ -53,7 +61,21 @@ internal sealed class MainController : IDisposable
         {
             InstallHelpers();
             RegisterExistingSecrets();
-            appSettings = await services.SettingsRepository.LoadAsync(lifetime.Token);
+            AppSettingsLoadResult settingsLoad = await services.SettingsRepository.LoadWithRecoveryAsync(lifetime.Token);
+            appSettings = settingsLoad.Settings;
+            if (settingsLoad.RecoveredCorruptSettings)
+            {
+                logger.Warning($"损坏的 appsettings.json 已隔离: path={settingsLoad.RecoveredCorruptFilePath}, sha256={settingsLoad.RecoveredCorruptSha256}, type={settingsLoad.RecoveredCorruptExceptionType ?? "unknown"}");
+                if (CanUseUi)
+                {
+                    MessageBox.Show(
+                        form,
+                        services.Redactor.Redact(settingsLoad.Warning ?? "损坏的应用设置已隔离，并恢复为默认设置。"),
+                        "设置已恢复",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                }
+            }
             Uri? configuredEndpoint = Uri.TryCreate(appSettings.LmStudioEndpoint, UriKind.Absolute, out Uri? savedEndpoint) ? savedEndpoint : null;
             LmStudioEndpointDetection detectedEndpoint = await LmStudioEndpointDetector.DetectAsync(configuredEndpoint, lifetime.Token);
             form.LmStudio.EndpointText.Text = detectedEndpoint.Endpoint.AbsoluteUri.TrimEnd('/');
@@ -71,9 +93,48 @@ internal sealed class MainController : IDisposable
 
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref disposed, 1) != 0)
+        {
+            return;
+        }
+
         logger.MessageLogged -= OnLogMessage;
-        lifetime.Cancel();
+        if (!lifetime.IsCancellationRequested)
+        {
+            lifetime.Cancel();
+        }
+
         lifetime.Dispose();
+    }
+
+    internal async Task PrepareForCloseAsync()
+    {
+        Task? activeAction;
+        lock (actionGate)
+        {
+            Volatile.Write(ref closing, 1);
+            activeAction = activeActionCompletion?.Task;
+        }
+
+        try
+        {
+            lifetime.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+
+        if (activeAction is not null)
+        {
+            try
+            {
+                await activeAction.ConfigureAwait(true);
+            }
+            catch (Exception exception)
+            {
+                logger.LogError("等待当前 UI 操作关闭时失败", exception);
+            }
+        }
     }
 
     private void WireEvents()
@@ -107,6 +168,7 @@ internal sealed class MainController : IDisposable
             InvalidatePreview();
             InvalidateLmStudioCompatibilityForSelection();
             InvalidateTemplateAnalysis("Endpoint 已变化，请刷新模型并重新分析。");
+            InvalidatePersistenceState("Persistence State Ambiguous — Endpoint 已变化，请刷新模型。");
         };
         form.LmStudio.ModelCombo.SelectedIndexChanged += (_, _) =>
         {
@@ -115,6 +177,7 @@ internal sealed class MainController : IDisposable
             InvalidateLmStudioCompatibilityForSelection();
             UpdateLocalModelDetails();
             SyncMainLocalSelection();
+            InvalidatePersistenceState("Persistence State Ambiguous — 模型选择已变化，请刷新模型。");
         };
         form.LmStudio.CodexContextInput.ValueChanged += (_, _) =>
         {
@@ -136,7 +199,14 @@ internal sealed class MainController : IDisposable
         };
         form.LmStudio.ResetAutoCompactButton.Click += (_, _) => SetAutoCompactMode(AutoCompactMode.Automatic);
         form.LmStudio.BrowseGgufButton.Click += (_, _) => BrowseForGguf();
-        form.LmStudio.GgufPathText.TextChanged += (_, _) => InvalidateTemplateAnalysis();
+        form.LmStudio.GgufPathText.TextChanged += (_, _) =>
+        {
+            InvalidateTemplateAnalysis();
+            if (exactLmStudioModelFile is not null && !form.LmStudio.GgufPathText.Text.Trim().Equals(exactLmStudioModelFile.FilePath, StringComparison.OrdinalIgnoreCase))
+            {
+                InvalidatePersistenceState("Persistence State Ambiguous — 手工 GGUF 仅可只读分析，不能作为持久化身份。");
+            }
+        };
         form.LmStudio.AnalyzeTemplateButton.Click += async (_, _) => await RunUiActionAsync(AnalyzePromptTemplateAsync);
         form.LmStudio.ExportTemplateButton.Click += async (_, _) => await RunUiActionAsync(ExportPromptTemplateAsync);
         form.LmStudio.CopyTemplateButton.Click += async (_, _) => await RunUiActionAsync(CopyPromptTemplateAsync);
@@ -149,8 +219,8 @@ internal sealed class MainController : IDisposable
         form.Backups.RestoreSelectedButton.Click += async (_, _) => await RunUiActionAsync(RestoreSelectedAsync);
         form.Backups.RestoreInitialButton.Click += async (_, _) => await RunUiActionAsync(RestoreInitialAsync);
         form.Backups.InspectDeepSeekButton.Click += async (_, _) => await RunUiActionAsync(InspectDeepSeekBackupAsync);
-        form.SettingsLog.SaveDeepSeekButton.Click += (_, _) => SaveCredential(CredentialNames.DeepSeek, form.SettingsLog.DeepSeekToken);
-        form.SettingsLog.SaveLmStudioButton.Click += (_, _) => SaveCredential(CredentialNames.LmStudio, form.SettingsLog.LmStudioToken);
+        form.SettingsLog.SaveDeepSeekButton.Click += async (_, _) => await RunUiActionAsync(() => SaveCredentialAsync(CredentialNames.DeepSeek, form.SettingsLog.DeepSeekToken));
+        form.SettingsLog.SaveLmStudioButton.Click += async (_, _) => await RunUiActionAsync(() => SaveCredentialAsync(CredentialNames.LmStudio, form.SettingsLog.LmStudioToken));
     }
 
     private async Task RefreshEnvironmentAsync()
@@ -229,7 +299,7 @@ internal sealed class MainController : IDisposable
             : initial;
         form.LmStudio.ServerStatusValue.Text = effective.Summary;
         form.LmStudio.ServerStatusValue.ForeColor = effective.IsAvailable ? Color.DarkGreen : Color.Firebrick;
-        form.LmStudio.VersionValue.Text = DetectLmStudioVersion() ?? "未知（Models API 未提供版本）";
+        form.LmStudio.VersionValue.Text = LmStudioLocalVersionDetector.Detect() ?? "未知（Models API 未提供版本）";
         lmModels.Clear();
         if (effective.IsAvailable)
         {
@@ -251,6 +321,7 @@ internal sealed class MainController : IDisposable
 
         InvalidateLmStudioCompatibilityForSelection();
         UpdateLocalModelDetails();
+        exactLmStudioModelFile = null;
         if (form.LmStudio.ModelCombo.SelectedItem is ModelProfile selectedModel)
         {
             LmStudioModelFileResolutionAttempt resolutionAttempt = await services.ModelFileLocator
@@ -258,13 +329,24 @@ internal sealed class MainController : IDisposable
             if (resolutionAttempt.Succeeded && resolutionAttempt.Resolution is LmStudioModelFileResolution resolution)
             {
                 form.LmStudio.GgufPathText.Text = resolution.FilePath;
+                exactLmStudioModelFile = resolution;
                 form.LmStudio.TemplateStatusValue.Text = $"已通过 {resolution.Source} 解析精确 GGUF；请点击分析。";
+                await RefreshPersistenceStatusAsync(selectedModel, endpoint, resolution);
             }
             else
             {
+                form.LmStudio.GgufPathText.Clear();
                 form.LmStudio.TemplateStatusValue.Text = resolutionAttempt.Diagnostic + " 可继续使用手工选择 GGUF。";
+                InvalidatePersistenceState("Persistence State Ambiguous — 没有严格验证的 concrete GGUF identity；自动持久化已阻断。");
             }
         }
+        else
+        {
+            form.LmStudio.GgufPathText.Clear();
+            InvalidatePersistenceState("Persistence State Ambiguous — 未选择 loaded LLM instance。");
+        }
+
+        UpdateTemplateAnalysisAvailability();
 
         if (form.Current.ProviderCombo.SelectedItem is ProviderKind.LmStudio) await LoadModelsForSelectedProviderAsync();
         appSettings.LmStudioEndpoint = endpoint.AbsoluteUri.TrimEnd('/');
@@ -450,6 +532,8 @@ internal sealed class MainController : IDisposable
             form.LmStudio.ExportTemplateButton.Enabled = false;
             form.LmStudio.CopyTemplateButton.Enabled = false;
         }
+
+        UpdateTemplateAnalysisAvailability();
     }
 
     private void InvalidateTemplateAnalysis(string detail = "路径已变化，请重新分析。")
@@ -460,7 +544,174 @@ internal sealed class MainController : IDisposable
         form.LmStudio.TemplateStatusValue.Text = detail;
         form.LmStudio.ExportTemplateButton.Enabled = false;
         form.LmStudio.CopyTemplateButton.Enabled = false;
+        UpdateTemplateAnalysisAvailability();
     }
+
+    private void InvalidatePersistenceState(string detail)
+    {
+        exactLmStudioModelFile = null;
+        SetPersistenceStatus(LmStudioPersistenceStatus.PersistenceStateAmbiguous, detail);
+    }
+
+    private async Task RefreshPersistenceStatusAsync(
+        ModelProfile selectedModel,
+        Uri endpoint,
+        LmStudioModelFileResolution resolution)
+    {
+        string? version = LmStudioLocalVersionDetector.Detect();
+        try
+        {
+            GgufChatTemplateAnalysis analysis = await services.GgufReader.ReadAsync(resolution.FilePath, lifetime.Token);
+            PromptTemplateRepairPreview preview = services.TemplateRepair.CreatePreview(analysis);
+            if (preview.Status is not (PromptTemplateRepairStatus.Supported or PromptTemplateRepairStatus.UpgradeRequired or PromptTemplateRepairStatus.AlreadyCompatible) ||
+                string.IsNullOrWhiteSpace(preview.PatchedTemplate) || string.IsNullOrWhiteSpace(preview.PatchedTemplateSha256))
+            {
+                SetPersistenceStatus(LmStudioPersistenceStatus.UnsupportedCustomOverride, "Unsupported Custom Override — GGUF 原模板本身不满足当前精确修复规则；仅保留只读分析/导出。");
+                return;
+            }
+
+            IReadOnlyList<LmStudioTemplateTransactionRecord> completed = await services.TemplateTransactions.ListCompletedAsync(lifetime.Token);
+            LmStudioTemplateTransactionRecord[] matchingHistory = completed
+                .Where(record =>
+                    record.OriginalInstance.Endpoint.AbsoluteUri.TrimEnd('/').Equals(endpoint.AbsoluteUri.TrimEnd('/'), StringComparison.OrdinalIgnoreCase) &&
+                    record.OriginalInstance.SourceModelKey.Equals(selectedModel.SourceModelKey, StringComparison.OrdinalIgnoreCase) &&
+                    Path.GetFullPath(record.GgufFilePath).Equals(Path.GetFullPath(resolution.FilePath), StringComparison.OrdinalIgnoreCase) &&
+                    record.OriginalTemplateSha256.Equals(analysis.TemplateSha256, StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(record => record.UpdatedAt)
+                .ToArray();
+            LmStudioTemplateTransactionRecord? v2Evidence = matchingHistory.FirstOrDefault(record =>
+                record.RuleVersion == PromptTemplateRepairService.LegacyLeadingRuleVersion &&
+                record.PatchedTemplateSha256.Length == 64 &&
+                CompletedRuntimeEvidenceMatchesCurrentInstance(record, selectedModel, analysis));
+            LmStudioRuntimeTemplateProvenance provenance = v2Evidence is null
+                ? new LmStudioRuntimeTemplateProvenance(LmStudioRuntimeTemplateMode.BuiltIn)
+                : new LmStudioRuntimeTemplateProvenance(
+                    LmStudioRuntimeTemplateMode.ManagerRule,
+                    PromptTemplateRepairService.LegacyLeadingRuleVersion,
+                    v2Evidence.PatchedTemplateSha256,
+                    v2Evidence.TransactionId);
+            LmStudioPerModelDefaultsPlan defaultsPlan = await services.PerModelDefaults.CreatePlanAsync(
+                endpoint,
+                version,
+                resolution,
+                analysis,
+                preview,
+                provenance,
+                lifetime.Token);
+
+            switch (defaultsPlan.Mutation)
+            {
+                case LmStudioPerModelDefaultsMutation.NoOp:
+                    SetPersistenceStatus(
+                        LmStudioPersistenceStatus.PersistentV3Applied,
+                        $"Persistent v3 Applied — {defaultsPlan.FilePath} | file SHA {ShortHash(defaultsPlan.OriginalFingerprint.Sha256)} | template SHA {ShortHash(defaultsPlan.TargetTemplateSha256)}");
+                    break;
+                case LmStudioPerModelDefaultsMutation.Upgrade:
+                    SetPersistenceStatus(
+                        LmStudioPersistenceStatus.PersistentV2UpgradeRequired,
+                        $"Persistent v2 Upgrade Required — {defaultsPlan.FilePath} | {ShortHash(defaultsPlan.OriginalTemplateSha256!)} → {ShortHash(defaultsPlan.TargetTemplateSha256)}");
+                    break;
+                default:
+                    LmStudioTemplateTransactionRecord? legacyCompleted = matchingHistory.FirstOrDefault(record => record.SchemaVersion < 4 && record.RuleVersion == PromptTemplateRepairService.CurrentRuleVersion);
+                    if (legacyCompleted is null)
+                    {
+                        SetPersistenceStatus(
+                            ClassifyMissingPersistentOverride(hasLegacyCompleted: false, hierarchyCompatible: null),
+                            $"Built-in / No Override — {defaultsPlan.FilePath} | 将执行 Add；Refresh 未写入任何文件。");
+                        break;
+                    }
+
+                    string? token = lmRequiresAuthentication ? GetSecret(CredentialNames.LmStudio) : null;
+                    var hierarchyProbe = new CodexInstructionHierarchyProbe(httpClient, endpoint, lmRequiresAuthentication ? () => token : null);
+                    CodexInstructionHierarchyProbeResult hierarchy = await hierarchyProbe.ProbeAsync(selectedModel.Id, lifetime.Token);
+                    if (hierarchy.IsCompatible)
+                    {
+                        SetPersistenceStatus(
+                            ClassifyMissingPersistentOverride(hasLegacyCompleted: true, hierarchyCompatible: true),
+                            $"Legacy Runtime-Only Patch — 旧 schema-v{legacyCompleted.SchemaVersion} 运行时实例仍兼容，但 {defaultsPlan.FilePath} 没有持久字段；下次重载会丢失。");
+                    }
+                    else
+                    {
+                        SetPersistenceStatus(
+                            ClassifyMissingPersistentOverride(hasLegacyCompleted: true, hierarchyCompatible: false),
+                            $"Persistent Override Missing After Reload — 旧 schema-v{legacyCompleted.SchemaVersion} Completed 仅证明过临时运行时补丁；当前四阶段已不兼容，模型重载后补丁已丢失。");
+                    }
+                    break;
+            }
+        }
+        catch (NotSupportedException exception)
+        {
+            SetPersistenceStatus(LmStudioPersistenceStatus.UnsupportedLmStudioVersion, "Unsupported LM Studio Version — " + services.Redactor.Redact(exception.Message));
+        }
+        catch (InvalidDataException exception) when (exception.Message.Contains("自定义", StringComparison.Ordinal) || exception.Message.Contains("不会覆盖", StringComparison.Ordinal))
+        {
+            SetPersistenceStatus(LmStudioPersistenceStatus.UnsupportedCustomOverride, "Unsupported Custom Override — " + services.Redactor.Redact(exception.Message));
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException or InvalidDataException or CryptographicException)
+        {
+            SetPersistenceStatus(LmStudioPersistenceStatus.PersistenceStateAmbiguous, "Persistence State Ambiguous — " + services.Redactor.Redact(exception.Message));
+        }
+    }
+
+    private void SetPersistenceStatus(LmStudioPersistenceStatus status, string detail)
+    {
+        form.LmStudio.PersistenceStatusValue.Text = detail;
+        form.LmStudio.PersistenceStatusValue.ForeColor = PersistenceStatusColor(status);
+    }
+
+    internal static string PersistenceStatusName(LmStudioPersistenceStatus status) => status switch
+    {
+        LmStudioPersistenceStatus.BuiltInNoOverride => "Built-in / No Override",
+        LmStudioPersistenceStatus.LegacyRuntimeOnlyPatch => "Legacy Runtime-Only Patch",
+        LmStudioPersistenceStatus.PersistentV3Applied => "Persistent v3 Applied",
+        LmStudioPersistenceStatus.PersistentV2UpgradeRequired => "Persistent v2 Upgrade Required",
+        LmStudioPersistenceStatus.PersistentOverrideMissingAfterReload => "Persistent Override Missing After Reload",
+        LmStudioPersistenceStatus.UnsupportedCustomOverride => "Unsupported Custom Override",
+        LmStudioPersistenceStatus.UnsupportedLmStudioVersion => "Unsupported LM Studio Version",
+        _ => "Persistence State Ambiguous",
+    };
+
+    internal static Color PersistenceStatusColor(LmStudioPersistenceStatus status) => status switch
+    {
+        LmStudioPersistenceStatus.PersistentV3Applied => Color.DarkGreen,
+        LmStudioPersistenceStatus.BuiltInNoOverride or
+        LmStudioPersistenceStatus.LegacyRuntimeOnlyPatch or
+        LmStudioPersistenceStatus.PersistentV2UpgradeRequired or
+        LmStudioPersistenceStatus.PersistentOverrideMissingAfterReload => Color.DarkOrange,
+        _ => Color.Firebrick,
+    };
+
+    internal static LmStudioPersistenceStatus ClassifyMissingPersistentOverride(bool hasLegacyCompleted, bool? hierarchyCompatible) =>
+        !hasLegacyCompleted
+            ? LmStudioPersistenceStatus.BuiltInNoOverride
+            : hierarchyCompatible == true
+                ? LmStudioPersistenceStatus.LegacyRuntimeOnlyPatch
+                : LmStudioPersistenceStatus.PersistentOverrideMissingAfterReload;
+
+    private static bool CompletedRuntimeEvidenceMatchesCurrentInstance(
+        LmStudioTemplateTransactionRecord record,
+        ModelProfile current,
+        GgufChatTemplateAnalysis analysis) =>
+        record.State == LmStudioTemplateTransactionState.Completed &&
+        string.Equals(record.PatchedInstanceId, current.Id, StringComparison.Ordinal) &&
+        string.Equals(record.OriginalInstance.SourceModelKey, current.SourceModelKey, StringComparison.OrdinalIgnoreCase) &&
+        OptionalExact(record.OriginalInstance.SelectedVariant, current.SelectedVariant) &&
+        OptionalExact(record.OriginalInstance.Architecture, current.Architecture) &&
+        OptionalExact(record.OriginalInstance.Quantization, current.Quantization) &&
+        OptionalExact(record.OriginalInstance.Parameters, current.Parameters) &&
+        OptionalExact(record.OriginalInstance.ModelType, current.ModelType) &&
+        record.OriginalInstance.MaxContextLength == current.MaxContextLength &&
+        current.LoadedConfiguration is not null &&
+        LmStudioClient.LoadConfigurationsEqual(record.OriginalInstance.LoadConfiguration, current.LoadedConfiguration) &&
+        record.GgufFileName.Equals(analysis.FileName, StringComparison.OrdinalIgnoreCase) &&
+        record.GgufLength == analysis.FileLength &&
+        record.GgufLastWriteTimeUtc == analysis.LastWriteTimeUtc &&
+        record.GgufVersion == analysis.GgufVersion &&
+        record.OriginalTemplateSha256.Equals(analysis.TemplateSha256, StringComparison.OrdinalIgnoreCase);
+
+    private static bool OptionalExact(string? left, string? right) =>
+        string.IsNullOrWhiteSpace(left) && string.IsNullOrWhiteSpace(right) ||
+        !string.IsNullOrWhiteSpace(left) && !string.IsNullOrWhiteSpace(right) && left.Equals(right, StringComparison.OrdinalIgnoreCase);
 
     private void BrowseForGguf()
     {
@@ -485,12 +736,10 @@ internal sealed class MainController : IDisposable
 
     private async Task AnalyzePromptTemplateAsync()
     {
-        if (form.LmStudio.ModelCombo.SelectedItem is not ModelProfile model || model.IsLoaded != true)
-        {
-            throw new InvalidOperationException("请选择当前已加载的 LM Studio LLM instance。");
-        }
-
+        ModelProfile? selectedModel = form.LmStudio.ModelCombo.SelectedItem as ModelProfile;
         string path = form.LmStudio.GgufPathText.Text.Trim();
+        ValidatePromptTemplateAnalysisInput(selectedModel, path);
+        ModelProfile model = selectedModel!;
         GgufChatTemplateAnalysis analysis = await services.GgufReader.ReadAsync(path, lifetime.Token);
         if (!string.IsNullOrWhiteSpace(model.Architecture) && !string.IsNullOrWhiteSpace(analysis.Architecture) &&
             !model.Architecture.Equals(analysis.Architecture, StringComparison.OrdinalIgnoreCase))
@@ -513,6 +762,39 @@ internal sealed class MainController : IDisposable
         form.LmStudio.ExportTemplateButton.Enabled = preview.Status is PromptTemplateRepairStatus.Supported or PromptTemplateRepairStatus.UpgradeRequired;
         form.LmStudio.CopyTemplateButton.Enabled = preview.Status is PromptTemplateRepairStatus.Supported or PromptTemplateRepairStatus.UpgradeRequired;
         logger.Info($"GGUF Prompt Template analysis: model={model.Id}, file={analysis.FileName}, gguf={analysis.GgufVersion}, templateSha={ShortHash(analysis.TemplateSha256)}, repair={preview.Status}");
+        if (exactLmStudioModelFile is not null &&
+            exactLmStudioModelFile.FilePath.Equals(path, StringComparison.OrdinalIgnoreCase) &&
+            Uri.TryCreate(form.LmStudio.EndpointText.Text.Trim(), UriKind.Absolute, out Uri? endpoint))
+        {
+            await RefreshPersistenceStatusAsync(model, endpoint, exactLmStudioModelFile);
+        }
+    }
+
+    internal static bool CanAnalyzePromptTemplate(ModelProfile? model, string? path) =>
+        model?.Provider == ProviderKind.LmStudio &&
+        model.IsLoaded == true &&
+        model.ModelType?.Equals("llm", StringComparison.OrdinalIgnoreCase) == true &&
+        !string.IsNullOrWhiteSpace(path);
+
+    internal static void ValidatePromptTemplateAnalysisInput(ModelProfile? model, string? path)
+    {
+        if (model?.Provider != ProviderKind.LmStudio || model.IsLoaded != true ||
+            model.ModelType?.Equals("llm", StringComparison.OrdinalIgnoreCase) != true)
+        {
+            throw new InvalidOperationException("请选择当前已加载的 LM Studio LLM instance。");
+        }
+
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            throw new InvalidOperationException("尚未定位对应 GGUF；请先刷新模型，或点击“选择 GGUF”手工选择。");
+        }
+    }
+
+    private void UpdateTemplateAnalysisAvailability()
+    {
+        ModelProfile? model = form.LmStudio.ModelCombo.SelectedItem as ModelProfile;
+        form.LmStudio.AnalyzeTemplateButton.Enabled = !lmStudioLifecycleBusy &&
+            CanAnalyzePromptTemplate(model, form.LmStudio.GgufPathText.Text);
     }
 
     private async Task ExportPromptTemplateAsync()
@@ -533,7 +815,7 @@ internal sealed class MainController : IDisposable
         MessageBox.Show(
             form,
             "兼容模板已导出：\n" + artifact.Directory +
-            "\n\n这是手工回退工件：可按 APPLY.md 在 LM Studio 中应用并手动重载。主 Switch 流程仅对受支持失败码提供经预览确认的事务式运行时重载；两种方式都不会修改 GGUF。",
+            "\n\n这是手工回退工件：可按 APPLY.md 在 LM Studio 中应用并手动重载。主 Switch 流程仅对受支持失败码提供经预览确认的 per-model defaults 持久写入与事务式重载；两种方式都不会修改 GGUF。",
             "Prompt Template 已导出",
             MessageBoxButtons.OK,
             MessageBoxIcon.Information);
@@ -593,6 +875,10 @@ internal sealed class MainController : IDisposable
         var probe = new CodexInstructionHierarchyProbe(httpClient, endpoint, lmRequiresAuthentication ? () => token : null);
         CodexInstructionHierarchyProbeResult result = await probe.ProbeAsync(current.Id, lifetime.Token);
         DisplayHierarchyProbe(result);
+        if (exactLmStudioModelFile is not null)
+        {
+            await RefreshPersistenceStatusAsync(current, endpoint, exactLmStudioModelFile);
+        }
         logger.Info($"LM Studio instruction hierarchy: model={current.Id}, compatible={result.IsCompatible}, code={result.FailureCode ?? "none"}, control={Status(result.Control)}, leading={Status(result.LeadingDeveloper)}, conversation={Status(result.ConversationControl)}, continuation={Status(result.ContinuationDeveloper)}");
         bool templateFixRequired = result.FailureCode is
             CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder or
@@ -726,8 +1012,15 @@ internal sealed class MainController : IDisposable
         ModelProfile? local = lmModels.FirstOrDefault(model => model.Id == selected.Id);
         if (local is null) return;
         updating = true;
-        form.LmStudio.ModelCombo.SelectedItem = local;
-        updating = false;
+        try
+        {
+            form.LmStudio.ModelCombo.SelectedItem = local;
+        }
+        finally
+        {
+            updating = false;
+        }
+
         InvalidateLmStudioCompatibilityForSelection();
         UpdateLocalModelDetails();
     }
@@ -740,8 +1033,15 @@ internal sealed class MainController : IDisposable
             if (item is ModelProfile model && model.Id == selected.Id)
             {
                 updating = true;
-                form.Current.ModelCombo.SelectedItem = item;
-                updating = false;
+                try
+                {
+                    form.Current.ModelCombo.SelectedItem = item;
+                }
+                finally
+                {
+                    updating = false;
+                }
+
                 UpdateReasoningChoices();
                 break;
             }
@@ -762,12 +1062,16 @@ internal sealed class MainController : IDisposable
         {
             DisplayHierarchyProbe(exception.Result);
             (LmStudioInstanceController previewController, LmStudioTemplateRepairPlan repairPlan) = await CreateTemplateRepairPlanAsync(request, exception.Result);
-            using (previewController)
+            try
             {
                 form.LmStudio.RuntimeRepairStatusValue.Text = "Preview Ready — 未执行 unload/load";
                 form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.DarkOrange;
                 using var dialog = new LmStudioTemplateRepairDialog(repairPlan, allowApply: false);
                 dialog.ShowDialog(form);
+            }
+            finally
+            {
+                ReleaseTemplateRepairController(previewController);
             }
         }
     }
@@ -799,7 +1103,7 @@ internal sealed class MainController : IDisposable
                     return;
                 }
 
-                form.LmStudio.RuntimeRepairStatusValue.Text = "Applying — 正在卸载/加载/验证";
+                form.LmStudio.RuntimeRepairStatusValue.Text = "Applying — 正在备份/写入持久 defaults/卸载/重载/验证";
                 form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.DarkOrange;
                 lifecycleStarted = true;
                 SetLmStudioLifecycleBusy(true);
@@ -908,10 +1212,10 @@ internal sealed class MainController : IDisposable
                 try
                 {
                     await instanceController.CompleteAsync(repairResult.Plan.TransactionId, lifetime.Token);
-                    form.LmStudio.RuntimeRepairStatusValue.Text = $"Completed — 保留补丁实例 {repairResult.PatchedInstance.InstanceId}";
+                    form.LmStudio.RuntimeRepairStatusValue.Text = $"Completed / PersistentDefaultVerified — {repairResult.PatchedInstance.InstanceId}";
                     form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.DarkGreen;
                 }
-                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException)
+                catch (Exception exception)
                 {
                     lmStudioRecoveryPending = true;
                     ApplyLmStudioRecoveryGate();
@@ -976,7 +1280,10 @@ internal sealed class MainController : IDisposable
         }
         finally
         {
-            instanceController?.Dispose();
+            if (instanceController is not null)
+            {
+                ReleaseTemplateRepairController(instanceController);
+            }
             if (lifecycleStarted)
             {
                 SetLmStudioLifecycleBusy(false);
@@ -1006,22 +1313,55 @@ internal sealed class MainController : IDisposable
             ?? throw new InvalidOperationException("所选 LM Studio loaded instance 已不在当前 native 模型快照中，请刷新。");
         LmStudioInstanceController controller = services.CreateLmStudioInstanceController(request.LmStudioEndpoint, request.LmStudioRequiresAuthentication);
         controller.ProgressChanged += OnLmStudioLifecycleProgress;
-        var planner = new LmStudioTemplateRepairPlanner(
+        return await TransferOwnershipOnSuccessAsync(
             controller,
-            services.GgufReader,
-            services.TemplateRepair,
-            services.TemplateTransactions,
-            services.ModelFileLocator);
-        form.LmStudio.RuntimeRepairStatusValue.Text = "Planning — 捕获实例并分析精确 GGUF";
-        form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.DarkOrange;
-        LmStudioTemplateRepairPlan plan = await planner.CreatePlanAsync(selected, failure, lifetime.Token);
-        logger.Info($"LM Studio runtime template repair preview: transaction={plan.TransactionId:N}, instance={plan.OriginalInstance.InstanceId}, variant={plan.OriginalInstance.SelectedVariant ?? plan.OriginalInstance.SourceModelKey}, originalSha={ShortHash(plan.GgufAnalysis.TemplateSha256)}, patchedSha={ShortHash(plan.TemplatePreview.PatchedTemplateSha256!)}");
-        return (controller, plan);
+            async ownedController =>
+            {
+                var planner = new LmStudioTemplateRepairPlanner(
+                    ownedController,
+                    services.GgufReader,
+                    services.TemplateRepair,
+                    services.TemplateTransactions,
+                    services.ModelFileLocator,
+                    services.PerModelDefaults,
+                    LmStudioLocalVersionDetector.Detect);
+                form.LmStudio.RuntimeRepairStatusValue.Text = "Planning — 捕获实例并分析精确 GGUF";
+                form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.DarkOrange;
+                LmStudioTemplateRepairPlan plan = await planner.CreatePlanAsync(selected, failure, lifetime.Token);
+                logger.Info($"LM Studio runtime template repair preview: transaction={plan.TransactionId:N}, instance={plan.OriginalInstance.InstanceId}, variant={plan.OriginalInstance.SelectedVariant ?? plan.OriginalInstance.SourceModelKey}, originalSha={ShortHash(plan.GgufAnalysis.TemplateSha256)}, patchedSha={ShortHash(plan.TemplatePreview.PatchedTemplateSha256!)}");
+                return (ownedController, plan);
+            },
+            ReleaseTemplateRepairController);
+    }
+
+    internal static async Task<TResult> TransferOwnershipOnSuccessAsync<TResource, TResult>(
+        TResource resource,
+        Func<TResource, Task<TResult>> operation,
+        Action<TResource> releaseOnFailure)
+    {
+        ArgumentNullException.ThrowIfNull(resource);
+        ArgumentNullException.ThrowIfNull(operation);
+        ArgumentNullException.ThrowIfNull(releaseOnFailure);
+        try
+        {
+            return await operation(resource);
+        }
+        catch
+        {
+            releaseOnFailure(resource);
+            throw;
+        }
+    }
+
+    private void ReleaseTemplateRepairController(LmStudioInstanceController controller)
+    {
+        controller.ProgressChanged -= OnLmStudioLifecycleProgress;
+        controller.Dispose();
     }
 
     private void OnLmStudioLifecycleProgress(object? sender, string stage)
     {
-        if (form.IsDisposed || form.Disposing || !form.IsHandleCreated)
+        if (!CanUseUi)
         {
             return;
         }
@@ -1039,11 +1379,20 @@ internal sealed class MainController : IDisposable
 
         if (form.InvokeRequired)
         {
-            form.BeginInvoke((Action)Update);
+            try
+            {
+                form.BeginInvoke((Action)(() =>
+                {
+                    if (CanUseUi) Update();
+                }));
+            }
+            catch (InvalidOperationException)
+            {
+            }
         }
         else
         {
-            Update();
+            if (CanUseUi) Update();
         }
     }
 
@@ -1278,6 +1627,9 @@ internal sealed class MainController : IDisposable
             .Append("Original runtime template: ").Append(transaction.OriginalRuntimeTemplateMode)
             .Append(transaction.OriginalRuntimeRuleVersion is null ? string.Empty : " / " + transaction.OriginalRuntimeRuleVersion).AppendLine()
             .Append("Target runtime rule: ").AppendLine(transaction.TargetRuntimeRuleVersion ?? transaction.RuleVersion)
+            .Append("Persistence stage: ").AppendLine(transaction.SchemaVersion >= 4 ? transaction.PersistenceStage.ToString() : "legacy runtime-only")
+            .Append("Per-model defaults: ").AppendLine(transaction.PerModelDefaultsPath ?? "<legacy none>")
+            .Append("Current defaults SHA-256: ").AppendLine(assessment.CurrentDefaultsFingerprint?.Exists == true ? assessment.CurrentDefaultsFingerprint.Sha256 : "<missing/not applicable>")
             .AppendLine()
             .AppendLine("当前权威 native 候选：");
         if (assessment.Candidates.Count == 0)
@@ -1302,9 +1654,12 @@ internal sealed class MainController : IDisposable
             .Append("评估结果: ").AppendLine(assessment.Disposition.ToString())
             .AppendLine(assessment.Detail)
             .AppendLine()
+            .AppendLine(assessment.RequiresPersistenceRecovery
+                ? "确认后会先解密并校验 DPAPI 备份，再恢复管理器拥有的 per-model Prompt Template 字段；外部自定义改写会进入 RecoveryBlocked，绝不覆盖。"
+                : "当前评估未发现需要恢复的管理器持久字段；执行前仍会重新核对 defaults 指纹。")
             .AppendLine(assessment.RequiresLifecycleMutation
-                ? "确认后将执行上述精确 unload/load；执行前会再次指纹复查。"
-                : "确认后只会把 journal 标记为 RolledBack，不会 unload/load 模型。")
+                ? "随后将执行上述精确 unload/load；执行前会再次指纹复查。"
+                : "当前不需要模型 unload/load；持久状态处理完成后才会把 journal 标记为 RolledBack。")
             .AppendLine("恢复完成前新的 Preview/Switch 保持禁用。是否继续？");
         return builder.ToString();
     }
@@ -1366,7 +1721,9 @@ internal sealed class MainController : IDisposable
         }
 
         await controller.CompleteAsync(transaction.TransactionId, lifetime.Token);
-        form.LmStudio.RuntimeRepairStatusValue.Text = $"Completed — 保留补丁实例 {patched.InstanceId}";
+        form.LmStudio.RuntimeRepairStatusValue.Text = transaction.SchemaVersion >= 4
+            ? $"Completed / PersistentDefaultVerified — {patched.InstanceId}"
+            : $"Completed — Legacy Runtime-Only Patch {patched.InstanceId}";
         form.LmStudio.RuntimeRepairStatusValue.ForeColor = Color.DarkGreen;
         logger.Info($"LM Studio committed transaction finalized after restart: id={transaction.TransactionId:N}, instance={patched.InstanceId}");
         return true;
@@ -1457,6 +1814,7 @@ internal sealed class MainController : IDisposable
             if (!lmStudioLifecycleBusy)
             {
                 ApplyLmStudioRecoveryGate();
+                UpdateTemplateAnalysisAvailability();
                 return;
             }
 
@@ -1470,6 +1828,7 @@ internal sealed class MainController : IDisposable
         }
 
         ApplyLmStudioRecoveryGate();
+        UpdateTemplateAnalysisAvailability();
     }
 
     private void ApplyLmStudioRecoveryGate()
@@ -1721,13 +2080,13 @@ internal sealed class MainController : IDisposable
         MessageBox.Show(form, builder.ToString(), "DeepSeek 官方 backup-deepseek", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
-    private void SaveCredential(string target, TextBox input)
+    internal Task SaveCredentialAsync(string target, TextBox input)
     {
         string secret = input.Text;
         if (string.IsNullOrWhiteSpace(secret))
         {
             MessageBox.Show(form, "Token 不能为空。", "凭据", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
+            return Task.CompletedTask;
         }
 
         services.Redactor.Register(secret);
@@ -1735,6 +2094,7 @@ internal sealed class MainController : IDisposable
         input.Clear();
         logger.Info($"Credential Manager 凭据已更新: {target}（值未记录）");
         RefreshCredentialStatus();
+        return Task.CompletedTask;
     }
 
     private void RefreshCredentialStatus()
@@ -1834,40 +2194,35 @@ internal sealed class MainController : IDisposable
         if (File.Exists(destination)) File.Replace(temp, destination, null, true); else File.Move(temp, destination);
     }
 
-    private static string? DetectLmStudioVersion()
-    {
-        foreach (Process process in Process.GetProcesses())
-        {
-            using (process)
-            {
-                try
-                {
-                    string product = process.MainModule?.FileVersionInfo.ProductName ?? string.Empty;
-                    if (process.ProcessName.Contains("lm studio", StringComparison.OrdinalIgnoreCase) || product.Contains("LM Studio", StringComparison.OrdinalIgnoreCase))
-                    {
-                        return process.MainModule?.FileVersionInfo.ProductVersion;
-                    }
-                }
-                catch (Exception exception) when (exception is System.ComponentModel.Win32Exception or InvalidOperationException)
-                {
-                }
-            }
-        }
-
-        return null;
-    }
-
     private async Task RunUiActionAsync(Func<Task> action)
     {
-        if (Interlocked.CompareExchange(ref uiActionRunning, 1, 0) != 0)
+        ArgumentNullException.ThrowIfNull(action);
+        TaskCompletionSource completion;
+        lock (actionGate)
         {
-            logger.Warning("已有操作正在执行，本次重复操作已忽略。");
-            return;
+            if (Volatile.Read(ref closing) != 0 || Volatile.Read(ref disposed) != 0)
+            {
+                return;
+            }
+
+            if (uiActionRunning != 0)
+            {
+                logger.Warning("已有操作正在执行，本次重复操作已忽略。");
+                return;
+            }
+
+            uiActionRunning = 1;
+            completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            activeActionCompletion = completion;
         }
 
-        form.UseWaitCursor = true;
         try
         {
+            if (CanUseUi)
+            {
+                form.UseWaitCursor = true;
+            }
+
             await action();
         }
         catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
@@ -1876,6 +2231,11 @@ internal sealed class MainController : IDisposable
         catch (LmStudioTemplateApplyException exception)
         {
             logger.LogError($"LM Studio runtime template repair failed; rollbackSucceeded={exception.Rollback.Succeeded}, transaction={Path.GetFileNameWithoutExtension(exception.Rollback.TransactionPath)}", exception.InnerException ?? exception);
+            if (!CanUseUi)
+            {
+                return;
+            }
+
             form.LmStudio.RuntimeRepairStatusValue.Text = exception.Rollback.Succeeded ? "RolledBack — 修复失败，原实例已恢复" : "RollbackFailed — 需要恢复";
             form.LmStudio.RuntimeRepairStatusValue.ForeColor = exception.Rollback.Succeeded ? Color.DarkGreen : Color.Firebrick;
             if (!exception.Rollback.Succeeded)
@@ -1905,36 +2265,106 @@ internal sealed class MainController : IDisposable
         }
         catch (LmStudioCompatibilityException exception)
         {
-            DisplayHierarchyProbe(exception.Result);
             logger.Warning($"LM Studio compatibility blocked: code={exception.Result.FailureCode ?? CompatibilityFailureCodes.OtherProviderError}, control={Status(exception.Result.Control)}, leading={Status(exception.Result.LeadingDeveloper)}, conversation={Status(exception.Result.ConversationControl)}, continuation={Status(exception.Result.ContinuationDeveloper)}");
-            MessageBox.Show(form, services.Redactor.Redact(exception.Message), "LM Studio Prompt Template 不兼容", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            if (CanUseUi)
+            {
+                DisplayHierarchyProbe(exception.Result);
+                MessageBox.Show(form, services.Redactor.Redact(exception.Message), "LM Studio Prompt Template 不兼容", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
         catch (LmStudioApiException exception)
         {
             logger.LogError($"LM Studio API request failed: status={exception.Failure.HttpStatus}, type={exception.Failure.ErrorType ?? "none"}, code={exception.Failure.ErrorCode ?? "none"}", exception);
-            ModelProfile? selected = form.Current.ModelCombo.SelectedItem as ModelProfile;
-            string context = selected?.Provider == ProviderKind.LmStudio
-                ? $"请求阶段: preflight/schema\nREST load key: {selected.SourceModelKey ?? "<unknown>"}\nExpected variant: {selected.SelectedVariant ?? "<unknown>"}\n"
-                : string.Empty;
-            MessageBox.Show(form, services.Redactor.Redact(context + FormatLmStudioApiFailure(exception.Failure)), "LM Studio HTTP 请求失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            if (CanUseUi)
+            {
+                ModelProfile? selected = form.Current.ModelCombo.SelectedItem as ModelProfile;
+                string context = selected?.Provider == ProviderKind.LmStudio
+                    ? $"请求阶段: preflight/schema\nREST load key: {selected.SourceModelKey ?? "<unknown>"}\nExpected variant: {selected.SelectedVariant ?? "<unknown>"}\n"
+                    : string.Empty;
+                MessageBox.Show(form, services.Redactor.Redact(context + FormatLmStudioApiFailure(exception.Failure)), "LM Studio HTTP 请求失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
         catch (Exception exception)
         {
             logger.LogError("操作失败", exception);
-            MessageBox.Show(form, services.Redactor.Redact($"{exception.GetType().Name}: {exception.Message}"), "操作失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            if (CanUseUi)
+            {
+                MessageBox.Show(form, services.Redactor.Redact($"{exception.GetType().Name}: {exception.Message}"), "操作失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
         finally
         {
-            form.UseWaitCursor = false;
-            Volatile.Write(ref uiActionRunning, 0);
+            if (CanUseUi)
+            {
+                form.UseWaitCursor = false;
+            }
+
+            lock (actionGate)
+            {
+                uiActionRunning = 0;
+                activeActionCompletion = null;
+            }
+
+            completion.TrySetResult();
         }
     }
 
+    internal Task RunUiActionForTestAsync(Func<Task> action) => RunUiActionAsync(action);
+
     private void OnLogMessage(object? sender, string message)
     {
-        if (form.IsDisposed) return;
-        void Append() => form.SettingsLog.Log.AppendText(message + Environment.NewLine);
-        if (form.InvokeRequired) form.BeginInvoke((Action)Append); else Append();
+        if (!CanUseUi) return;
+        void Append()
+        {
+            if (CanUseUi)
+            {
+                AppendLogMessage(form.SettingsLog.Log, message);
+            }
+        }
+
+        if (form.InvokeRequired)
+        {
+            try
+            {
+                form.BeginInvoke((Action)Append);
+            }
+            catch (InvalidOperationException)
+            {
+            }
+        }
+        else
+        {
+            Append();
+        }
+    }
+
+    internal static void AppendLogMessage(TextBox log, string message)
+    {
+        ArgumentNullException.ThrowIfNull(log);
+        string addition = message + Environment.NewLine;
+        int maximumEntryLength = MaximumUiLogCharacters - RetainedUiLogCharacters;
+        if (addition.Length > maximumEntryLength)
+        {
+            const string marker = "[...oversized log entry truncated...]";
+            addition = marker + addition[^Math.Max(0, maximumEntryLength - marker.Length)..];
+        }
+
+        if (log.TextLength + addition.Length > MaximumUiLogCharacters)
+        {
+            string current = log.Text;
+            int targetCut = Math.Max(0, current.Length - RetainedUiLogCharacters);
+            int lineEnd = current.IndexOf('\n', targetCut);
+            int removeLength = lineEnd >= 0 ? lineEnd + 1 : current.Length;
+            if (removeLength > 0)
+            {
+                log.Select(0, removeLength);
+                log.SelectedText = string.Empty;
+            }
+        }
+
+        log.AppendText(addition);
+        log.SelectionStart = log.TextLength;
+        log.ScrollToCaret();
     }
 
     private void InvalidatePreview() => lastPlan = null;
@@ -1981,9 +2411,25 @@ internal sealed class MainController : IDisposable
 
     private void BeginInvokePreviewInvalidation()
     {
-        if (updating || form.IsDisposed) return;
-        form.BeginInvoke((Action)InvalidatePreview);
+        if (updating || !CanUseUi) return;
+        try
+        {
+            form.BeginInvoke((Action)(() =>
+            {
+                if (CanUseUi) InvalidatePreview();
+            }));
+        }
+        catch (InvalidOperationException)
+        {
+        }
     }
+
+    private bool CanUseUi =>
+        Volatile.Read(ref closing) == 0 &&
+        Volatile.Read(ref disposed) == 0 &&
+        !form.IsDisposed &&
+        !form.Disposing &&
+        form.IsHandleCreated;
 
     private static string Bool(bool? value) => value switch { true => "Yes", false => "No", null => "未知" };
     private static string FormatSize(long? bytes) => bytes is long value ? $"{value / 1024d / 1024d / 1024d:F1} GiB" : "大小未知";

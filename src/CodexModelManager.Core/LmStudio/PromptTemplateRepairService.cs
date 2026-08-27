@@ -326,11 +326,9 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
         Directory.CreateDirectory(root);
         string modelDirectory = Path.Combine(root, SanitizePathSegment(modelId));
         Directory.CreateDirectory(modelDirectory);
-        string directory = Path.Combine(modelDirectory, DateTime.Now.ToString("yyyyMMdd-HHmmssfff", System.Globalization.CultureInfo.InvariantCulture));
-        if (Directory.Exists(directory))
-        {
-            directory += "-" + Guid.NewGuid().ToString("N")[..8];
-        }
+        string directory = Path.Combine(
+            modelDirectory,
+            DateTime.Now.ToString("yyyyMMdd-HHmmssfff", System.Globalization.CultureInfo.InvariantCulture) + "-" + Guid.NewGuid().ToString("N"));
 
         Directory.CreateDirectory(directory);
         try
@@ -378,7 +376,7 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
         catch
         {
             string fullDirectory = Path.GetFullPath(directory);
-            if (fullDirectory.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) && Directory.Exists(fullDirectory))
+            if (IsStrictDescendant(root, fullDirectory) && Directory.Exists(fullDirectory))
             {
                 Directory.Delete(fullDirectory, recursive: true);
             }
@@ -630,7 +628,7 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
         return count;
     }
 
-    private static string SanitizePathSegment(string value)
+    internal static string SanitizePathSegment(string value)
     {
         char[] invalid = Path.GetInvalidFileNameChars();
         string safe = new(value.Select(character => invalid.Contains(character) || character is '/' or '\\' ? '_' : character).ToArray());
@@ -640,7 +638,53 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
             safe = safe[..80];
         }
 
-        return string.IsNullOrWhiteSpace(safe) ? "model" : safe;
+        if (string.IsNullOrWhiteSpace(safe))
+        {
+            return "model";
+        }
+
+        string baseName = safe.Split('.', 2)[0].TrimEnd(' ', '.');
+        if (IsWindowsReservedDeviceName(baseName))
+        {
+            safe = "_" + safe;
+        }
+
+        return safe;
+    }
+
+    internal static bool IsStrictDescendant(string parent, string candidate)
+    {
+        string fullParent = Path.GetFullPath(parent);
+        string? parentRoot = Path.GetPathRoot(fullParent);
+        if (parentRoot is null || !fullParent.Equals(parentRoot, StringComparison.OrdinalIgnoreCase))
+        {
+            fullParent = fullParent.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        }
+
+        string fullCandidate = Path.GetFullPath(candidate);
+        string relative = Path.GetRelativePath(fullParent, fullCandidate);
+        return !relative.Equals(".", StringComparison.Ordinal) &&
+            !Path.IsPathRooted(relative) &&
+            !relative.Equals("..", StringComparison.Ordinal) &&
+            !relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal) &&
+            !relative.StartsWith(".." + Path.AltDirectorySeparatorChar, StringComparison.Ordinal);
+    }
+
+    private static bool IsWindowsReservedDeviceName(string value)
+    {
+        if (value.Equals("CON", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("PRN", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("AUX", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("NUL", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("CONIN$", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("CONOUT$", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return value.Length == 4 &&
+            (value.StartsWith("COM", StringComparison.OrdinalIgnoreCase) || value.StartsWith("LPT", StringComparison.OrdinalIgnoreCase)) &&
+            value[3] is >= '1' and <= '9';
     }
 
     private static async Task WriteNewAsync(string path, byte[] bytes, CancellationToken cancellationToken)

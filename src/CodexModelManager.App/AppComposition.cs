@@ -1,4 +1,5 @@
 using CodexModelManager.App.UI;
+using CodexModelManager.Core.Abstractions;
 using CodexModelManager.Core.Backup;
 using CodexModelManager.Core.Codex;
 using CodexModelManager.Core.Infrastructure;
@@ -10,22 +11,27 @@ namespace CodexModelManager.App;
 
 internal sealed class AppComposition : IDisposable
 {
-    private readonly AppLogger logger;
+    private readonly IAppLogger logger;
     private readonly HttpClient providerHttpClient = new(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromMinutes(3) };
     private readonly HttpClient catalogHttpClient = new() { Timeout = TimeSpan.FromSeconds(20) };
 
     public AppComposition()
+        : this(null, null, null)
     {
-        Paths = new AppPaths();
+    }
+
+    internal AppComposition(AppPaths? paths, ISecretStore? secretStore, IAppLogger? logger)
+    {
+        Paths = paths ?? new AppPaths();
         Paths.EnsureDirectories();
         Redactor = new SecretRedactor();
-        logger = new AppLogger(Paths, Redactor);
+        this.logger = logger ?? new AppLogger(Paths, Redactor);
         HomeProvider = new DefaultCodexHomeProvider();
         PatchEngine = new TomlConfigPatchEngine();
         AtomicWriter = new AtomicBatchWriter();
         RuntimeProbe = new CodexRuntimeProbe(HomeProvider, PatchEngine);
         SettingsRepository = new AppSettingsRepository(Paths);
-        SecretStore = new WindowsCredentialStore();
+        SecretStore = secretStore ?? new WindowsCredentialStore();
         OverrideScanner = new SecondaryModelOverrideScanner(PatchEngine);
         Backups = new BackupService(HomeProvider, AtomicWriter, PatchEngine);
         Catalog = new DeepSeekCatalogService(HomeProvider, Paths, catalogHttpClient);
@@ -34,17 +40,19 @@ internal sealed class AppComposition : IDisposable
         TemplateRepair = new PromptTemplateRepairService(GgufReader);
         ModelFileLocator = new LmStudioModelFileLocator();
         TemplateTransactions = new LmStudioTemplateTransactionStore(Paths);
+        PerModelDefaults = new LmStudioPerModelDefaultsStore(TemplateRepair, AtomicWriter);
         Switches = new ConfigurationSwitchService(HomeProvider, PatchEngine, AtomicWriter, Backups, OverrideScanner, RuntimeProbe, SettingsRepository, SecretStore, LmStudioPreflight);
     }
 
     public AppPaths Paths { get; }
     public SecretRedactor Redactor { get; }
+    internal IAppLogger Logger => logger;
     public DefaultCodexHomeProvider HomeProvider { get; }
     public TomlConfigPatchEngine PatchEngine { get; }
     public AtomicBatchWriter AtomicWriter { get; }
     public CodexRuntimeProbe RuntimeProbe { get; }
     public AppSettingsRepository SettingsRepository { get; }
-    public WindowsCredentialStore SecretStore { get; }
+    public ISecretStore SecretStore { get; }
     public SecondaryModelOverrideScanner OverrideScanner { get; }
     public BackupService Backups { get; }
     public DeepSeekCatalogService Catalog { get; }
@@ -53,6 +61,7 @@ internal sealed class AppComposition : IDisposable
     public PromptTemplateRepairService TemplateRepair { get; }
     public LmStudioModelFileLocator ModelFileLocator { get; }
     public LmStudioTemplateTransactionStore TemplateTransactions { get; }
+    public LmStudioPerModelDefaultsStore PerModelDefaults { get; }
     public ConfigurationSwitchService Switches { get; }
 
     public LmStudioInstanceController CreateLmStudioInstanceController(Uri endpoint, bool requiresAuthentication) => new(
@@ -64,7 +73,10 @@ internal sealed class AppComposition : IDisposable
         GgufReader,
         TemplateRepair,
         TemplateTransactions,
-        logger);
+        logger,
+        PerModelDefaults,
+        LmStudioLocalVersionDetector.Detect,
+        ModelFileLocator);
 
     public MainForm CreateMainForm()
     {
@@ -76,7 +88,10 @@ internal sealed class AppComposition : IDisposable
 
     public void Dispose()
     {
-        logger.Dispose();
+        if (logger is IDisposable disposableLogger)
+        {
+            disposableLogger.Dispose();
+        }
         providerHttpClient.Dispose();
         catalogHttpClient.Dispose();
     }

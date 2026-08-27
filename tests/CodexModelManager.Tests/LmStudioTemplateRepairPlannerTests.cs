@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using CodexModelManager.Core.Abstractions;
+using CodexModelManager.Core.Infrastructure;
 using CodexModelManager.Core.LmStudio;
 using CodexModelManager.Core.Models;
 
@@ -101,6 +102,58 @@ public sealed class LmStudioTemplateRepairPlannerTests
         Assert.Contains("稳定脱敏诊断", exception.Message, StringComparison.Ordinal);
         Assert.Contains("手工选择", exception.Message, StringComparison.Ordinal);
         Assert.Equal(0, reader.CallCount);
+        Assert.Equal(0, controller.LifecycleMutationCount);
+        Assert.False(Directory.Exists(transactionDirectory));
+    }
+
+    [Fact]
+    public async Task ProductionPlannerCreatesReadOnlyPersistentDefaultsPlanFromConcreteIdentity()
+    {
+        using var temporary = new TemporaryDirectory();
+        PlannerFixture fixture = CreateFixture(temporary.Path);
+        const string concreteIdentifier = "publisher/model.gguf";
+        LmStudioModelFileResolution resolution = fixture.Resolution with { ConcreteModelIdentifier = concreteIdentifier };
+        var controller = new PlanningOnlyInstanceController(fixture.Snapshot);
+        var locator = new FakeModelFileLocator(new LmStudioModelFileResolutionAttempt(
+            LmStudioModelFileResolutionStatus.Success,
+            resolution,
+            "test concrete identity"));
+        var repair = new PromptTemplateRepairService();
+        var defaultsStore = new LmStudioPerModelDefaultsStore(
+            repair,
+            new AtomicBatchWriter(),
+            new PlannerProtector(),
+            Path.Combine(temporary.Path, "defaults"));
+        string defaultsPath = defaultsStore.GetDefaultsPath(concreteIdentifier);
+        Directory.CreateDirectory(Path.GetDirectoryName(defaultsPath)!);
+        await File.WriteAllTextAsync(defaultsPath, """
+            {
+              "preset": "",
+              "operation": { "fields": [] },
+              "load": { "fields": [ { "key": "llm.load.llama.evalBatchSize", "value": 4096 } ] },
+              "unknown": { "preserved": true }
+            }
+            """);
+        FileFingerprint before = await FileFingerprintService.CaptureAsync(defaultsPath);
+        string transactionDirectory = Path.Combine(temporary.Path, "transactions");
+        var planner = new LmStudioTemplateRepairPlanner(
+            controller,
+            new FixedTemplateReader(fixture.Analysis),
+            repair,
+            new LmStudioTemplateTransactionStore(transactionDirectory),
+            locator,
+            defaultsStore,
+            () => "0.4.21.0");
+
+        LmStudioTemplateRepairPlan plan = await planner.CreatePlanAsync(fixture.Model, PrefixOnlyContinuationFailure());
+
+        LmStudioPerModelDefaultsPlan persistent = Assert.IsType<LmStudioPerModelDefaultsPlan>(plan.PersistentDefaults);
+        Assert.Equal(LmStudioPerModelDefaultsMutation.Add, persistent.Mutation);
+        Assert.Equal(concreteIdentifier, persistent.ConcreteModelIdentifier);
+        Assert.Equal(defaultsPath, persistent.FilePath);
+        Assert.Equal("0.4.21.0", plan.LmStudioVersion);
+        Assert.Equal(before, await FileFingerprintService.CaptureAsync(defaultsPath));
+        Assert.NotEqual(persistent.OriginalFingerprint.Sha256, persistent.CandidateFingerprint.Sha256);
         Assert.Equal(0, controller.LifecycleMutationCount);
         Assert.False(Directory.Exists(transactionDirectory));
     }
@@ -294,5 +347,12 @@ public sealed class LmStudioTemplateRepairPlannerTests
             CallCount++;
             return Task.FromResult(analysis);
         }
+    }
+
+    private sealed class PlannerProtector : ILmStudioDefaultsProtector
+    {
+        public byte[] Protect(byte[] plaintext) => [0x43, 0x4D, 0x4D, .. plaintext];
+
+        public byte[] Unprotect(byte[] ciphertext) => ciphertext[3..];
     }
 }

@@ -44,8 +44,8 @@ public sealed class CurrentSwitchControl : UserControl
         PreviewButton = UiFactory.Button("Preview Changes", 145);
         SwitchButton = UiFactory.Button("Switch Model", 145);
         buttons.Controls.AddRange([RefreshButton, PreviewButton, SwitchButton]);
-        Controls.Add(buttons);
         Controls.Add(table);
+        Controls.Add(buttons);
     }
 
     public Label CodexVersionValue { get; }

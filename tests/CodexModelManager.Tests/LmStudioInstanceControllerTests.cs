@@ -2,6 +2,7 @@ using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using CodexModelManager.Core.Abstractions;
 using CodexModelManager.Core.Infrastructure;
 using CodexModelManager.Core.LmStudio;
@@ -714,6 +715,301 @@ public sealed class LmStudioInstanceControllerTests
         Assert.True(rollback.Succeeded, rollback.Detail);
     }
 
+    [Fact]
+    public async Task SchemaV4PersistentApplyLoadsWithoutRestPromptTemplateAndCompletesOnlyAfterRevalidation()
+    {
+        using var fixture = new ControllerFixture(hierarchyPasses: true);
+        LmStudioLoadedInstanceSnapshot original = await fixture.Controller.CaptureAsync(ControllerFixture.OriginalInstanceId);
+        LmStudioTemplateRepairPlan plan = await fixture.CreatePersistentPlanAsync(original);
+
+        LmStudioTemplateRepairResult result = await fixture.Controller.ApplyTemplateAsync(plan);
+
+        Assert.True(result.HierarchyProbe.IsCompatible);
+        Assert.Single(fixture.Handler.LoadBodies);
+        using (JsonDocument load = JsonDocument.Parse(fixture.Handler.LoadBodies[0]))
+        {
+            Assert.False(load.RootElement.TryGetProperty("prompt_template", out _));
+            Assert.Equal("qwen/root", load.RootElement.GetProperty("model").GetString());
+        }
+
+        LmStudioTemplateTransactionRecord record = Assert.IsType<LmStudioTemplateTransactionRecord>(await fixture.Store.ReadAsync(plan.TransactionId));
+        Assert.Equal(4, record.SchemaVersion);
+        Assert.Equal(LmStudioTemplateTransactionState.PatchedAndVerified, record.State);
+        Assert.Equal(LmStudioPersistenceStage.PersistentDefaultVerified, record.PersistenceStage);
+        Assert.Equal(plan.PersistentDefaults!.ConcreteModelIdentifier, record.ConcreteModelIdentifier);
+        Assert.Equal(plan.PersistentDefaults.FilePath, record.PerModelDefaultsPath);
+        Assert.True(File.Exists(record.EncryptedDefaultsBackupPath));
+        string journal = await File.ReadAllTextAsync(fixture.Store.GetPath(plan.TransactionId));
+        Assert.DoesNotContain("patched-template", journal, StringComparison.Ordinal);
+        Assert.DoesNotContain("original-template", journal, StringComparison.Ordinal);
+
+        await fixture.Controller.CompleteAsync(plan.TransactionId);
+
+        record = Assert.IsType<LmStudioTemplateTransactionRecord>(await fixture.Store.ReadAsync(plan.TransactionId));
+        Assert.Equal(LmStudioTemplateTransactionState.Completed, record.State);
+        Assert.Equal(LmStudioPersistenceStage.PersistentDefaultVerified, record.PersistenceStage);
+        Assert.Contains("patched-template", await File.ReadAllTextAsync(fixture.DefaultsPath), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task SchemaV4RollbackRestoresDefaultsBeforeExplicitBuiltInReload()
+    {
+        using var fixture = new ControllerFixture(hierarchyPasses: true);
+        byte[] originalDefaults = await File.ReadAllBytesAsync(fixture.DefaultsPath);
+        LmStudioLoadedInstanceSnapshot original = await fixture.Controller.CaptureAsync(ControllerFixture.OriginalInstanceId);
+        LmStudioTemplateRepairPlan plan = await fixture.CreatePersistentPlanAsync(original);
+        LmStudioTemplateRepairResult applied = await fixture.Controller.ApplyTemplateAsync(plan);
+
+        LmStudioRollbackResult rollback = await fixture.Controller.RollbackAsync(plan, applied.PatchedInstance.InstanceId);
+
+        Assert.True(rollback.Succeeded, rollback.Detail);
+        Assert.Equal(originalDefaults, await File.ReadAllBytesAsync(fixture.DefaultsPath));
+        Assert.Collection(fixture.Handler.LoadBodies, _ => { }, _ => { });
+        using JsonDocument patchedLoad = JsonDocument.Parse(fixture.Handler.LoadBodies[0]);
+        Assert.False(patchedLoad.RootElement.TryGetProperty("prompt_template", out _));
+        using JsonDocument restoredLoad = JsonDocument.Parse(fixture.Handler.LoadBodies[1]);
+        Assert.Equal("original-template", restoredLoad.RootElement.GetProperty("prompt_template").GetProperty("template").GetString());
+        LmStudioTemplateTransactionRecord record = Assert.IsType<LmStudioTemplateTransactionRecord>(await fixture.Store.ReadAsync(plan.TransactionId));
+        Assert.Equal(LmStudioTemplateTransactionState.RolledBack, record.State);
+        Assert.Equal(LmStudioPersistenceStage.Restored, record.PersistenceStage);
+    }
+
+    [Fact]
+    public async Task SchemaV4RollbackRestoresExactManagerV2DefaultsAndRuntime()
+    {
+        using var fixture = new ControllerFixture(hierarchyPasses: true);
+        LmStudioLoadedInstanceSnapshot original = await fixture.Controller.CaptureAsync(ControllerFixture.OriginalInstanceId);
+        LmStudioTemplateRepairPlan plan = await fixture.CreatePersistentV2UpgradePlanAsync(original);
+        byte[] originalV2Defaults = plan.PersistentDefaults!.OriginalBytes.ToArray();
+        LmStudioTemplateRepairResult applied = await fixture.Controller.ApplyTemplateAsync(plan);
+
+        LmStudioRollbackResult rollback = await fixture.Controller.RollbackAsync(plan, applied.PatchedInstance.InstanceId);
+
+        Assert.True(rollback.Succeeded, rollback.Detail);
+        Assert.Equal(originalV2Defaults, await File.ReadAllBytesAsync(fixture.DefaultsPath));
+        Assert.Equal(2, fixture.Handler.LoadBodies.Count);
+        using JsonDocument restoredLoad = JsonDocument.Parse(fixture.Handler.LoadBodies[1]);
+        Assert.Equal(ControllerFixture.LegacyV2Template, restoredLoad.RootElement.GetProperty("prompt_template").GetProperty("template").GetString());
+        LmStudioTemplateTransactionRecord record = Assert.IsType<LmStudioTemplateTransactionRecord>(await fixture.Store.ReadAsync(plan.TransactionId));
+        Assert.Equal(LmStudioPersistentTemplateFieldState.ManagerV2, record.OriginalPersistentTemplateState);
+        Assert.Equal(LmStudioTemplateTransactionState.RolledBack, record.State);
+        Assert.Equal(LmStudioPersistenceStage.Restored, record.PersistenceStage);
+    }
+
+    [Fact]
+    public async Task SchemaV4LoadFailureRestoresDefaultsAndOriginalInstance()
+    {
+        using var fixture = new ControllerFixture(hierarchyPasses: true, firstLoadFails: true);
+        byte[] originalDefaults = await File.ReadAllBytesAsync(fixture.DefaultsPath);
+        LmStudioLoadedInstanceSnapshot original = await fixture.Controller.CaptureAsync(ControllerFixture.OriginalInstanceId);
+        LmStudioTemplateRepairPlan plan = await fixture.CreatePersistentPlanAsync(original);
+
+        LmStudioTemplateApplyException exception = await Assert.ThrowsAsync<LmStudioTemplateApplyException>(() => fixture.Controller.ApplyTemplateAsync(plan));
+
+        Assert.True(exception.Rollback.Succeeded, exception.Rollback.Detail);
+        Assert.Equal(originalDefaults, await File.ReadAllBytesAsync(fixture.DefaultsPath));
+        Assert.Equal(2, fixture.Handler.LoadBodies.Count);
+        using JsonDocument failedTargetLoad = JsonDocument.Parse(fixture.Handler.LoadBodies[0]);
+        Assert.False(failedTargetLoad.RootElement.TryGetProperty("prompt_template", out _));
+        using JsonDocument originalReload = JsonDocument.Parse(fixture.Handler.LoadBodies[1]);
+        Assert.Equal("original-template", originalReload.RootElement.GetProperty("prompt_template").GetProperty("template").GetString());
+        Assert.Equal(LmStudioTemplateTransactionState.RolledBack, (await fixture.Store.ReadAsync(plan.TransactionId))?.State);
+    }
+
+    [Fact]
+    public async Task SchemaV4DefaultsDriftAfterPreviewStopsBeforeJournalUnloadOrLoad()
+    {
+        using var fixture = new ControllerFixture(hierarchyPasses: true);
+        LmStudioLoadedInstanceSnapshot original = await fixture.Controller.CaptureAsync(ControllerFixture.OriginalInstanceId);
+        LmStudioTemplateRepairPlan plan = await fixture.CreatePersistentPlanAsync(original);
+        await File.AppendAllTextAsync(fixture.DefaultsPath, " ");
+
+        await Assert.ThrowsAsync<IOException>(() => fixture.Controller.ApplyTemplateAsync(plan));
+
+        Assert.Equal(0, fixture.Handler.UnloadCount);
+        Assert.Empty(fixture.Handler.LoadBodies);
+        Assert.False(File.Exists(fixture.Store.GetPath(plan.TransactionId)));
+    }
+
+    [Fact]
+    public async Task SchemaV4CrashRecoveryFingerprintsAndRestoresDefaultsBeforeRuntime()
+    {
+        using var fixture = new ControllerFixture(hierarchyPasses: true);
+        byte[] originalDefaults = await File.ReadAllBytesAsync(fixture.DefaultsPath);
+        LmStudioLoadedInstanceSnapshot original = await fixture.Controller.CaptureAsync(ControllerFixture.OriginalInstanceId);
+        LmStudioTemplateRepairPlan plan = await fixture.CreatePersistentPlanAsync(original);
+        LmStudioTemplateRepairResult applied = await fixture.Controller.ApplyTemplateAsync(plan);
+        fixture.Controller.Dispose();
+        using LmStudioInstanceController recoveryController = fixture.CreateAdditionalController();
+        LmStudioTemplateTransactionRecord pending = Assert.IsType<LmStudioTemplateTransactionRecord>(await fixture.Store.ReadAsync(plan.TransactionId));
+
+        LmStudioRecoveryAssessment assessment = await recoveryController.AssessRecoveryAsync(pending);
+
+        Assert.True(assessment.RequiresPersistenceRecovery);
+        Assert.Equal(plan.PersistentDefaults!.CandidateFingerprint.Sha256, assessment.CurrentDefaultsFingerprint?.Sha256);
+        Assert.Equal(LmStudioRecoveryDisposition.UnloadKnownPatchAndLoadOriginal, assessment.Disposition);
+        LmStudioRollbackResult recovered = await recoveryController.RecoverAsync(pending, assessment);
+
+        Assert.True(recovered.Succeeded, recovered.Detail);
+        Assert.Equal(originalDefaults, await File.ReadAllBytesAsync(fixture.DefaultsPath));
+        Assert.Equal(2, fixture.Handler.UnloadCount);
+        Assert.Equal(2, fixture.Handler.LoadBodies.Count);
+        using JsonDocument restoredLoad = JsonDocument.Parse(fixture.Handler.LoadBodies[1]);
+        Assert.Equal("original-template", restoredLoad.RootElement.GetProperty("prompt_template").GetProperty("template").GetString());
+        LmStudioTemplateTransactionRecord completedRecovery = Assert.IsType<LmStudioTemplateTransactionRecord>(await fixture.Store.ReadAsync(plan.TransactionId));
+        Assert.Equal(LmStudioTemplateTransactionState.RolledBack, completedRecovery.State);
+        Assert.Equal(LmStudioPersistenceStage.Restored, completedRecovery.PersistenceStage);
+    }
+
+    [Fact]
+    public async Task SchemaV4CrashAfterLoadBeforeInstanceIdJournalUpdateUsesSoleCompatibleCandidate()
+    {
+        using var fixture = new ControllerFixture(hierarchyPasses: true);
+        byte[] originalDefaults = await File.ReadAllBytesAsync(fixture.DefaultsPath);
+        LmStudioLoadedInstanceSnapshot original = await fixture.Controller.CaptureAsync(ControllerFixture.OriginalInstanceId);
+        LmStudioTemplateRepairPlan plan = await fixture.CreatePersistentPlanAsync(original);
+        await fixture.Controller.ApplyTemplateAsync(plan);
+        LmStudioTemplateTransactionRecord applied = Assert.IsType<LmStudioTemplateTransactionRecord>(await fixture.Store.ReadAsync(plan.TransactionId));
+        LmStudioTemplateTransactionRecord interrupted = applied with
+        {
+            State = LmStudioTemplateTransactionState.OriginalUnloaded,
+            LastStableState = LmStudioTemplateTransactionState.OriginalUnloaded,
+            PatchedInstanceId = null,
+            CandidateInstanceId = null,
+            SameSourceInstanceIdsAfterLoad = null,
+            PersistenceStage = LmStudioPersistenceStage.DefaultsVerified,
+            Detail = "simulated crash after load returned but before instance ID journal update",
+        };
+        await fixture.Store.WriteAsync(interrupted);
+        fixture.Controller.Dispose();
+        using LmStudioInstanceController recoveryController = fixture.CreateAdditionalController();
+
+        LmStudioRecoveryAssessment assessment = await recoveryController.AssessRecoveryAsync(interrupted);
+        LmStudioRollbackResult recovered = await recoveryController.RecoverAsync(interrupted, assessment);
+
+        Assert.Equal(LmStudioRecoveryDisposition.UnloadKnownPatchAndLoadOriginal, assessment.Disposition);
+        Assert.Equal("qwen/root:2", assessment.InstanceToUnload);
+        Assert.True(recovered.Succeeded, recovered.Detail);
+        Assert.Equal(originalDefaults, await File.ReadAllBytesAsync(fixture.DefaultsPath));
+        Assert.Equal(2, fixture.Handler.UnloadCount);
+        Assert.Equal(LmStudioTemplateTransactionState.RolledBack, (await fixture.Store.ReadAsync(plan.TransactionId))?.State);
+    }
+
+    [Fact]
+    public async Task SchemaV4AlreadyRestoredRuntimeStillRestoresPendingPersistentCandidateBeforeClosingJournal()
+    {
+        using var fixture = new ControllerFixture(hierarchyPasses: true);
+        byte[] originalDefaults = await File.ReadAllBytesAsync(fixture.DefaultsPath);
+        LmStudioLoadedInstanceSnapshot original = await fixture.Controller.CaptureAsync(ControllerFixture.OriginalInstanceId);
+        LmStudioTemplateRepairPlan plan = await fixture.CreatePersistentPlanAsync(original);
+        await fixture.Controller.ApplyTemplateAsync(plan);
+        LmStudioTemplateTransactionRecord applied = Assert.IsType<LmStudioTemplateTransactionRecord>(await fixture.Store.ReadAsync(plan.TransactionId));
+        LmStudioTemplateTransactionRecord interrupted = applied with
+        {
+            State = LmStudioTemplateTransactionState.Prepared,
+            LastStableState = LmStudioTemplateTransactionState.Prepared,
+            PatchedInstanceId = null,
+            CandidateInstanceId = null,
+            SameSourceInstanceIdsAfterLoad = null,
+            PersistenceStage = LmStudioPersistenceStage.DefaultsVerified,
+            Detail = "simulated crash after defaults write but before unload",
+        };
+        await fixture.Store.WriteAsync(interrupted);
+        fixture.Handler.SimulateLoadedInstance(ControllerFixture.OriginalInstanceId, patchedTemplate: false);
+        int unloadsBeforeRecovery = fixture.Handler.UnloadCount;
+        int loadsBeforeRecovery = fixture.Handler.LoadBodies.Count;
+        fixture.Controller.Dispose();
+        using LmStudioInstanceController recoveryController = fixture.CreateAdditionalController();
+
+        LmStudioRecoveryAssessment assessment = await recoveryController.AssessRecoveryAsync(interrupted);
+        LmStudioRollbackResult recovered = await recoveryController.RecoverAsync(interrupted, assessment);
+
+        Assert.Equal(LmStudioRecoveryDisposition.AlreadyRestored, assessment.Disposition);
+        Assert.True(assessment.RequiresPersistenceRecovery);
+        Assert.False(assessment.RequiresLifecycleMutation);
+        Assert.True(recovered.Succeeded, recovered.Detail);
+        Assert.Equal(originalDefaults, await File.ReadAllBytesAsync(fixture.DefaultsPath));
+        Assert.Equal(unloadsBeforeRecovery, fixture.Handler.UnloadCount);
+        Assert.Equal(loadsBeforeRecovery, fixture.Handler.LoadBodies.Count);
+        LmStudioTemplateTransactionRecord rolledBack = Assert.IsType<LmStudioTemplateTransactionRecord>(await fixture.Store.ReadAsync(plan.TransactionId));
+        Assert.Equal(LmStudioTemplateTransactionState.RolledBack, rolledBack.State);
+        Assert.Equal(LmStudioPersistenceStage.Restored, rolledBack.PersistenceStage);
+    }
+
+    [Fact]
+    public async Task SchemaV4RecoveryBlocksExternalPromptReplacementWithoutFurtherLifecycleMutation()
+    {
+        using var fixture = new ControllerFixture(hierarchyPasses: true);
+        LmStudioLoadedInstanceSnapshot original = await fixture.Controller.CaptureAsync(ControllerFixture.OriginalInstanceId);
+        LmStudioTemplateRepairPlan plan = await fixture.CreatePersistentPlanAsync(original);
+        await fixture.Controller.ApplyTemplateAsync(plan);
+        string externallyChanged = (await File.ReadAllTextAsync(fixture.DefaultsPath)).Replace("patched-template", "external-custom-template", StringComparison.Ordinal);
+        await File.WriteAllTextAsync(fixture.DefaultsPath, externallyChanged);
+        int unloadsBeforeRecovery = fixture.Handler.UnloadCount;
+        int loadsBeforeRecovery = fixture.Handler.LoadBodies.Count;
+        fixture.Controller.Dispose();
+        using LmStudioInstanceController recoveryController = fixture.CreateAdditionalController();
+        LmStudioTemplateTransactionRecord pending = Assert.IsType<LmStudioTemplateTransactionRecord>(await fixture.Store.ReadAsync(plan.TransactionId));
+        LmStudioRecoveryAssessment assessment = await recoveryController.AssessRecoveryAsync(pending);
+
+        LmStudioRollbackResult recovery = await recoveryController.RecoverAsync(pending, assessment);
+
+        Assert.False(recovery.Succeeded);
+        Assert.Contains("外部修改", recovery.Detail, StringComparison.Ordinal);
+        Assert.Equal(unloadsBeforeRecovery, fixture.Handler.UnloadCount);
+        Assert.Equal(loadsBeforeRecovery, fixture.Handler.LoadBodies.Count);
+        Assert.Contains("external-custom-template", await File.ReadAllTextAsync(fixture.DefaultsPath), StringComparison.Ordinal);
+        LmStudioTemplateTransactionRecord blocked = Assert.IsType<LmStudioTemplateTransactionRecord>(await fixture.Store.ReadAsync(plan.TransactionId));
+        Assert.Equal(LmStudioTemplateTransactionState.RecoveryBlocked, blocked.State);
+        Assert.Equal(LmStudioPersistenceStage.RecoveryBlocked, blocked.PersistenceStage);
+    }
+
+    [Fact]
+    public async Task SchemaV4CompleteRefusesPersistentDefaultsDrift()
+    {
+        using var fixture = new ControllerFixture(hierarchyPasses: true);
+        LmStudioLoadedInstanceSnapshot original = await fixture.Controller.CaptureAsync(ControllerFixture.OriginalInstanceId);
+        LmStudioTemplateRepairPlan plan = await fixture.CreatePersistentPlanAsync(original);
+        await fixture.Controller.ApplyTemplateAsync(plan);
+        await File.AppendAllTextAsync(fixture.DefaultsPath, " ");
+
+        await Assert.ThrowsAsync<IOException>(() => fixture.Controller.CompleteAsync(plan.TransactionId));
+
+        LmStudioTemplateTransactionRecord pending = Assert.IsType<LmStudioTemplateTransactionRecord>(await fixture.Store.ReadAsync(plan.TransactionId));
+        Assert.Equal(LmStudioTemplateTransactionState.PatchedAndVerified, pending.State);
+        Assert.Equal(LmStudioPersistenceStage.PersistentDefaultVerified, pending.PersistenceStage);
+    }
+
+    [Fact]
+    public async Task SchemaV4JournalRejectsBackupPathOrPlaintextHashTampering()
+    {
+        using var fixture = new ControllerFixture(hierarchyPasses: true);
+        LmStudioLoadedInstanceSnapshot original = await fixture.Controller.CaptureAsync(ControllerFixture.OriginalInstanceId);
+        LmStudioTemplateRepairPlan plan = await fixture.CreatePersistentPlanAsync(original);
+        await fixture.Controller.ApplyTemplateAsync(plan);
+        string journalPath = fixture.Store.GetPath(plan.TransactionId);
+        JsonObject journal = JsonNode.Parse(await File.ReadAllTextAsync(journalPath))!.AsObject();
+        journal["encryptedDefaultsBackupPath"] = Path.Combine(Path.GetDirectoryName(journalPath)!, "wrong.dpapi");
+        await File.WriteAllTextAsync(journalPath, journal.ToJsonString());
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => fixture.Store.ReadAsync(plan.TransactionId));
+
+        journal["encryptedDefaultsBackupPath"] = fixture.Store.GetEncryptedDefaultsBackupPath(plan.TransactionId);
+        journal["defaultsBackupPlaintextSha256"] = new string('F', 64);
+        await File.WriteAllTextAsync(journalPath, journal.ToJsonString());
+        await Assert.ThrowsAsync<InvalidDataException>(() => fixture.Store.ReadAsync(plan.TransactionId));
+
+        journal["defaultsBackupPlaintextSha256"] = plan.PersistentDefaults!.OriginalFingerprint.Sha256;
+        journal["persistenceStage"] = nameof(LmStudioPersistenceStage.None);
+        await File.WriteAllTextAsync(journalPath, journal.ToJsonString());
+        await Assert.ThrowsAsync<InvalidDataException>(() => fixture.Store.ReadAsync(plan.TransactionId));
+
+        journal["state"] = nameof(LmStudioTemplateTransactionState.OriginalUnloaded);
+        journal["persistenceStage"] = nameof(LmStudioPersistenceStage.Prepared);
+        await File.WriteAllTextAsync(journalPath, journal.ToJsonString());
+        await Assert.ThrowsAsync<InvalidDataException>(() => fixture.Store.ReadAsync(plan.TransactionId));
+    }
+
     private sealed class ControllerFixture : IDisposable
     {
         public const string OriginalInstanceId = "qwen/root";
@@ -723,6 +1019,7 @@ public sealed class LmStudioInstanceControllerTests
         private readonly StubTemplateReader reader;
         private readonly StubTemplateRepair repair;
         private readonly bool codexRunning;
+        private readonly FixedModelFileLocator modelFileLocator;
 
         public ControllerFixture(
             bool hierarchyPasses,
@@ -758,6 +1055,23 @@ public sealed class LmStudioInstanceControllerTests
                 PromptTemplateRepairService.RuleVersion);
             reader = new StubTemplateReader(Analysis);
             repair = new StubTemplateRepair(Preview);
+            const string concreteIdentifier = "publisher/model.gguf";
+            Resolution = new LmStudioModelFileResolution(GgufPath, "qwen/root", "qwen/root@q8_0", "qwen35", "Q8_0", "lms ps --json", concreteIdentifier);
+            DefaultsStore = new LmStudioPerModelDefaultsStore(
+                repair,
+                new AtomicBatchWriter(),
+                new TestDefaultsProtector(),
+                Path.Combine(temporary.Path, "lmstudio-defaults"));
+            DefaultsPath = DefaultsStore.GetDefaultsPath(concreteIdentifier);
+            Directory.CreateDirectory(Path.GetDirectoryName(DefaultsPath)!);
+            File.WriteAllText(DefaultsPath, """
+                {
+                  "preset": "",
+                  "operation": { "fields": [] },
+                  "load": { "fields": [ { "key": "llm.load.llama.evalBatchSize", "value": 4096 } ] }
+                }
+                """, new UTF8Encoding(false));
+            modelFileLocator = new FixedModelFileLocator(Resolution);
             Handler = new LifecycleHandler(
                 hierarchyPasses,
                 firstLoadOmitsConfig,
@@ -766,7 +1080,8 @@ public sealed class LmStudioInstanceControllerTests
                 secondLoadFails,
                 firstLoadWithoutSuffix,
                 remainingTtlSeconds,
-                firstReloadedTtlSeconds);
+                firstReloadedTtlSeconds,
+                () => File.ReadAllText(DefaultsPath).Contains("patched-template", StringComparison.Ordinal));
             var paths = new AppPaths(Path.Combine(temporary.Path, "local"));
             Store = new LmStudioTemplateTransactionStore(paths);
             home = new TestCodexHomeProvider(Path.Combine(temporary.Path, "codex-home"));
@@ -782,13 +1097,19 @@ public sealed class LmStudioInstanceControllerTests
                 reader,
                 repair,
                 Store,
-                new FakeLogger());
+                new FakeLogger(),
+                DefaultsStore,
+                () => "0.4.21.0",
+                modelFileLocator);
 
         public string GgufPath { get; }
         public GgufChatTemplateAnalysis Analysis { get; }
         public PromptTemplateRepairPreview Preview { get; }
         public LifecycleHandler Handler { get; }
         public LmStudioTemplateTransactionStore Store { get; }
+        public LmStudioPerModelDefaultsStore DefaultsStore { get; }
+        public string DefaultsPath { get; }
+        public LmStudioModelFileResolution Resolution { get; }
         public LmStudioInstanceController Controller { get; }
 
         public LmStudioTemplateRepairPlan CreatePlan(LmStudioLoadedInstanceSnapshot original) => new(
@@ -801,6 +1122,23 @@ public sealed class LmStudioInstanceControllerTests
             Preview,
             new LmStudioRuntimeTemplateProvenance(LmStudioRuntimeTemplateMode.BuiltIn),
             FakeLmStudioSwitchPreflight.Fail());
+
+        public async Task<LmStudioTemplateRepairPlan> CreatePersistentPlanAsync(LmStudioLoadedInstanceSnapshot original)
+        {
+            LmStudioPerModelDefaultsPlan defaults = await DefaultsStore.CreatePlanAsync(
+                original.Endpoint,
+                "0.4.21.0",
+                Resolution,
+                Analysis,
+                Preview,
+                new LmStudioRuntimeTemplateProvenance(LmStudioRuntimeTemplateMode.BuiltIn));
+            return CreatePlan(original) with
+            {
+                ModelFile = Resolution,
+                PersistentDefaults = defaults,
+                LmStudioVersion = "0.4.21.0",
+            };
+        }
 
         public async Task<LmStudioTemplateRepairPlan> CreateV2UpgradePlanAsync(LmStudioLoadedInstanceSnapshot original)
         {
@@ -838,6 +1176,36 @@ public sealed class LmStudioInstanceControllerTests
                     evidenceId),
                 OriginalHierarchyProbe = V2FailureProbe(),
                 OriginalRuntimeTemplateText = LegacyV2Template,
+            };
+        }
+
+        public async Task<LmStudioTemplateRepairPlan> CreatePersistentV2UpgradePlanAsync(LmStudioLoadedInstanceSnapshot original)
+        {
+            LmStudioTemplateRepairPlan runtimePlan = await CreateV2UpgradePlanAsync(original);
+            JsonObject defaultsRoot = JsonNode.Parse(await File.ReadAllTextAsync(DefaultsPath))!.AsObject();
+            JsonArray fields = (JsonArray)defaultsRoot["load"]!["fields"]!;
+            fields.Add(new JsonObject
+            {
+                ["key"] = LmStudioPerModelDefaultsStore.PromptTemplateKey,
+                ["value"] = new JsonObject
+                {
+                    ["type"] = "jinja",
+                    ["jinjaPromptTemplate"] = new JsonObject { ["template"] = LegacyV2Template },
+                },
+            });
+            await File.WriteAllTextAsync(DefaultsPath, defaultsRoot.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+            LmStudioPerModelDefaultsPlan defaults = await DefaultsStore.CreatePlanAsync(
+                original.Endpoint,
+                "0.4.21.0",
+                Resolution,
+                Analysis,
+                Preview,
+                runtimePlan.OriginalRuntimeTemplate);
+            return runtimePlan with
+            {
+                ModelFile = Resolution,
+                PersistentDefaults = defaults,
+                LmStudioVersion = "0.4.21.0",
             };
         }
 
@@ -881,6 +1249,21 @@ public sealed class LmStudioInstanceControllerTests
         }
 
         private static string Hash(string value) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)));
+
+        private sealed class FixedModelFileLocator(LmStudioModelFileResolution resolution) : ILmStudioModelFileLocator
+        {
+            public Task<LmStudioModelFileResolutionAttempt> ResolveAsync(ModelProfile model, Uri endpoint, CancellationToken cancellationToken = default) =>
+                Task.FromResult(new LmStudioModelFileResolutionAttempt(LmStudioModelFileResolutionStatus.Success, resolution, "test concrete identity"));
+        }
+
+        private sealed class TestDefaultsProtector : ILmStudioDefaultsProtector
+        {
+            public byte[] Protect(byte[] plaintext) => [0x43, 0x4D, 0x4D, .. plaintext];
+
+            public byte[] Unprotect(byte[] ciphertext) => ciphertext.Length >= 3 && ciphertext[0] == 0x43 && ciphertext[1] == 0x4D && ciphertext[2] == 0x4D
+                ? ciphertext[3..]
+                : throw new CryptographicException("invalid test backup");
+        }
     }
 
     private sealed class LifecycleHandler(
@@ -891,7 +1274,8 @@ public sealed class LmStudioInstanceControllerTests
         bool secondLoadFails,
         bool firstLoadWithoutSuffix,
         int? remainingTtlSeconds,
-        int? firstReloadedTtlSeconds) : HttpMessageHandler
+        int? firstReloadedTtlSeconds,
+        Func<bool>? persistentTemplateApplied = null) : HttpMessageHandler
     {
         private int loadCount;
 
@@ -988,11 +1372,12 @@ public sealed class LmStudioInstanceControllerTests
                     return StubHttpHandler.Json("{\"error\":\"simulated load failure\"}", HttpStatusCode.InternalServerError);
                 }
 
-                CurrentHasPatchedTemplate = loadRequest.RootElement.TryGetProperty("prompt_template", out JsonElement promptTemplate) &&
+                bool hasRequestTemplate = loadRequest.RootElement.TryGetProperty("prompt_template", out JsonElement promptTemplate) &&
                     promptTemplate.ValueKind == JsonValueKind.Object;
-                CurrentRuntimeTemplate = CurrentHasPatchedTemplate
+                CurrentHasPatchedTemplate = hasRequestTemplate || persistentTemplateApplied?.Invoke() == true;
+                CurrentRuntimeTemplate = hasRequestTemplate
                     ? promptTemplate.GetProperty("template").GetString()
-                    : null;
+                    : CurrentHasPatchedTemplate ? "patched-template" : null;
                 CurrentInstanceId = loadCount == 1
                     ? firstLoadReusesOriginalId ? ControllerFixture.OriginalInstanceId : firstLoadWithoutSuffix ? "runtime-patched" : "qwen/root:2"
                     : "qwen/root:3";
@@ -1045,7 +1430,7 @@ public sealed class LmStudioInstanceControllerTests
                     return StubHttpHandler.Json("{\"error\":\"System and developer messages must precede conversation messages.\"}", HttpStatusCode.InternalServerError);
                 }
 
-                if (developerProbe && (CurrentRuntimeTemplate is null || CurrentRuntimeTemplate != ControllerFixture.LegacyV2Template && !hierarchyPasses))
+                if (developerProbe && (CurrentRuntimeTemplate is null || CurrentRuntimeTemplate == "original-template" || CurrentRuntimeTemplate != ControllerFixture.LegacyV2Template && !hierarchyPasses))
                 {
                     return StubHttpHandler.Json("{\"error\":\"System message must be at the beginning\"}", HttpStatusCode.InternalServerError);
                 }

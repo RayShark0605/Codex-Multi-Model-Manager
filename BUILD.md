@@ -28,9 +28,10 @@ Debug 主程序（相对仓库根目录）：
 
 ```powershell
 dotnet test .\tests\CodexModelManager.Tests\CodexModelManager.Tests.csproj -c Release
+dotnet test .\tests\CodexModelManager.App.Tests\CodexModelManager.App.Tests.csproj -c Release
 ```
 
-普通测试只使用 `%TEMP%\CodexModelManager.Tests\<guid>`，`TestCodexHomeProvider` 对真实 `%USERPROFILE%\.codex` 有硬守卫。
+Core 普通测试只使用 `%TEMP%\CodexModelManager.Tests\<guid>`，`TestCodexHomeProvider` 对真实 `%USERPROFILE%\.codex` 有硬守卫。App 测试目标为 `net8.0-windows`，在专用 STA 线程中构造控件并使用临时 composition；不会显示窗口、写真实 Codex 配置或访问真实 Credential Manager。
 
 ### 只读 LM Studio Live Level 1/2
 
@@ -114,7 +115,7 @@ git status --short --untracked-files=all
 
 1. restore `win-x64` runtime assets；
 2. Release build；
-3. 运行非 live 单元测试；
+3. 运行 Core 与 App 两个测试项目的非 live 单元测试；
 4. 分别发布主 WinForms、Credential Helper 与 Test MCP Helper；
 5. 将 Helper 放入主发布目录的 `helpers\`；
 6. 生成 self-contained、single-file、`PublishTrimmed=false` 产物。

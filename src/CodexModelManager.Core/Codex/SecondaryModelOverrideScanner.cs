@@ -25,15 +25,40 @@ public sealed partial class SecondaryModelOverrideScanner : ISecondaryModelOverr
         List<SecondaryModelOverride> results,
         CancellationToken cancellationToken)
     {
-        if (!visited.Add(path) || !File.Exists(path)) return;
-        string text = await File.ReadAllTextAsync(path, cancellationToken).ConfigureAwait(false);
+        if (!visited.Add(path)) return;
+        if (!File.Exists(path))
+        {
+            if (!isPrimary)
+            {
+                results.Add(new SecondaryModelOverride(
+                    path,
+                    "<scan_error>",
+                    "<unknown>",
+                    null,
+                    false,
+                    false,
+                    "引用的配置不存在或当前进程无权确认其存在，未扫描 model override。"));
+            }
+
+            return;
+        }
+        string text;
         try
         {
+            text = await File.ReadAllTextAsync(path, cancellationToken).ConfigureAwait(false);
             validator.Validate(text);
         }
-        catch (InvalidDataException) when (!isPrimary)
+        catch (Exception exception) when (!isPrimary && exception is
+            InvalidDataException or ArgumentException or NotSupportedException or PathTooLongException or UnauthorizedAccessException or IOException)
         {
-            results.Add(new SecondaryModelOverride(path, "<scan_error>", "<unknown>", null, false, false, "引用的配置 TOML 无效，未扫描其 model override。"));
+            results.Add(new SecondaryModelOverride(
+                path,
+                "<scan_error>",
+                "<unknown>",
+                null,
+                false,
+                false,
+                $"引用的配置不可读或 TOML 无效，未扫描其 model override（{exception.GetType().Name}）。"));
             return;
         }
 
@@ -43,9 +68,15 @@ public sealed partial class SecondaryModelOverrideScanner : ISecondaryModelOverr
         List<(string Table, string Relative)> referencedConfigs = [];
         List<string> projectRoots = [];
         int lineNumber = 0;
+        var lexicalState = new TomlLineLexicalState();
         foreach (string line in text.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n'))
         {
             lineNumber++;
+            if (!lexicalState.IsCodeLineAndAdvance(line))
+            {
+                continue;
+            }
+
             Match header = TableHeaderRegex().Match(line);
             if (header.Success)
             {

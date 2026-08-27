@@ -93,9 +93,84 @@ public sealed class LiveLmStudioIntegrationTests
         Assert.Equal(loaded.SourceModelKey, resolution.SourceModelKey, ignoreCase: true);
         Assert.Equal(loaded.SelectedVariant, resolution.SelectedVariant, ignoreCase: true);
         Assert.Equal(loaded.Quantization, resolution.Quantization, ignoreCase: true);
+        Assert.NotNull(resolution.ConcreteModelIdentifier);
+        Assert.Equal(loaded.SourceModelKey!.Replace('\\', '/').TrimStart('.', '/'), resolution.ConcreteModelIdentifier, ignoreCase: true);
         GgufChatTemplateAnalysis analysis = await new GgufChatTemplateReader().ReadAsync(resolution.FilePath, TestContext.Current.CancellationToken);
         Assert.Equal(loaded.Architecture, analysis.Architecture, ignoreCase: true);
         Assert.Equal(PromptTemplateRepairStatus.Supported, new PromptTemplateRepairService().CreatePreview(analysis).Status);
+    }
+
+    [Fact]
+    [Trait("Category", "LiveLmStudio")]
+    public async Task CurrentPersistentDefaultsPreviewIsReadOnlyAndUsesConcreteIdentity()
+    {
+        Assert.SkipUnless(string.Equals(Environment.GetEnvironmentVariable("CMM_RUN_LIVE_LM"), "1", StringComparison.Ordinal), "Set CMM_RUN_LIVE_LM=1 to run the live LM Studio test.");
+        Uri endpoint = new("http://127.0.0.1:1234");
+        using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(3) };
+        var client = new LmStudioClient(endpoint, null, http);
+        ModelProfile loaded = Assert.Single(
+            await client.DiscoverNativeModelsAsync(TestContext.Current.CancellationToken),
+            model => model.IsLoaded == true && model.ModelType == "llm");
+        var locator = new LmStudioModelFileLocator();
+        LmStudioModelFileResolutionAttempt resolutionAttempt = await locator.ResolveAsync(loaded, endpoint, TestContext.Current.CancellationToken);
+        LmStudioModelFileResolution resolution = Assert.IsType<LmStudioModelFileResolution>(resolutionAttempt.Resolution);
+        var hierarchyProbe = new CodexModelManager.Core.Providers.CodexInstructionHierarchyProbe(http, endpoint);
+        CodexInstructionHierarchyProbeResult originalProbe = await hierarchyProbe.ProbeAsync(loaded.Id, TestContext.Current.CancellationToken);
+        Assert.Contains(originalProbe.FailureCode, new[]
+        {
+            CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder,
+            CompatibilityFailureCodes.LmStudioChatTemplateDeveloperRole,
+            CompatibilityFailureCodes.LmStudioChatTemplateContinuationInstructionOrder,
+        });
+
+        var reader = new GgufChatTemplateReader();
+        var repair = new PromptTemplateRepairService(reader);
+        var defaultsStore = new LmStudioPerModelDefaultsStore(repair, new AtomicBatchWriter());
+        string defaultsPath = defaultsStore.GetDefaultsPath(Assert.IsType<string>(resolution.ConcreteModelIdentifier));
+        FileFingerprint defaultsBefore = await FileFingerprintService.CaptureAsync(defaultsPath, TestContext.Current.CancellationToken);
+        string[] instanceIdsBefore = (await client.DiscoverNativeModelsAsync(TestContext.Current.CancellationToken))
+            .Where(model => model.IsLoaded == true)
+            .Select(model => model.Id)
+            .OrderBy(value => value, StringComparer.Ordinal)
+            .ToArray();
+        var transactions = new LmStudioTemplateTransactionStore(new AppPaths());
+        var runtime = new CodexRuntimeProbe(new DefaultCodexHomeProvider(), new TomlConfigPatchEngine());
+        using var controller = new LmStudioInstanceController(
+            endpoint,
+            false,
+            http,
+            null,
+            runtime,
+            reader,
+            repair,
+            transactions,
+            new FakeLogger(),
+            defaultsStore,
+            LmStudioLocalVersionDetector.Detect,
+            locator);
+        var planner = new LmStudioTemplateRepairPlanner(
+            controller,
+            reader,
+            repair,
+            transactions,
+            locator,
+            defaultsStore,
+            LmStudioLocalVersionDetector.Detect);
+
+        LmStudioTemplateRepairPlan plan = await planner.CreatePlanAsync(loaded, originalProbe, TestContext.Current.CancellationToken);
+
+        LmStudioPerModelDefaultsPlan persistent = Assert.IsType<LmStudioPerModelDefaultsPlan>(plan.PersistentDefaults);
+        Assert.Equal(LmStudioPerModelDefaultsMutation.Add, persistent.Mutation);
+        Assert.Equal(defaultsPath, persistent.FilePath, ignoreCase: true);
+        Assert.Equal("12827F24B742EA4E80CDC12DBCF9622227056B9F797252A3149263D4F9AAADCE", plan.GgufAnalysis.TemplateSha256, ignoreCase: true);
+        Assert.Equal("9DC0DA000D1DF280BE9F6F64D314EB52879C0DF5C3C951F74105964136592F85", persistent.TargetTemplateSha256, ignoreCase: true);
+        Assert.Equal(defaultsBefore, await FileFingerprintService.CaptureAsync(defaultsPath, TestContext.Current.CancellationToken));
+        Assert.Equal(instanceIdsBefore, (await client.DiscoverNativeModelsAsync(TestContext.Current.CancellationToken))
+            .Where(model => model.IsLoaded == true)
+            .Select(model => model.Id)
+            .OrderBy(value => value, StringComparer.Ordinal)
+            .ToArray());
+        Assert.False(File.Exists(transactions.GetPath(plan.TransactionId)));
     }
 
     [Fact]

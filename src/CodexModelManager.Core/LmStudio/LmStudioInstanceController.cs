@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text.Json;
 using CodexModelManager.Core.Abstractions;
+using CodexModelManager.Core.Infrastructure;
 using CodexModelManager.Core.Models;
 using CodexModelManager.Core.Providers;
 
@@ -18,6 +19,9 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
     private readonly IPromptTemplateRepairService templateRepair;
     private readonly LmStudioTemplateTransactionStore transactions;
     private readonly IAppLogger logger;
+    private readonly LmStudioPerModelDefaultsStore? perModelDefaultsStore;
+    private readonly Func<string?> lmStudioVersionProvider;
+    private readonly ILmStudioModelFileLocator? modelFileLocator;
     private FileStream? lifecycleLease;
     private Guid? lifecycleLeaseTransactionId;
 
@@ -30,7 +34,10 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
         IGgufChatTemplateReader ggufReader,
         IPromptTemplateRepairService templateRepair,
         LmStudioTemplateTransactionStore transactions,
-        IAppLogger logger)
+        IAppLogger logger,
+        LmStudioPerModelDefaultsStore? perModelDefaultsStore = null,
+        Func<string?>? lmStudioVersionProvider = null,
+        ILmStudioModelFileLocator? modelFileLocator = null)
     {
         LmStudioEndpointPolicy.Validate(endpoint);
         this.endpoint = endpoint;
@@ -42,6 +49,9 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
         this.templateRepair = templateRepair;
         this.transactions = transactions;
         this.logger = logger;
+        this.perModelDefaultsStore = perModelDefaultsStore;
+        this.lmStudioVersionProvider = lmStudioVersionProvider ?? LmStudioLocalVersionDetector.Detect;
+        this.modelFileLocator = modelFileLocator;
         client = new LmStudioClient(endpoint, this.tokenProvider, httpClient);
     }
 
@@ -103,10 +113,41 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
             logger.Info($"LM Studio template transaction prepared: id={plan.TransactionId:N}, instance={plan.OriginalInstance.InstanceId}, variant={plan.OriginalInstance.SelectedVariant ?? plan.OriginalInstance.SourceModelKey}, originalSha={ShortHash(plan.GgufAnalysis.TemplateSha256)}, patchedSha={ShortHash(plan.TemplatePreview.PatchedTemplateSha256!)}");
 
             string? patchedInstanceId = null;
-            LmStudioLifecycleStage failureStage = LmStudioLifecycleStage.UnloadOriginal;
+            LmStudioLifecycleStage failureStage = plan.PersistentDefaults is null ? LmStudioLifecycleStage.UnloadOriginal : LmStudioLifecycleStage.PersistDefaults;
             try
             {
+                if (plan.PersistentDefaults is not null)
+                {
+                    LmStudioPerModelDefaultsStore defaultsStore = perModelDefaultsStore
+                        ?? throw new InvalidOperationException("schema-v4 计划缺少 per-model defaults 存储服务。");
+                    ReportProgress("使用 CurrentUser DPAPI 备份 LM Studio per-model defaults");
+                    string backupPath = transactions.GetEncryptedDefaultsBackupPath(plan.TransactionId);
+                    LmStudioDefaultsBackupArtifact backup = await defaultsStore.CreateVerifiedBackupAsync(plan.PersistentDefaults, backupPath, cancellationToken).ConfigureAwait(false);
+                    record = await UpdatePersistenceRecordAsync(
+                        record,
+                        LmStudioPersistenceStage.BackupVerified,
+                        "per-model defaults 的 DPAPI 备份已写入并完成解密/SHA 校验。",
+                        cancellationToken,
+                        backup).ConfigureAwait(false);
+
+                    ReportProgress(plan.PersistentDefaults.Mutation switch
+                    {
+                        LmStudioPerModelDefaultsMutation.Add => "持久化新增模型级 Prompt Template v3",
+                        LmStudioPerModelDefaultsMutation.Upgrade => "事务式升级模型级 Prompt Template v2 → v3",
+                        _ => "验证现有模型级 Prompt Template v3（No-op）",
+                    });
+                    await defaultsStore.ApplyAsync(plan.PersistentDefaults, cancellationToken).ConfigureAwait(false);
+                    record = await UpdatePersistenceRecordAsync(
+                        record,
+                        LmStudioPersistenceStage.DefaultsVerified,
+                        "per-model defaults 候选已原子写入并重读验证。",
+                        cancellationToken).ConfigureAwait(false);
+
+                    await ValidatePlanAfterDefaultsWriteAsync(plan, cancellationToken).ConfigureAwait(false);
+                }
+
                 ReportProgress("卸载原始 LM Studio 实例");
+                failureStage = LmStudioLifecycleStage.UnloadOriginal;
                 await client.UnloadAsync(plan.OriginalInstance.InstanceId, cancellationToken).ConfigureAwait(false);
                 if (await TryCaptureAsync(plan.OriginalInstance.InstanceId, cancellationToken).ConfigureAwait(false) is not null)
                 {
@@ -116,11 +157,15 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
                 await EnsureSourceAbsentAsync(plan.OriginalInstance.SourceModelKey, cancellationToken).ConfigureAwait(false);
 
                 record = await UpdateRecordAsync(record, LmStudioTemplateTransactionState.OriginalUnloaded, null, "原实例已卸载。", cancellationToken).ConfigureAwait(false);
-                ReportProgress("加载带运行时 Prompt Template 的精确模型变体");
+                ReportProgress(plan.PersistentDefaults is null
+                    ? "加载带运行时 Prompt Template 的精确模型变体"
+                    : "按持久 per-model defaults 重载精确模型变体（REST 请求不含 prompt_template）");
                 failureStage = LmStudioLifecycleStage.LoadPatched;
                 await ValidateLoadTargetCurrentAsync(plan.OriginalInstance, cancellationToken).ConfigureAwait(false);
                 string loadModel = plan.OriginalInstance.SourceModelKey;
-                var promptTemplate = new LmStudioPromptTemplateConfiguration("jinja", plan.TemplatePreview.PatchedTemplate!, []);
+                LmStudioPromptTemplateConfiguration? promptTemplate = plan.PersistentDefaults is null
+                    ? new LmStudioPromptTemplateConfiguration("jinja", plan.TemplatePreview.PatchedTemplate!, [])
+                    : null;
                 LmStudioLoadResponse load = await client.LoadAsync(
                     loadModel,
                     plan.OriginalInstance.LoadConfiguration,
@@ -153,6 +198,15 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
                 // a concurrent unload/reload cannot be reported as a verified result.
                 patched = await CaptureAsync(patchedInstanceId, cancellationToken).ConfigureAwait(false);
                 ValidateReloadedSnapshot(plan.OriginalInstance, patched);
+                if (plan.PersistentDefaults is not null)
+                {
+                    await LmStudioPerModelDefaultsStore.VerifyAppliedAsync(plan.PersistentDefaults, cancellationToken).ConfigureAwait(false);
+                    record = await UpdatePersistenceRecordAsync(
+                        record,
+                        LmStudioPersistenceStage.PersistentDefaultVerified,
+                        "无 REST prompt_template 的重载通过四阶段探针，持久 defaults 再次验证未漂移。",
+                        cancellationToken).ConfigureAwait(false);
+                }
                 record = await UpdateRecordAsync(record, LmStudioTemplateTransactionState.PatchedAndVerified, patchedInstanceId, "补丁实例 Codex 指令层级 PASS。", cancellationToken).ConfigureAwait(false);
                 logger.Info($"LM Studio template transaction verified: id={plan.TransactionId:N}, instance={patchedInstanceId}, control={hierarchy.Control.HttpStatus}, leading={hierarchy.LeadingDeveloper.HttpStatus}, conversation={hierarchy.ConversationControl.HttpStatus}, continuation={hierarchy.ContinuationDeveloper.HttpStatus}");
                 ReportProgress("PatchedAndVerified：等待 Codex 配置最终确认");
@@ -226,6 +280,13 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
         EnsureControllerMatches(transaction.OriginalInstance);
         GgufChatTemplateAnalysis recoveryAnalysis = await ValidateJournalGgufAsync(transaction, cancellationToken).ConfigureAwait(false);
         await ValidateOriginalRuntimeEvidenceAsync(transaction, recoveryAnalysis, cancellationToken).ConfigureAwait(false);
+        FileFingerprint? currentDefaultsFingerprint = await CaptureRecoveryDefaultsFingerprintAsync(transaction, cancellationToken).ConfigureAwait(false);
+        bool requiresPersistenceRecovery = transaction.SchemaVersion >= 4 &&
+            transaction.PersistenceStage >= LmStudioPersistenceStage.BackupVerified &&
+            transaction.PersistenceStage != LmStudioPersistenceStage.Restored &&
+            currentDefaultsFingerprint is not null &&
+            transaction.OriginalDefaultsFingerprint is not null &&
+            !FileFingerprintService.Matches(transaction.OriginalDefaultsFingerprint, currentDefaultsFingerprint);
 
         IReadOnlyList<ModelProfile> models = await client.DiscoverNativeModelsAsync(cancellationToken).ConfigureAwait(false);
         ModelProfile[] sameSource = models.Where(model =>
@@ -259,7 +320,9 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
         if (canCloseAsAlreadyRestored)
         {
             disposition = LmStudioRecoveryDisposition.AlreadyRestored;
-            detail = transaction.SchemaVersion < 3
+            detail = requiresPersistenceRecovery
+                ? "当前唯一实例已复现原始运行时签名，但持久 defaults 尚未恢复；确认后会先验证 DPAPI 备份并恢复管理器拥有的 Prompt Template 字段，再关闭 journal，不执行模型 unload/load。"
+                : transaction.SchemaVersion < 3
                 ? "Legacy 事务缺少 v3 provenance，但当前唯一实例的 ID、完整配置和原始层级失败签名均与快照一致；可只关闭 journal，不重载模型。"
                 : "当前唯一实例的完整配置和原始运行时模板四阶段签名均与事务快照一致；可只关闭 journal，不重载模型。";
         }
@@ -280,7 +343,7 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
         }
         else
         {
-            bool patchStageEvidence = transaction.State is LmStudioTemplateTransactionState.PatchedLoaded or LmStudioTemplateTransactionState.PatchedAndVerified ||
+            bool patchStageEvidence = transaction.State is LmStudioTemplateTransactionState.OriginalUnloaded or LmStudioTemplateTransactionState.PatchedLoaded or LmStudioTemplateTransactionState.PatchedAndVerified ||
                 transaction.LastStableState is LmStudioTemplateTransactionState.OriginalUnloaded or LmStudioTemplateTransactionState.PatchedLoaded or LmStudioTemplateTransactionState.PatchedAndVerified;
             LmStudioRecoveryCandidate? soleCompatiblePatch = candidates.Count == 1 &&
                 patchStageEvidence &&
@@ -302,7 +365,7 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
             }
         }
 
-        string fingerprint = ComputeRecoveryAssessmentFingerprint(transaction, candidates, disposition, instanceToUnload);
+        string fingerprint = ComputeRecoveryAssessmentFingerprint(transaction, candidates, disposition, instanceToUnload, currentDefaultsFingerprint);
         return new LmStudioRecoveryAssessment(
             transaction.TransactionId,
             disposition,
@@ -311,7 +374,9 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
             disposition is LmStudioRecoveryDisposition.LoadOriginal or LmStudioRecoveryDisposition.UnloadKnownPatchAndLoadOriginal,
             transaction.SchemaVersion < 3,
             fingerprint,
-            detail);
+            detail,
+            currentDefaultsFingerprint,
+            requiresPersistenceRecovery);
     }
 
     public async Task<LmStudioRollbackResult> RecoverAsync(
@@ -350,6 +415,37 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
             if (currentAssessment.Disposition == LmStudioRecoveryDisposition.BlockedAmbiguous)
             {
                 return new LmStudioRollbackResult(false, currentAssessment.Detail, null, transactions.GetPath(transaction.TransactionId));
+            }
+
+            if (currentRecord.SchemaVersion >= 4 &&
+                currentRecord.PersistenceStage >= LmStudioPersistenceStage.BackupVerified &&
+                currentRecord.PersistenceStage != LmStudioPersistenceStage.Restored)
+            {
+                LmStudioPerModelDefaultsStore defaultsStore = perModelDefaultsStore
+                    ?? throw new InvalidOperationException("schema-v4 恢复缺少 per-model defaults 存储服务。");
+                GgufChatTemplateAnalysis analysis = await ValidateJournalGgufAsync(currentRecord, cancellationToken).ConfigureAwait(false);
+                LmStudioDefaultsRestoreResult restore = await defaultsStore.RestoreFromTransactionAsync(currentRecord, analysis, cancellationToken).ConfigureAwait(false);
+                if (!restore.Succeeded)
+                {
+                    LmStudioTemplateTransactionRecord blocked = currentRecord with
+                    {
+                        State = LmStudioTemplateTransactionState.RecoveryBlocked,
+                        UpdatedAt = DateTimeOffset.Now,
+                        Detail = restore.Detail,
+                        FailureStage = LmStudioLifecycleStage.RestoreDefaults,
+                        LastRecoveryFailureStage = LmStudioLifecycleStage.RestoreDefaults,
+                        PersistenceStage = LmStudioPersistenceStage.RecoveryBlocked,
+                        RecoveryAttemptCount = attempt,
+                    };
+                    await transactions.WriteAsync(blocked, cancellationToken).ConfigureAwait(false);
+                    return new LmStudioRollbackResult(false, restore.Detail, null, transactions.GetPath(transaction.TransactionId));
+                }
+
+                currentRecord = await UpdatePersistenceRecordAsync(
+                    currentRecord,
+                    LmStudioPersistenceStage.Restored,
+                    restore.Detail,
+                    cancellationToken).ConfigureAwait(false);
             }
 
             if (currentAssessment.Disposition == LmStudioRecoveryDisposition.AlreadyRestored)
@@ -399,7 +495,33 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
                 throw new InvalidOperationException($"只有 PatchedAndVerified 事务可以完成，当前状态为 {record.State}。");
             }
 
-            await UpdateRecordAsync(record, LmStudioTemplateTransactionState.Completed, record.PatchedInstanceId, "Codex 配置切换已提交；保留补丁实例。", cancellationToken).ConfigureAwait(false);
+            if (record.SchemaVersion >= 4)
+            {
+                if (perModelDefaultsStore is null || string.IsNullOrWhiteSpace(record.PatchedInstanceId) ||
+                    string.IsNullOrWhiteSpace(record.LmStudioVersion) ||
+                    !record.LmStudioVersion.Equals(lmStudioVersionProvider(), StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new IOException("完成 schema-v4 事务前无法重新确认 LM Studio 版本、持久存储服务或 patched instance。");
+                }
+
+                await LmStudioPerModelDefaultsStore.VerifyTransactionTargetAsync(record, cancellationToken).ConfigureAwait(false);
+                LmStudioLoadedInstanceSnapshot patched = await CaptureAsync(record.PatchedInstanceId, cancellationToken).ConfigureAwait(false);
+                ValidateReloadedSnapshot(record.OriginalInstance, patched);
+                record = await UpdatePersistenceRecordAsync(
+                    record,
+                    LmStudioPersistenceStage.PersistentDefaultVerified,
+                    "Codex 配置提交后已再次验证持久 defaults 和当前 instance。",
+                    cancellationToken).ConfigureAwait(false);
+            }
+
+            await UpdateRecordAsync(
+                record,
+                LmStudioTemplateTransactionState.Completed,
+                record.PatchedInstanceId,
+                record.SchemaVersion >= 4
+                    ? "Codex 配置切换已提交；Completed / PersistentDefaultVerified。"
+                    : "Codex 配置切换已提交；保留补丁实例。",
+                cancellationToken).ConfigureAwait(false);
             logger.Info($"LM Studio template transaction completed: id={transactionId:N}, instance={record.PatchedInstanceId ?? "unknown"}");
             ReportProgress("Completed：Codex 配置已提交，保留补丁实例");
         }
@@ -426,6 +548,36 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
             ReportProgress("回滚校验：GGUF 指纹与当前权威实例状态");
             GgufChatTemplateAnalysis rollbackAnalysis = await ValidateJournalGgufAsync(record, cancellationToken).ConfigureAwait(false);
             await ValidateOriginalRuntimeEvidenceAsync(record, rollbackAnalysis, cancellationToken).ConfigureAwait(false);
+            if (record.SchemaVersion >= 4 && record.PersistenceStage >= LmStudioPersistenceStage.BackupVerified && record.PersistenceStage != LmStudioPersistenceStage.Restored)
+            {
+                LmStudioPerModelDefaultsStore defaultsStore = perModelDefaultsStore
+                    ?? throw new InvalidOperationException("schema-v4 恢复缺少 per-model defaults 存储服务。");
+                failureStage = LmStudioLifecycleStage.RestoreDefaults;
+                ReportProgress("先恢复 LM Studio per-model Prompt Template 默认值");
+                LmStudioDefaultsRestoreResult defaultsRestore = await defaultsStore.RestoreFromTransactionAsync(record, rollbackAnalysis, cancellationToken).ConfigureAwait(false);
+                if (!defaultsRestore.Succeeded)
+                {
+                    LmStudioTemplateTransactionRecord blocked = record with
+                    {
+                        State = LmStudioTemplateTransactionState.RecoveryBlocked,
+                        UpdatedAt = DateTimeOffset.Now,
+                        Detail = defaultsRestore.Detail,
+                        FailureStage = LmStudioLifecycleStage.RestoreDefaults,
+                        LastRecoveryFailureStage = LmStudioLifecycleStage.RestoreDefaults,
+                        PersistenceStage = LmStudioPersistenceStage.RecoveryBlocked,
+                    };
+                    await transactions.WriteAsync(blocked, CancellationToken.None).ConfigureAwait(false);
+                    ReportProgress("RecoveryBlocked：持久 Prompt Template 已被外部修改，未覆盖也未卸载实例");
+                    return new LmStudioRollbackResult(false, defaultsRestore.Detail, null, transactionPath);
+                }
+
+                record = await UpdatePersistenceRecordAsync(
+                    record,
+                    LmStudioPersistenceStage.Restored,
+                    defaultsRestore.Detail,
+                    cancellationToken).ConfigureAwait(false);
+            }
+
             LmStudioPromptTemplateConfiguration? originalPromptTemplate = RecreateOriginalRuntimeTemplate(record, rollbackAnalysis);
             IReadOnlyList<ModelProfile> models = await client.DiscoverNativeModelsAsync(cancellationToken).ConfigureAwait(false);
 
@@ -606,7 +758,10 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
         }
 
         await ValidateLoadTargetCurrentAsync(current, cancellationToken).ConfigureAwait(false);
-        await client.ProbePromptTemplateSchemaAsync(cancellationToken).ConfigureAwait(false);
+        if (plan.PersistentDefaults is null)
+        {
+            await client.ProbePromptTemplateSchemaAsync(cancellationToken).ConfigureAwait(false);
+        }
 
         var hierarchyProbe = new CodexInstructionHierarchyProbe(httpClient, endpoint, tokenProvider);
         CodexInstructionHierarchyProbeResult currentHierarchy = await hierarchyProbe.ProbeAsync(current.InstanceId, cancellationToken).ConfigureAwait(false);
@@ -632,9 +787,138 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
         }
 
         await ValidateRuntimeProvenanceAsync(plan, current, analysis, cancellationToken).ConfigureAwait(false);
+        if (plan.PersistentDefaults is not null)
+        {
+            await ValidatePersistentPlanCurrentAsync(plan, current, analysis, cancellationToken).ConfigureAwait(false);
+        }
 
         return current;
     }
+
+    private async Task ValidatePersistentPlanCurrentAsync(
+        LmStudioTemplateRepairPlan plan,
+        LmStudioLoadedInstanceSnapshot current,
+        GgufChatTemplateAnalysis analysis,
+        CancellationToken cancellationToken)
+    {
+        LmStudioPerModelDefaultsPlan expected = plan.PersistentDefaults
+            ?? throw new InvalidOperationException("持久化计划缺失。");
+        LmStudioPerModelDefaultsStore defaultsStore = perModelDefaultsStore
+            ?? throw new InvalidOperationException("持久化计划缺少 per-model defaults 存储服务。");
+        ILmStudioModelFileLocator locator = modelFileLocator
+            ?? throw new InvalidOperationException("持久化计划缺少 concrete GGUF 身份定位服务。");
+        string? currentVersion = lmStudioVersionProvider();
+        if (string.IsNullOrWhiteSpace(currentVersion) || !currentVersion.Equals(plan.LmStudioVersion, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new IOException("LM Studio 版本在 Preview 后发生变化或已无法确认；任何 defaults 写入和 unload 均已阻断。");
+        }
+
+        LmStudioModelFileResolution resolution = await ResolveCurrentModelFileAsync(locator, current, cancellationToken).ConfigureAwait(false);
+        if (!Path.GetFullPath(resolution.FilePath).Equals(Path.GetFullPath(plan.ModelFile.FilePath), StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(resolution.ConcreteModelIdentifier, expected.ConcreteModelIdentifier, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new IOException("lms ps 的 concrete GGUF 身份在 Preview 后发生变化；任何 defaults 写入和 unload 均已阻断。");
+        }
+
+        LmStudioPerModelDefaultsPlan refreshed = await defaultsStore.CreatePlanAsync(
+            endpoint,
+            currentVersion,
+            resolution,
+            analysis,
+            plan.TemplatePreview,
+            plan.OriginalRuntimeTemplate,
+            cancellationToken).ConfigureAwait(false);
+        if (!PersistentPlansEquivalent(expected, refreshed))
+        {
+            throw new IOException("LM Studio per-model defaults 在 Preview 后发生变化；任何文件写入和 unload 均已阻断。");
+        }
+    }
+
+    private async Task ValidatePlanAfterDefaultsWriteAsync(
+        LmStudioTemplateRepairPlan plan,
+        CancellationToken cancellationToken)
+    {
+        LmStudioPerModelDefaultsPlan persistent = plan.PersistentDefaults
+            ?? throw new InvalidOperationException("持久化计划缺失。");
+        ILmStudioModelFileLocator locator = modelFileLocator
+            ?? throw new InvalidOperationException("持久化计划缺少 concrete GGUF 身份定位服务。");
+        string? currentVersion = lmStudioVersionProvider();
+        if (string.IsNullOrWhiteSpace(currentVersion) || !currentVersion.Equals(plan.LmStudioVersion, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new IOException("写入 defaults 后 LM Studio 版本发生变化；事务将恢复原文件且不会 unload。");
+        }
+
+        LmStudioLoadedInstanceSnapshot current = await CaptureAsync(plan.OriginalInstance.InstanceId, cancellationToken).ConfigureAwait(false);
+        if (!current.Fingerprint.Equals(plan.OriginalInstance.Fingerprint, StringComparison.Ordinal))
+        {
+            throw new IOException("写入 defaults 后 native loaded instance 发生变化；事务将恢复原文件且不会继续 unload。");
+        }
+
+        LmStudioModelFileResolution resolution = await ResolveCurrentModelFileAsync(locator, current, cancellationToken).ConfigureAwait(false);
+        if (!Path.GetFullPath(resolution.FilePath).Equals(Path.GetFullPath(plan.ModelFile.FilePath), StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(resolution.ConcreteModelIdentifier, persistent.ConcreteModelIdentifier, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new IOException("写入 defaults 后 lms ps 的 concrete GGUF 身份发生变化；事务将回滚。");
+        }
+
+        GgufChatTemplateAnalysis analysis = await ggufReader.ReadAsync(plan.GgufAnalysis.FilePath, cancellationToken).ConfigureAwait(false);
+        if (!analysis.TemplateSha256.Equals(plan.GgufAnalysis.TemplateSha256, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new IOException("写入 defaults 后 GGUF Prompt Template SHA 发生变化；事务将回滚。");
+        }
+
+        await LmStudioPerModelDefaultsStore.VerifyAppliedAsync(persistent, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<LmStudioModelFileResolution> ResolveCurrentModelFileAsync(
+        ILmStudioModelFileLocator locator,
+        LmStudioLoadedInstanceSnapshot snapshot,
+        CancellationToken cancellationToken)
+    {
+        ModelProfile profile = CreateLocatorProfile(snapshot);
+        LmStudioModelFileResolutionAttempt attempt = await locator.ResolveAsync(profile, endpoint, cancellationToken).ConfigureAwait(false);
+        if (!attempt.Succeeded || attempt.Resolution is null)
+        {
+            throw new IOException($"无法重新证明当前 loaded instance 的 concrete GGUF 身份：{attempt.Diagnostic}");
+        }
+
+        return attempt.Resolution;
+    }
+
+    private static ModelProfile CreateLocatorProfile(LmStudioLoadedInstanceSnapshot snapshot) => new(
+        snapshot.InstanceId,
+        snapshot.InstanceId,
+        ProviderKind.LmStudio,
+        Quantization: snapshot.Quantization,
+        Parameters: snapshot.Parameters,
+        IsLoaded: true,
+        MaxContextLength: snapshot.MaxContextLength,
+        LoadedContextLength: snapshot.LoadConfiguration.ContextLength,
+        Source: "/api/v1/models",
+        LoadedInstanceId: snapshot.InstanceId,
+        Architecture: snapshot.Architecture,
+        ModelType: snapshot.ModelType,
+        SourceModelKey: snapshot.SourceModelKey,
+        SelectedVariant: snapshot.SelectedVariant,
+        LoadedConfiguration: snapshot.LoadConfiguration,
+        RemainingTtlSeconds: snapshot.RemainingTtlSeconds,
+        AvailableVariants: snapshot.LoadTarget?.AvailableVariants,
+        Format: snapshot.LoadTarget?.Format);
+
+    private static bool PersistentPlansEquivalent(LmStudioPerModelDefaultsPlan expected, LmStudioPerModelDefaultsPlan actual) =>
+        expected.ConcreteModelIdentifier.Equals(actual.ConcreteModelIdentifier, StringComparison.OrdinalIgnoreCase) &&
+        Path.GetFullPath(expected.FilePath).Equals(Path.GetFullPath(actual.FilePath), StringComparison.OrdinalIgnoreCase) &&
+        expected.LmStudioVersion.Equals(actual.LmStudioVersion, StringComparison.OrdinalIgnoreCase) &&
+        FileFingerprintService.Matches(expected.OriginalFingerprint, actual.OriginalFingerprint) &&
+        expected.CandidateFingerprint.Sha256.Equals(actual.CandidateFingerprint.Sha256, StringComparison.OrdinalIgnoreCase) &&
+        expected.OriginalFieldState == actual.OriginalFieldState &&
+        SameOptional(expected.OriginalRuleVersion, actual.OriginalRuleVersion) &&
+        SameOptional(expected.OriginalTemplateSha256, actual.OriginalTemplateSha256) &&
+        expected.TargetRuleVersion.Equals(actual.TargetRuleVersion, StringComparison.Ordinal) &&
+        expected.TargetTemplateSha256.Equals(actual.TargetTemplateSha256, StringComparison.OrdinalIgnoreCase) &&
+        expected.Mutation == actual.Mutation &&
+        expected.OriginalBytes.AsSpan().SequenceEqual(actual.OriginalBytes) &&
+        expected.CandidateBytes.AsSpan().SequenceEqual(actual.CandidateBytes);
 
     private async Task ValidateRuntimeProvenanceAsync(
         LmStudioTemplateRepairPlan plan,
@@ -855,7 +1139,8 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
         LmStudioTemplateTransactionRecord transaction,
         IReadOnlyList<LmStudioRecoveryCandidate> candidates,
         LmStudioRecoveryDisposition disposition,
-        string? instanceToUnload)
+        string? instanceToUnload,
+        FileFingerprint? currentDefaultsFingerprint)
     {
         byte[] canonical = JsonSerializer.SerializeToUtf8Bytes(new
         {
@@ -875,6 +1160,20 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
             transaction.OriginalRuntimeTemplateSha256,
             transaction.OriginalRuntimeEvidenceTransactionId,
             transaction.TargetRuntimeRuleVersion,
+            transaction.ConcreteModelIdentifier,
+            transaction.PerModelDefaultsPath,
+            transaction.OriginalDefaultsFingerprint,
+            transaction.OriginalPersistentTemplateState,
+            transaction.OriginalPersistentRuleVersion,
+            transaction.OriginalPersistentTemplateSha256,
+            transaction.TargetPersistentRuleVersion,
+            transaction.TargetPersistentTemplateSha256,
+            transaction.CandidateDefaultsSha256,
+            transaction.EncryptedDefaultsBackupPath,
+            transaction.DefaultsBackupPlaintextSha256,
+            transaction.PersistenceStage,
+            transaction.LmStudioVersion,
+            CurrentDefaultsFingerprint = currentDefaultsFingerprint,
             Candidates = candidates.Select(candidate => new
             {
                 candidate.Snapshot.InstanceId,
@@ -891,6 +1190,31 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
             InstanceToUnload = instanceToUnload,
         });
         return Convert.ToHexString(SHA256.HashData(canonical));
+    }
+
+    private async Task<FileFingerprint?> CaptureRecoveryDefaultsFingerprintAsync(
+        LmStudioTemplateTransactionRecord transaction,
+        CancellationToken cancellationToken)
+    {
+        if (transaction.SchemaVersion < 4)
+        {
+            return null;
+        }
+
+        LmStudioPerModelDefaultsStore defaultsStore = perModelDefaultsStore
+            ?? throw new InvalidOperationException("schema-v4 恢复评估缺少 per-model defaults 存储服务。");
+        if (string.IsNullOrWhiteSpace(transaction.ConcreteModelIdentifier) || string.IsNullOrWhiteSpace(transaction.PerModelDefaultsPath))
+        {
+            throw new InvalidDataException("schema-v4 恢复事务缺少 concrete model identifier 或 defaults 路径。");
+        }
+
+        string expectedPath = defaultsStore.GetDefaultsPath(transaction.ConcreteModelIdentifier);
+        if (!Path.GetFullPath(transaction.PerModelDefaultsPath).Equals(expectedPath, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException("schema-v4 恢复事务的 defaults 路径与 concrete model identifier 不一致。");
+        }
+
+        return await FileFingerprintService.CaptureAsync(expectedPath, cancellationToken).ConfigureAwait(false);
     }
 
     private static void ValidateReloadedSnapshot(
@@ -949,7 +1273,9 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
     {
         if (record.OriginalRuntimeTemplateMode == LmStudioRuntimeTemplateMode.BuiltIn)
         {
-            return null;
+            return record.SchemaVersion >= 4
+                ? new LmStudioPromptTemplateConfiguration("jinja", analysis.ChatTemplate, [])
+                : null;
         }
 
         if (record.OriginalRuntimeTemplateMode != LmStudioRuntimeTemplateMode.ManagerRule ||
@@ -1078,7 +1404,7 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
     }
 
     private static LmStudioTemplateTransactionRecord CreateRecord(LmStudioTemplateRepairPlan plan) => new(
-        3,
+        plan.PersistentDefaults is null ? 3 : 4,
         plan.TransactionId,
         LmStudioTemplateTransactionState.Prepared,
         plan.CreatedAt,
@@ -1102,7 +1428,18 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
         OriginalRuntimeTemplateSha256: plan.OriginalRuntimeTemplate.TemplateSha256,
         OriginalRuntimeEvidenceTransactionId: plan.OriginalRuntimeTemplate.EvidenceTransactionId,
         TargetRuntimeRuleVersion: plan.TemplatePreview.RuleVersion,
-        OriginalHierarchyProbe: plan.OriginalHierarchyProbe);
+        OriginalHierarchyProbe: plan.OriginalHierarchyProbe,
+        ConcreteModelIdentifier: plan.PersistentDefaults?.ConcreteModelIdentifier,
+        PerModelDefaultsPath: plan.PersistentDefaults?.FilePath,
+        OriginalDefaultsFingerprint: plan.PersistentDefaults?.OriginalFingerprint,
+        OriginalPersistentTemplateState: plan.PersistentDefaults?.OriginalFieldState,
+        OriginalPersistentRuleVersion: plan.PersistentDefaults?.OriginalRuleVersion,
+        OriginalPersistentTemplateSha256: plan.PersistentDefaults?.OriginalTemplateSha256,
+        TargetPersistentRuleVersion: plan.PersistentDefaults?.TargetRuleVersion,
+        TargetPersistentTemplateSha256: plan.PersistentDefaults?.TargetTemplateSha256,
+        CandidateDefaultsSha256: plan.PersistentDefaults?.CandidateFingerprint.Sha256,
+        PersistenceStage: plan.PersistentDefaults is null ? LmStudioPersistenceStage.None : LmStudioPersistenceStage.Prepared,
+        LmStudioVersion: plan.LmStudioVersion);
 
     private async Task<LmStudioTemplateTransactionRecord> RecordApplyFailureEvidenceAsync(
         LmStudioTemplateTransactionRecord record,
@@ -1184,6 +1521,30 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
             LastRecoveryFailureStage = state == LmStudioTemplateTransactionState.RollbackFailed && failureStage != LmStudioLifecycleStage.None
                 ? failureStage
                 : record.LastRecoveryFailureStage,
+        };
+        await transactions.WriteAsync(updated, cancellationToken).ConfigureAwait(false);
+        return updated;
+    }
+
+    private async Task<LmStudioTemplateTransactionRecord> UpdatePersistenceRecordAsync(
+        LmStudioTemplateTransactionRecord record,
+        LmStudioPersistenceStage stage,
+        string detail,
+        CancellationToken cancellationToken,
+        LmStudioDefaultsBackupArtifact? backup = null)
+    {
+        if (record.SchemaVersion < 4)
+        {
+            throw new InvalidOperationException("只有 schema-v4 事务可以记录持久 defaults 阶段。");
+        }
+
+        LmStudioTemplateTransactionRecord updated = record with
+        {
+            UpdatedAt = DateTimeOffset.Now,
+            Detail = detail,
+            PersistenceStage = stage,
+            EncryptedDefaultsBackupPath = backup?.Path ?? record.EncryptedDefaultsBackupPath,
+            DefaultsBackupPlaintextSha256 = backup?.PlaintextSha256 ?? record.DefaultsBackupPlaintextSha256,
         };
         await transactions.WriteAsync(updated, cancellationToken).ConfigureAwait(false);
         return updated;

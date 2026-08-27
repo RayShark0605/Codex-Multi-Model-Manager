@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using CodexModelManager.Core.Abstractions;
+using CodexModelManager.Core.Infrastructure;
 using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Core.LmStudio;
@@ -35,11 +36,12 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
     {
         ArgumentNullException.ThrowIfNull(model);
         ArgumentNullException.ThrowIfNull(endpoint);
-        if (!HasAuthoritativeLoadedIdentity(model))
+        string[] missingIdentityFields = GetMissingAuthoritativeLoadedIdentityFields(model);
+        if (missingIdentityFields.Length > 0)
         {
             return Failure(
                 LmStudioModelFileResolutionStatus.InvalidModelSnapshot,
-                "native loaded instance 快照缺少 loaded ID、source、type、architecture、quantization 或实际 context；拒绝猜测 GGUF。");
+                $"native loaded instance 快照缺少或不满足以下权威字段：{string.Join("、", missingIdentityFields)}；拒绝猜测 GGUF。");
         }
 
         try
@@ -77,7 +79,7 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
                 LmStudioModelFileResolutionStatus.InvalidSettings,
                 "LM Studio settings.json 不是有效 JSON；拒绝推断 models 根目录。");
         }
-        catch (Exception exception) when (exception is ArgumentException or IOException or NotSupportedException or UnauthorizedAccessException)
+        catch (Exception exception) when (exception is ArgumentException or InvalidDataException or IOException or NotSupportedException or UnauthorizedAccessException)
         {
             return Failure(
                 LmStudioModelFileResolutionStatus.InvalidSettings,
@@ -185,23 +187,30 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
             EvidenceResult result = ResolvePsEvidence(model, processesJson, ReadModelRoots(settingsJson, userProfile));
             return result.Resolution is not null
                 ? Success(result.Resolution)
-                : Failure(MapEvidenceStatus(result.Status), DiagnosticForEvidence(result.Status));
+                : Failure(MapEvidenceStatus(result.Status), DiagnosticForEvidence(result));
         }
         catch (JsonException)
         {
             return Failure(LmStudioModelFileResolutionStatus.InvalidJson, "lms ps --json 输出不是有效 JSON；自动定位已阻断。");
         }
+        catch (InvalidDataException)
+        {
+            return Failure(LmStudioModelFileResolutionStatus.InvalidSettings, "LM Studio settings.json 的 downloadsFolder 必须是绝对路径；自动定位已阻断。");
+        }
     }
 
-    private static bool HasAuthoritativeLoadedIdentity(ModelProfile model) =>
-        model.Provider == ProviderKind.LmStudio &&
-        model.IsLoaded == true &&
-        !string.IsNullOrWhiteSpace(model.LoadedInstanceId ?? model.Id) &&
-        !string.IsNullOrWhiteSpace(model.SourceModelKey) &&
-        !string.IsNullOrWhiteSpace(model.ModelType) &&
-        !string.IsNullOrWhiteSpace(model.Architecture) &&
-        !string.IsNullOrWhiteSpace(model.Quantization) &&
-        model.LoadedContextLength is > 0;
+    private static string[] GetMissingAuthoritativeLoadedIdentityFields(ModelProfile model)
+    {
+        List<string> missing = [];
+        if (model.Provider != ProviderKind.LmStudio) missing.Add("provider=lmstudio");
+        if (model.IsLoaded != true) missing.Add("loaded=true");
+        if (string.IsNullOrWhiteSpace(model.LoadedInstanceId ?? model.Id)) missing.Add("loaded ID");
+        if (string.IsNullOrWhiteSpace(model.SourceModelKey)) missing.Add("source");
+        if (string.IsNullOrWhiteSpace(model.ModelType)) missing.Add("type");
+        if (string.IsNullOrWhiteSpace(model.Architecture)) missing.Add("architecture");
+        if (model.LoadedContextLength is not > 0) missing.Add("实际 context");
+        return [.. missing];
+    }
 
     private static EvidenceResult ParseCommand(
         LmsCliCommandResult command,
@@ -268,9 +277,12 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         ];
         foreach (EvidenceStatus status in rejectedEvidence)
         {
-            if (variants.Status == status || processes.Status == status)
+            EvidenceResult? rejected = variants.Status == status && !string.IsNullOrWhiteSpace(variants.Diagnostic)
+                ? variants
+                : processes.Status == status ? processes : variants.Status == status ? variants : null;
+            if (rejected is not null)
             {
-                return Failure(MapEvidenceStatus(status), DiagnosticForEvidence(status));
+                return Failure(MapEvidenceStatus(status), DiagnosticForEvidence(rejected));
             }
         }
 
@@ -286,7 +298,8 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         EvidenceStatus evidenceStatus = HighestPriorityEvidenceStatus(variants.Status, processes.Status);
         if (evidenceStatus is not (EvidenceStatus.NoMatch or EvidenceStatus.CommandFailed))
         {
-            return Failure(MapEvidenceStatus(evidenceStatus), DiagnosticForEvidence(evidenceStatus));
+            EvidenceResult evidence = variants.Status == evidenceStatus ? variants : processes;
+            return Failure(MapEvidenceStatus(evidenceStatus), DiagnosticForEvidence(evidence));
         }
 
         LmsCliCommandStatus commandStatus = HighestPriorityCommandStatus(variantsCommand.Status, processesCommand.Status);
@@ -347,6 +360,9 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         EvidenceStatus.InvalidJson => "lms CLI 返回非法 JSON；自动定位已阻断。",
         _ => "lms CLI 未唯一定位当前 native loaded instance 的 GGUF；请手工选择并核对。",
     };
+
+    private static string DiagnosticForEvidence(EvidenceResult evidence) =>
+        string.IsNullOrWhiteSpace(evidence.Diagnostic) ? DiagnosticForEvidence(evidence.Status) : evidence.Diagnostic;
     private static EvidenceResult ResolveLsEvidence(
         ModelProfile model,
         string variantsJson,
@@ -417,6 +433,7 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         string sourceKey = model.SourceModelKey!;
         bool sawObject = false;
         bool sawIdentityMismatch = false;
+        var mismatchFields = new SortedSet<string>(StringComparer.Ordinal);
         List<CliCandidate> candidates = [];
         foreach (JsonElement item in document.RootElement.EnumerateArray())
         {
@@ -434,16 +451,30 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
             string? quantization = GetQuantization(item);
             int? contextLength = GetInt32(item, "contextLength");
             string? format = GetString(item, "format");
-            bool instanceMatches = StringEquals(modelKey, loadedId) && StringEquals(identifier, loadedId);
-            bool sourceMatches = SourceMatches(sourceKey, publisher, modelKey);
-            bool metadataMatches = Exact(model.ModelType, type) &&
-                Exact(model.Architecture, architecture) &&
-                Exact(model.Quantization, quantization) &&
-                model.LoadedContextLength == contextLength &&
-                string.Equals(format, "gguf", StringComparison.OrdinalIgnoreCase);
-            if (!instanceMatches || !sourceMatches || !metadataMatches || string.IsNullOrWhiteSpace(publisher))
+            string? path = GetString(item, "path");
+            string? indexedModelIdentifier = GetString(item, "indexedModelIdentifier");
+            bool modelKeyMatches = ModelKeyMatches(modelKey, loadedId, sourceKey);
+            bool identifierMatches = StringEquals(identifier, loadedId);
+            bool publisherPresent = !string.IsNullOrWhiteSpace(publisher);
+            bool sourceMatches = SourceMatches(sourceKey, publisher, modelKey, path, indexedModelIdentifier);
+            bool typeMatches = Exact(model.ModelType, type);
+            bool architectureMatches = Exact(model.Architecture, architecture);
+            bool quantizationMatches = OptionalExact(model.Quantization, quantization);
+            bool contextMatches = model.LoadedContextLength == contextLength;
+            bool formatMatches = string.Equals(format, "gguf", StringComparison.OrdinalIgnoreCase);
+            if (!modelKeyMatches || !identifierMatches || !publisherPresent || !sourceMatches || !typeMatches ||
+                !architectureMatches || !quantizationMatches || !contextMatches || !formatMatches)
             {
                 sawIdentityMismatch = true;
+                if (!modelKeyMatches) mismatchFields.Add("modelKey（必须等于 loaded ID 或 source/load key）");
+                if (!identifierMatches) mismatchFields.Add("loaded identifier");
+                if (!publisherPresent) mismatchFields.Add("publisher");
+                if (!sourceMatches) mismatchFields.Add(IsGgufSourcePath(sourceKey) ? "source/path/indexedModelIdentifier" : "source/publisher/modelKey");
+                if (!typeMatches) mismatchFields.Add("type");
+                if (!architectureMatches) mismatchFields.Add("architecture");
+                if (!quantizationMatches) mismatchFields.Add("quantization");
+                if (!contextMatches) mismatchFields.Add("实际 context");
+                if (!formatMatches) mismatchFields.Add("format=gguf");
                 continue;
             }
 
@@ -452,7 +483,7 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
                 model.SelectedVariant,
                 architecture,
                 quantization,
-                [GetString(item, "path")],
+                [ExtractIndexedRelativePath(indexedModelIdentifier), path],
                 "lms ps --json",
                 publisher));
         }
@@ -461,23 +492,81 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         {
             return new EvidenceResult(
                 sawObject && sawIdentityMismatch ? EvidenceStatus.IdentityMismatch : EvidenceStatus.NoMatch,
-                null);
+                null,
+                mismatchFields.Count == 0
+                    ? null
+                    : $"lms ps 的以下权威字段与 native loaded instance 快照不一致：{string.Join("、", mismatchFields)}；拒绝自动定位。");
         }
 
         return ResolveCandidates(candidates, modelRoots);
     }
 
-    private static bool SourceMatches(string sourceKey, string? publisher, string? modelKey)
+    private static bool SourceMatches(
+        string sourceKey,
+        string? publisher,
+        string? modelKey,
+        string? path,
+        string? indexedModelIdentifier)
     {
         if (string.IsNullOrWhiteSpace(publisher) || string.IsNullOrWhiteSpace(modelKey))
         {
             return false;
         }
 
-        string qualified = publisher.TrimEnd('/') + "/" + modelKey.TrimStart('/');
-        return sourceKey.Contains('/', StringComparison.Ordinal)
-            ? sourceKey.Equals(qualified, StringComparison.OrdinalIgnoreCase)
-            : sourceKey.Equals(modelKey, StringComparison.OrdinalIgnoreCase);
+        if (IsGgufSourcePath(sourceKey))
+        {
+            string normalizedSource = NormalizeModelIdentifierPath(sourceKey);
+            string? sourcePublisher = normalizedSource.Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+            if (!string.Equals(sourcePublisher, publisher, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            string? indexedPath = ExtractIndexedRelativePath(indexedModelIdentifier);
+            if (!string.IsNullOrWhiteSpace(indexedModelIdentifier) && string.IsNullOrWhiteSpace(indexedPath))
+            {
+                return false;
+            }
+
+            string[] evidencePaths = [.. new[] { path, indexedPath }.Where(value => !string.IsNullOrWhiteSpace(value)).Cast<string>()];
+            return evidencePaths.Length > 0 && evidencePaths.All(value =>
+                normalizedSource.Equals(NormalizeModelIdentifierPath(value), StringComparison.OrdinalIgnoreCase));
+        }
+
+        string normalizedSourceId = NormalizeModelIdentifierPath(sourceKey);
+        string normalizedModelKey = NormalizeModelIdentifierPath(modelKey);
+        string normalizedPublisher = publisher.Trim().Trim('/');
+        string qualified = normalizedModelKey.StartsWith(normalizedPublisher + "/", StringComparison.OrdinalIgnoreCase)
+            ? normalizedModelKey
+            : normalizedPublisher + "/" + normalizedModelKey;
+        return normalizedSourceId.Contains('/', StringComparison.Ordinal)
+            ? normalizedSourceId.Equals(qualified, StringComparison.OrdinalIgnoreCase)
+            : normalizedSourceId.Equals(normalizedModelKey, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool ModelKeyMatches(string? modelKey, string loadedId, string sourceKey)
+    {
+        if (string.IsNullOrWhiteSpace(modelKey))
+        {
+            return false;
+        }
+
+        return modelKey.Equals(loadedId, StringComparison.OrdinalIgnoreCase) ||
+            NormalizeModelIdentifierPath(modelKey).Equals(NormalizeModelIdentifierPath(sourceKey), StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsGgufSourcePath(string sourceKey) =>
+        sourceKey.Trim().EndsWith(".gguf", StringComparison.OrdinalIgnoreCase);
+
+    private static string NormalizeModelIdentifierPath(string value)
+    {
+        string normalized = value.Trim().Replace('\\', '/');
+        while (normalized.StartsWith("./", StringComparison.Ordinal))
+        {
+            normalized = normalized[2..];
+        }
+
+        return normalized;
     }
 
     private static void AddLsCandidate(
@@ -513,7 +602,7 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
 
         string? quantization = GetQuantization(item);
         string? architecture = GetString(item, "architecture");
-        if (!Compatible(model.Quantization, quantization) || !Compatible(model.Architecture, architecture))
+        if (!OptionalExact(model.Quantization, quantization) || !Compatible(model.Architecture, architecture))
         {
             return;
         }
@@ -550,13 +639,15 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
 
             foreach (string path in paths.Paths)
             {
+                string? concreteModelIdentifier = ResolveConcreteModelIdentifier(path, modelRoots);
                 resolved.Add(new LmStudioModelFileResolution(
                     path,
                     candidate.SourceModelKey,
                     candidate.SelectedVariant,
                     candidate.Architecture,
                     candidate.Quantization,
-                    candidate.Source));
+                    candidate.Source,
+                    concreteModelIdentifier));
             }
         }
 
@@ -639,6 +730,24 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         }
 
         return new PathResolution(paths.Distinct(StringComparer.OrdinalIgnoreCase).ToArray(), rejections);
+    }
+
+    private static string? ResolveConcreteModelIdentifier(string path, IReadOnlyList<string> modelRoots)
+    {
+        string fullPath = Path.GetFullPath(path);
+        string? root = modelRoots.FirstOrDefault(candidateRoot => IsUnderRoot(fullPath, candidateRoot));
+        if (root is null)
+        {
+            return null;
+        }
+
+        string relative = Path.GetRelativePath(root, fullPath);
+        if (Path.IsPathFullyQualified(relative) || relative.Equals("..", StringComparison.Ordinal) || relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        return NormalizeModelIdentifierPath(relative);
     }
     private static void TryAddAbsolutePath(
         List<string> paths,
@@ -770,22 +879,36 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         !string.IsNullOrWhiteSpace(actual) &&
         expected.Equals(actual, StringComparison.OrdinalIgnoreCase);
 
+    private static bool OptionalExact(string? expected, string? actual)
+    {
+        bool expectedMissing = string.IsNullOrWhiteSpace(expected);
+        bool actualMissing = string.IsNullOrWhiteSpace(actual);
+        return expectedMissing || actualMissing
+            ? expectedMissing && actualMissing
+            : expected!.Equals(actual, StringComparison.OrdinalIgnoreCase);
+    }
+
     private static bool StringEquals(string? left, string? right) =>
         string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
 
     private static string? GetString(JsonElement element, string name) =>
+        element.ValueKind == JsonValueKind.Object &&
         element.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.String
             ? value.GetString()
             : null;
 
     private static int? GetInt32(JsonElement element, string name) =>
-        element.TryGetProperty(name, out JsonElement value) && value.TryGetInt32(out int number)
+        element.ValueKind == JsonValueKind.Object &&
+        element.TryGetProperty(name, out JsonElement value) &&
+        value.ValueKind == JsonValueKind.Number &&
+        value.TryGetInt32(out int number)
             ? number
             : null;
 
     private static string? GetQuantization(JsonElement element)
     {
-        if (!element.TryGetProperty("quantization", out JsonElement value))
+        if (element.ValueKind != JsonValueKind.Object ||
+            !element.TryGetProperty("quantization", out JsonElement value))
         {
             return null;
         }
@@ -820,7 +943,8 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
 
     private sealed record EvidenceResult(
         EvidenceStatus Status,
-        LmStudioModelFileResolution? Resolution);
+        LmStudioModelFileResolution? Resolution,
+        string? Diagnostic = null);
 
     private sealed record PathResolution(
         IReadOnlyList<string> Paths,
@@ -835,6 +959,30 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         string Source,
         string? RequiredPublisher);
 
+    internal static ProcessStartInfo CreateLmsProcessStartInfo(
+        string executable,
+        IReadOnlyList<string> arguments)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = executable,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardInputEncoding = Encoding.UTF8,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
+        };
+        foreach (string argument in arguments)
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        return startInfo;
+    }
+
     private sealed class ProcessLmsCliCommandRunner : ILmsCliCommandRunner
     {
         public async Task<LmsCliCommandResult> RunAsync(
@@ -843,20 +991,7 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
             CancellationToken cancellationToken)
         {
             string executable = FindLmsExecutable() ?? (OperatingSystem.IsWindows() ? "lms.exe" : "lms");
-            var startInfo = new ProcessStartInfo
-            {
-                FileName = executable,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardInput = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-            };
-            foreach (string argument in arguments)
-            {
-                startInfo.ArgumentList.Add(argument);
-            }
-
+            ProcessStartInfo startInfo = CreateLmsProcessStartInfo(executable, arguments);
             using var process = new Process { StartInfo = startInfo };
             try
             {
@@ -885,9 +1020,7 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
             }
             catch (OperationCanceledException)
             {
-                TryTerminate(process);
-                await WaitForExitAfterTerminationAsync(process).ConfigureAwait(false);
-                await ObserveOutputAsync(stdoutTask, stderrTask).ConfigureAwait(false);
+                await BoundedProcessCleanup.TerminateAndDrainAsync(process, [stdoutTask, stderrTask]).ConfigureAwait(false);
                 cancellationToken.ThrowIfCancellationRequested();
                 return new LmsCliCommandResult(LmsCliCommandStatus.TimedOut, null);
             }
@@ -933,31 +1066,6 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
             return null;
         }
 
-        private static void TryTerminate(Process process)
-        {
-            try
-            {
-                if (!process.HasExited)
-                {
-                    process.Kill(entireProcessTree: true);
-                }
-            }
-            catch (Exception exception) when (exception is InvalidOperationException or Win32Exception or NotSupportedException)
-            {
-            }
-        }
-
-        private static async Task WaitForExitAfterTerminationAsync(Process process)
-        {
-            try
-            {
-                await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
-            }
-            catch (InvalidOperationException)
-            {
-            }
-        }
-
         private static async Task<BoundedOutput> ReadBoundedOutputAsync(StreamReader reader)
         {
             var output = new StringBuilder();
@@ -985,17 +1093,6 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         {
             char[] buffer = new char[8192];
             while (await reader.ReadAsync(buffer.AsMemory(), CancellationToken.None).ConfigureAwait(false) > 0)
-            {
-            }
-        }
-
-        private static async Task ObserveOutputAsync(params Task[] tasks)
-        {
-            try
-            {
-                await Task.WhenAll(tasks).ConfigureAwait(false);
-            }
-            catch (IOException)
             {
             }
         }

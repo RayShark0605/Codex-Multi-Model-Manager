@@ -50,11 +50,14 @@ public sealed partial class CodexRuntimeProbe : ICodexRuntimeProbe
             }
         }
 
-        string[] processes = DetectProcesses();
-        string? executable = CodexExecutableLocator.Find();
-        var appServer = new CodexAppServerClient(home, executable);
+        List<ProcessSnapshot> processSnapshot = CaptureProcesses();
+        string[] processes = DetectProcesses(processSnapshot);
+        CodexLaunchCommand? launchCommand = CodexExecutableLocator.FindInvocation(
+            processSnapshot.Where(IsCodexProcess).Select(process => process.Path));
+        string? executable = launchCommand?.FileName;
+        var appServer = new CodexAppServerClient(home, launchCommand);
         string? cliVersion = await appServer.GetVersionAsync(cancellationToken).ConfigureAwait(false);
-        string? desktopVersion = DetectDesktopVersion(executable, processes);
+        string? desktopVersion = DetectDesktopVersion(executable, processSnapshot);
 
         return new CodexEnvironmentInfo(
             home,
@@ -94,9 +97,9 @@ public sealed partial class CodexRuntimeProbe : ICodexRuntimeProbe
         return value;
     }
 
-    private static string[] DetectProcesses()
+    private static List<ProcessSnapshot> CaptureProcesses()
     {
-        List<string> matches = [];
+        List<ProcessSnapshot> snapshots = [];
         foreach (Process process in Process.GetProcesses())
         {
             using (process)
@@ -105,52 +108,62 @@ public sealed partial class CodexRuntimeProbe : ICodexRuntimeProbe
                 try
                 {
                     string name = process.ProcessName;
-                    if (name.StartsWith("CodexModelManager", StringComparison.OrdinalIgnoreCase)) continue;
-                    string description = process.MainModule?.FileVersionInfo.FileDescription ?? string.Empty;
-                    string product = process.MainModule?.FileVersionInfo.ProductName ?? string.Empty;
-                    string? path = process.MainModule?.FileName;
-                    string evidence = string.Join(' ', name, description, product, path);
-                    if (name.Contains("codex", StringComparison.OrdinalIgnoreCase) ||
-                        name.Contains("chatgpt", StringComparison.OrdinalIgnoreCase) ||
-                        evidence.Contains("OpenAI Codex", StringComparison.OrdinalIgnoreCase) ||
-                        evidence.Contains("ChatGPT", StringComparison.OrdinalIgnoreCase))
-                    {
-                        matches.Add($"{name} (PID {process.Id})");
-                    }
+                    ProcessModule? module = process.MainModule;
+                    FileVersionInfo? version = module?.FileVersionInfo;
+                    snapshots.Add(new ProcessSnapshot(
+                        process.Id,
+                        name,
+                        module?.FileName,
+                        version?.FileDescription,
+                        version?.ProductName));
                 }
                 catch (Exception exception) when (exception is System.ComponentModel.Win32Exception or InvalidOperationException or NotSupportedException)
                 {
-                    string name = process.ProcessName;
-                    if (name.Contains("codex", StringComparison.OrdinalIgnoreCase) || name.Contains("chatgpt", StringComparison.OrdinalIgnoreCase))
+                    try
                     {
-                        matches.Add($"{name} (PID {process.Id})");
+                        snapshots.Add(new ProcessSnapshot(process.Id, process.ProcessName, null, null, null));
+                    }
+                    catch (InvalidOperationException)
+                    {
                     }
                 }
             }
         }
 
-        return matches.Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.OrdinalIgnoreCase).ToArray();
+        return snapshots;
     }
 
-    private static string? DetectDesktopVersion(string? executable, IReadOnlyList<string> processes)
+    private static string[] DetectProcesses(IEnumerable<ProcessSnapshot> snapshots) => snapshots
+        .Where(snapshot => !snapshot.Name.StartsWith("CodexModelManager", StringComparison.OrdinalIgnoreCase))
+        .Where(snapshot => IsCodexProcess(snapshot) || IsChatGptProcess(snapshot))
+        .Select(snapshot => $"{snapshot.Name} (PID {snapshot.Id})")
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .Order(StringComparer.OrdinalIgnoreCase)
+        .ToArray();
+
+    private static bool IsCodexProcess(ProcessSnapshot snapshot)
     {
-        string combined = executable + " " + string.Join(' ', processes);
+        string evidence = string.Join(' ', snapshot.Name, snapshot.Description, snapshot.ProductName, snapshot.Path);
+        return snapshot.Name.Contains("codex", StringComparison.OrdinalIgnoreCase) ||
+            evidence.Contains("OpenAI Codex", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsChatGptProcess(ProcessSnapshot snapshot)
+    {
+        string evidence = string.Join(' ', snapshot.Name, snapshot.Description, snapshot.ProductName, snapshot.Path);
+        return snapshot.Name.Contains("chatgpt", StringComparison.OrdinalIgnoreCase) ||
+            evidence.Contains("ChatGPT", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? DetectDesktopVersion(string? executable, IEnumerable<ProcessSnapshot> processes)
+    {
+        string combined = executable + " " + string.Join(' ', processes.Select(process => process.Path));
         Match match = DesktopVersionRegex().Match(combined);
         if (match.Success) return match.Groups["version"].Value;
-        foreach (Process process in Process.GetProcesses())
+        foreach (ProcessSnapshot process in processes)
         {
-            using (process)
-            {
-                try
-                {
-                    string path = process.MainModule?.FileName ?? string.Empty;
-                    match = DesktopVersionRegex().Match(path);
-                    if (match.Success) return match.Groups["version"].Value;
-                }
-                catch (Exception exception) when (exception is System.ComponentModel.Win32Exception or InvalidOperationException or NotSupportedException)
-                {
-                }
-            }
+            match = DesktopVersionRegex().Match(process.Path ?? string.Empty);
+            if (match.Success) return match.Groups["version"].Value;
         }
 
         return null;
@@ -160,4 +173,11 @@ public sealed partial class CodexRuntimeProbe : ICodexRuntimeProbe
 
     [GeneratedRegex("OpenAI\\.Codex_(?<version>[0-9]+(?:\\.[0-9]+){2,3})_", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex DesktopVersionRegex();
+
+    private sealed record ProcessSnapshot(
+        int Id,
+        string Name,
+        string? Path,
+        string? Description,
+        string? ProductName);
 }

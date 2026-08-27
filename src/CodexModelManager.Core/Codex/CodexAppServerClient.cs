@@ -1,34 +1,47 @@
 using System.Diagnostics;
+using System.Text;
 using System.Text.Json;
+using CodexModelManager.Core.Infrastructure;
 using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Core.Codex;
 
 public sealed class CodexAppServerClient
 {
-    private readonly string? executablePath;
+    private readonly CodexLaunchCommand? launchCommand;
     private readonly string codexHome;
 
     public CodexAppServerClient(string codexHome, string? executablePath = null)
     {
         this.codexHome = codexHome;
-        this.executablePath = executablePath ?? CodexExecutableLocator.Find();
+        launchCommand = string.IsNullOrWhiteSpace(executablePath)
+            ? CodexExecutableLocator.FindInvocation()
+            : new CodexLaunchCommand(Path.GetFullPath(executablePath), [], "explicit executable");
     }
 
-    public string? ExecutablePath => executablePath;
+    internal CodexAppServerClient(string codexHome, CodexLaunchCommand? launchCommand)
+    {
+        this.codexHome = codexHome;
+        this.launchCommand = launchCommand;
+    }
+
+    public string? ExecutablePath => launchCommand?.FileName;
 
     public ProviderCapabilitySnapshot? LastCapabilities { get; private set; }
 
     public async Task<IReadOnlyList<ModelProfile>> ListModelsAsync(CancellationToken cancellationToken = default)
     {
         LastCapabilities = null;
-        if (string.IsNullOrWhiteSpace(executablePath)) return await ReadCacheAsync(cancellationToken).ConfigureAwait(false);
+        if (launchCommand is null) return await ReadCacheAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             IReadOnlyList<ModelProfile> live = await ListLiveAsync(cancellationToken).ConfigureAwait(false);
             if (live.Count > 0) return live;
         }
-        catch (Exception exception) when (exception is IOException or JsonException or InvalidOperationException or System.ComponentModel.Win32Exception or OperationCanceledException)
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception) when (exception is IOException or JsonException or InvalidOperationException or System.ComponentModel.Win32Exception)
         {
         }
 
@@ -37,24 +50,36 @@ public sealed class CodexAppServerClient
 
     public async Task<string?> GetVersionAsync(CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrWhiteSpace(executablePath)) return null;
+        if (launchCommand is null) return null;
         try
         {
-            var start = new ProcessStartInfo(executablePath, "--version")
-            {
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true,
-            };
+            ProcessStartInfo start = launchCommand.CreateStartInfo(["--version"]);
+            start.RedirectStandardOutput = true;
+            start.RedirectStandardError = true;
+            start.StandardOutputEncoding = Encoding.UTF8;
+            start.StandardErrorEncoding = Encoding.UTF8;
             using Process process = Process.Start(start) ?? throw new InvalidOperationException("无法启动 Codex CLI。");
+            Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync(CancellationToken.None);
+            Task<string> stderrTask = process.StandardError.ReadToEndAsync(CancellationToken.None);
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeout.CancelAfter(TimeSpan.FromSeconds(5));
-            string output = await process.StandardOutput.ReadToEndAsync(timeout.Token).ConfigureAwait(false);
-            await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
-            return output.Trim();
+            try
+            {
+                await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
+                string output = await stdoutTask.ConfigureAwait(false);
+                await stderrTask.ConfigureAwait(false);
+                return output.Trim();
+            }
+            finally
+            {
+                await BoundedProcessCleanup.TerminateAndDrainAsync(process, [stdoutTask, stderrTask]).ConfigureAwait(false);
+            }
         }
-        catch (Exception exception) when (exception is IOException or System.ComponentModel.Win32Exception or InvalidOperationException or OperationCanceledException)
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return null;
+        }
+        catch (Exception exception) when (exception is IOException or System.ComponentModel.Win32Exception or InvalidOperationException)
         {
             return null;
         }
@@ -62,15 +87,14 @@ public sealed class CodexAppServerClient
 
     private async Task<IReadOnlyList<ModelProfile>> ListLiveAsync(CancellationToken cancellationToken)
     {
-        var start = new ProcessStartInfo(executablePath!, "app-server")
-        {
-            UseShellExecute = false,
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true,
-            WorkingDirectory = Environment.CurrentDirectory,
-        };
+        ProcessStartInfo start = launchCommand!.CreateStartInfo(["app-server"]);
+        start.RedirectStandardInput = true;
+        start.RedirectStandardOutput = true;
+        start.RedirectStandardError = true;
+        start.StandardInputEncoding = Encoding.UTF8;
+        start.StandardOutputEncoding = Encoding.UTF8;
+        start.StandardErrorEncoding = Encoding.UTF8;
+        start.WorkingDirectory = Environment.CurrentDirectory;
         start.Environment["CODEX_HOME"] = codexHome;
         using Process process = Process.Start(start) ?? throw new InvalidOperationException("无法启动 Codex app-server。");
         Task<string> stderrTask = process.StandardError.ReadToEndAsync(CancellationToken.None);
@@ -109,13 +133,7 @@ public sealed class CodexAppServerClient
         }
         finally
         {
-            if (!process.HasExited)
-            {
-                process.Kill(true);
-                await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
-            }
-
-            await stderrTask.ConfigureAwait(false);
+            await BoundedProcessCleanup.TerminateAndDrainAsync(process, [stderrTask]).ConfigureAwait(false);
         }
     }
 
@@ -132,25 +150,50 @@ public sealed class CodexAppServerClient
             string? line = await process.StandardOutput.ReadLineAsync(cancellationToken).ConfigureAwait(false);
             if (line is null) throw new IOException("Codex app-server 在返回结果前退出。");
             using JsonDocument document = JsonDocument.Parse(line);
-            if (document.RootElement.TryGetProperty("id", out JsonElement responseId) && responseId.TryGetInt32(out int actual) && actual == id)
+            JsonElement root = document.RootElement;
+            if (root.ValueKind == JsonValueKind.Object &&
+                root.TryGetProperty("id", out JsonElement responseId) &&
+                MatchesResponseId(responseId, id))
             {
-                if (document.RootElement.TryGetProperty("error", out JsonElement error)) throw new InvalidOperationException("Codex app-server error: " + error.GetRawText());
-                return document.RootElement.GetProperty("result").Clone();
+                if (root.TryGetProperty("error", out _))
+                {
+                    throw new InvalidOperationException("Codex app-server 返回协议错误。");
+                }
+
+                if (!root.TryGetProperty("result", out JsonElement result))
+                {
+                    throw new InvalidDataException("Codex app-server 响应缺少 result。");
+                }
+
+                return result.Clone();
             }
         }
     }
 
-    private static List<ModelProfile> ParseAppServerModels(JsonElement result)
+    internal static bool MatchesResponseId(JsonElement responseId, int expected)
+    {
+        if (responseId.ValueKind == JsonValueKind.Number)
+        {
+            return responseId.TryGetInt32(out int actual) && actual == expected;
+        }
+
+        return responseId.ValueKind == JsonValueKind.String &&
+            int.TryParse(responseId.GetString(), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int parsed) &&
+            parsed == expected;
+    }
+
+    internal static List<ModelProfile> ParseAppServerModels(JsonElement result)
     {
         JsonElement array;
-        if (result.TryGetProperty("data", out JsonElement data) && data.ValueKind == JsonValueKind.Array) array = data;
-        else if (result.TryGetProperty("models", out JsonElement models) && models.ValueKind == JsonValueKind.Array) array = models;
+        if (result.ValueKind == JsonValueKind.Object && result.TryGetProperty("data", out JsonElement data) && data.ValueKind == JsonValueKind.Array) array = data;
+        else if (result.ValueKind == JsonValueKind.Object && result.TryGetProperty("models", out JsonElement models) && models.ValueKind == JsonValueKind.Array) array = models;
         else if (result.ValueKind == JsonValueKind.Array) array = result;
         else return [];
 
         List<ModelProfile> profiles = [];
         foreach (JsonElement model in array.EnumerateArray())
         {
+            if (model.ValueKind != JsonValueKind.Object) continue;
             string? id = GetString(model, "id") ?? GetString(model, "model") ?? GetString(model, "slug");
             if (string.IsNullOrWhiteSpace(id)) continue;
             List<string> reasoning = ReadReasoningOptions(model);
@@ -185,10 +228,11 @@ public sealed class CodexAppServerClient
             {
                 using JsonDocument document = JsonDocument.Parse(await File.ReadAllBytesAsync(path, cancellationToken).ConfigureAwait(false));
                 JsonElement root = document.RootElement;
-                if (!root.TryGetProperty("models", out JsonElement models) || models.ValueKind != JsonValueKind.Array) continue;
+                if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty("models", out JsonElement models) || models.ValueKind != JsonValueKind.Array) continue;
                 List<ModelProfile> result = [];
                 foreach (JsonElement model in models.EnumerateArray())
                 {
+                    if (model.ValueKind != JsonValueKind.Object) continue;
                     string? id = GetString(model, "slug");
                     if (string.IsNullOrWhiteSpace(id) || !id.StartsWith("gpt-", StringComparison.OrdinalIgnoreCase)) continue;
                     List<string> reasoning = ReadReasoningOptions(model);
@@ -210,7 +254,7 @@ public sealed class CodexAppServerClient
         string[] names = ["supportedReasoningEfforts", "supported_reasoning_levels"];
         foreach (string name in names)
         {
-            if (!model.TryGetProperty(name, out JsonElement levels) || levels.ValueKind != JsonValueKind.Array) continue;
+            if (model.ValueKind != JsonValueKind.Object || !model.TryGetProperty(name, out JsonElement levels) || levels.ValueKind != JsonValueKind.Array) continue;
             return levels.EnumerateArray().Select(level =>
             {
                 if (level.ValueKind == JsonValueKind.String) return level.GetString();
@@ -227,10 +271,16 @@ public sealed class CodexAppServerClient
         GetBool(result, "webSearch"),
         "Codex app-server modelProvider/capabilities/read");
 
-    private static string? GetString(JsonElement element, string name) => element.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
-    private static int? GetInt(JsonElement element, string name) => element.TryGetProperty(name, out JsonElement value) && value.TryGetInt32(out int number) ? number : null;
-    private static bool? GetBool(JsonElement element, string name) => element.TryGetProperty(name, out JsonElement value) && value.ValueKind is JsonValueKind.True or JsonValueKind.False ? value.GetBoolean() : null;
+    private static string? GetString(JsonElement element, string name) => element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+    private static int? GetInt(JsonElement element, string name) =>
+        element.ValueKind == JsonValueKind.Object &&
+        element.TryGetProperty(name, out JsonElement value) &&
+        value.ValueKind == JsonValueKind.Number &&
+        value.TryGetInt32(out int number)
+            ? number
+            : null;
+    private static bool? GetBool(JsonElement element, string name) => element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out JsonElement value) && value.ValueKind is JsonValueKind.True or JsonValueKind.False ? value.GetBoolean() : null;
     private static bool HasArrayValue(JsonElement element, string name, string expected) =>
-        element.TryGetProperty(name, out JsonElement values) && values.ValueKind == JsonValueKind.Array &&
+        element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out JsonElement values) && values.ValueKind == JsonValueKind.Array &&
         values.EnumerateArray().Any(value => value.ValueKind == JsonValueKind.String && value.GetString() == expected);
 }

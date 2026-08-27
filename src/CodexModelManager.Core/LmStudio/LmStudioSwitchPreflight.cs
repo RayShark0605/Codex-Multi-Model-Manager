@@ -35,7 +35,7 @@ public sealed class LmStudioSwitchPreflight(
             // avoids sending a Responses request that could cause a backend to
             // auto-load an otherwise unloaded model.
             var client = new LmStudioClient(request.LmStudioEndpoint, effectiveTokenProvider, httpClient);
-            IReadOnlyList<ModelProfile> models = await client.DiscoverModelsAsync(cancellationToken).ConfigureAwait(false);
+            IReadOnlyList<ModelProfile> models = await client.DiscoverNativeModelsAsync(cancellationToken).ConfigureAwait(false);
             ModelProfile? loaded = models.FirstOrDefault(model =>
                 model.Id.Equals(request.TargetModel, StringComparison.Ordinal) &&
                 model.IsLoaded == true);

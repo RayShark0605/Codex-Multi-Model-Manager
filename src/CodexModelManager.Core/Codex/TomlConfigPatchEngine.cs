@@ -410,7 +410,13 @@ public sealed class TomlConfigPatchEngine : IConfigPatchEngine
 
             string left = line.Content[..equals];
             string keyText = left.Trim();
-            if (keyText.Length == 0 || keyText.Any(character => !(char.IsLetterOrDigit(character) || character is '_' or '-')))
+            if (keyText.Length == 0)
+            {
+                return false;
+            }
+
+            IReadOnlyList<string> keySegments = TomlDottedKey.ParseSegments(keyText);
+            if (keySegments.Count != 1 || string.IsNullOrEmpty(keySegments[0]))
             {
                 return false;
             }
@@ -436,7 +442,7 @@ public sealed class TomlConfigPatchEngine : IConfigPatchEngine
             string inlineComment = line.Content[valueEnd..];
             string rawValue = line.Content[valueStart..valueEnd];
             entry = new RootEntry(
-                keyText,
+                keySegments[0],
                 keyText,
                 rawValue,
                 indent,

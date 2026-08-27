@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
     <NoWarn>$(NoWarn);xUnit1051</NoWarn>
@@ -15,10 +16,7 @@
     <Using Include="Xunit" />
   </ItemGroup>
   <ItemGroup>
+    <ProjectReference Include="..\..\src\CodexModelManager.App\CodexModelManager.App.csproj" />
     <ProjectReference Include="..\..\src\CodexModelManager.Core\CodexModelManager.Core.csproj" />
-    <ProjectReference Include="..\..\src\CodexModelManager.TestMcpServer\CodexModelManager.TestMcpServer.csproj" ReferenceOutputAssembly="false" />
-  </ItemGroup>
-  <ItemGroup>
-    <None Include="Fixtures\unsloth-qwen3.8-prefix-template.jinja" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

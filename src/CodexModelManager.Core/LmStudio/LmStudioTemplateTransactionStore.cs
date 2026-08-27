@@ -29,6 +29,9 @@ public sealed class LmStudioTemplateTransactionStore
 
     public string GetPath(Guid transactionId) => Path.Combine(directory, transactionId.ToString("N") + ".json");
 
+    public string GetEncryptedDefaultsBackupPath(Guid transactionId) =>
+        Path.Combine(directory, "encrypted-backups", transactionId.ToString("N") + ".lmstudio-defaults.dpapi");
+
     public string LifecycleLockPath => Path.Combine(directory, ".lmstudio-lifecycle.lock");
 
     public async Task WriteAsync(
@@ -84,7 +87,7 @@ public sealed class LmStudioTemplateTransactionStore
         await using FileStream stream = new(path, FileMode.Open, FileAccess.Read, FileShare.Read, 16 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
         LmStudioTemplateTransactionRecord? record = await JsonSerializer.DeserializeAsync<LmStudioTemplateTransactionRecord>(stream, JsonOptions, cancellationToken).ConfigureAwait(false);
         if (record is null ||
-            record.SchemaVersion is not (1 or 2 or 3) ||
+            record.SchemaVersion is not (1 or 2 or 3 or 4) ||
             record.TransactionId != transactionId ||
             !Enum.IsDefined(record.State) ||
             record.LastStableState is not null && !Enum.IsDefined(record.LastStableState.Value) ||
@@ -96,6 +99,7 @@ public sealed class LmStudioTemplateTransactionStore
             string.IsNullOrWhiteSpace(record.OriginalInstance.SourceModelKey) ||
             string.IsNullOrWhiteSpace(record.OriginalInstance.InstanceId) ||
             record.OriginalInstance.LoadConfiguration?.ContextLength is not > 0 ||
+            string.IsNullOrWhiteSpace(record.RuleVersion) ||
             record.FailureCode is not (CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder or
                 CompatibilityFailureCodes.LmStudioChatTemplateDeveloperRole or
                 CompatibilityFailureCodes.LmStudioChatTemplateContinuationInstructionOrder) ||
@@ -109,6 +113,7 @@ public sealed class LmStudioTemplateTransactionStore
             (record.SchemaVersion >= 2 && string.IsNullOrWhiteSpace(record.LoadModelKey)) ||
             (record.SchemaVersion >= 2 && !string.Equals(record.LoadModelKey, record.OriginalInstance.SourceModelKey, StringComparison.OrdinalIgnoreCase)) ||
             (record.SchemaVersion >= 3 && !ValidV3Provenance(record)) ||
+            (record.SchemaVersion >= 4 && !ValidV4Persistence(record)) ||
             (record.LastApiFailure is not null &&
              (record.LastApiFailure.HttpStatus is < 100 or > 599 ||
               string.IsNullOrWhiteSpace(record.LastApiFailure.Message) ||
@@ -136,13 +141,14 @@ public sealed class LmStudioTemplateTransactionStore
             return [];
         }
 
+        CleanupStaleTemporaryFiles();
         List<LmStudioTemplateTransactionRecord> result = [];
         foreach (string path in Directory.EnumerateFiles(directory, "*.json", SearchOption.TopDirectoryOnly).OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (!Guid.TryParseExact(Path.GetFileNameWithoutExtension(path), "N", out Guid id))
             {
-                throw new InvalidDataException($"LM Studio 事务目录包含无法识别的 JSON 记录: {Path.GetFileName(path)}");
+                continue;
             }
 
             LmStudioTemplateTransactionRecord? record = await ReadAsync(id, cancellationToken).ConfigureAwait(false);
@@ -154,6 +160,36 @@ public sealed class LmStudioTemplateTransactionStore
 
         return result.OrderBy(record => record.CreatedAt).ToArray();
     }
+
+    private void CleanupStaleTemporaryFiles()
+    {
+        DateTime cutoff = DateTime.UtcNow.Subtract(TimeSpan.FromHours(24));
+        foreach (string path in Directory.EnumerateFiles(directory, "*.tmp-*", SearchOption.TopDirectoryOnly))
+        {
+            string name = Path.GetFileName(path);
+            if (!IsTransactionTemporaryFileName(name))
+            {
+                continue;
+            }
+
+            try
+            {
+                if (File.GetLastWriteTimeUtc(path) < cutoff)
+                {
+                    File.Delete(path);
+                }
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+            }
+        }
+    }
+
+    internal static bool IsTransactionTemporaryFileName(string fileName) =>
+        fileName.Length == 74 &&
+        fileName.AsSpan(32, 10).SequenceEqual(".json.tmp-") &&
+        Guid.TryParseExact(fileName.AsSpan(0, 32), "N", out _) &&
+        Guid.TryParseExact(fileName.AsSpan(42, 32), "N", out _);
 
     public async Task<IReadOnlyList<LmStudioTemplateTransactionRecord>> ListCompletedAsync(
         CancellationToken cancellationToken = default) =>
@@ -200,4 +236,114 @@ public sealed class LmStudioTemplateTransactionStore
     private static bool HasInvalidInstanceIds(IReadOnlyList<string>? values) =>
         values is not null &&
         (values.Any(string.IsNullOrWhiteSpace) || values.Distinct(StringComparer.Ordinal).Count() != values.Count);
+
+    private bool ValidV4Persistence(LmStudioTemplateTransactionRecord record)
+    {
+        bool supportedVersion = Version.TryParse(record.LmStudioVersion, out Version? version) &&
+            version.Major == 0 && version.Minor == 4 && version.Build == 21;
+        if (string.IsNullOrWhiteSpace(record.ConcreteModelIdentifier) ||
+            Path.IsPathFullyQualified(record.ConcreteModelIdentifier) ||
+            !record.ConcreteModelIdentifier.EndsWith(".gguf", StringComparison.OrdinalIgnoreCase) ||
+            string.IsNullOrWhiteSpace(record.PerModelDefaultsPath) ||
+            !Path.IsPathFullyQualified(record.PerModelDefaultsPath) ||
+            record.OriginalDefaultsFingerprint is null ||
+            !record.OriginalDefaultsFingerprint.Exists ||
+            record.OriginalDefaultsFingerprint.Length <= 0 ||
+            record.OriginalDefaultsFingerprint.Sha256?.Length != 64 ||
+            record.OriginalPersistentTemplateState is null ||
+            !string.Equals(record.TargetPersistentRuleVersion, PromptTemplateRepairService.CurrentRuleVersion, StringComparison.Ordinal) ||
+            record.TargetPersistentTemplateSha256?.Length != 64 ||
+            !record.TargetPersistentTemplateSha256.Equals(record.PatchedTemplateSha256, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(record.TargetPersistentRuleVersion, record.RuleVersion, StringComparison.Ordinal) ||
+            !string.Equals(record.TargetPersistentRuleVersion, record.TargetRuntimeRuleVersion, StringComparison.Ordinal) ||
+             record.CandidateDefaultsSha256?.Length != 64 ||
+             string.IsNullOrWhiteSpace(record.LmStudioVersion) ||
+             !supportedVersion ||
+             !Enum.IsDefined(record.PersistenceStage) ||
+             !ValidV4StageState(record))
+        {
+            return false;
+        }
+
+        bool originalStateValid = record.OriginalPersistentTemplateState switch
+        {
+            LmStudioPersistentTemplateFieldState.Missing => record.OriginalPersistentRuleVersion is null && record.OriginalPersistentTemplateSha256 is null,
+            LmStudioPersistentTemplateFieldState.ManagerV2 =>
+                string.Equals(record.OriginalPersistentRuleVersion, PromptTemplateRepairService.LegacyLeadingRuleVersion, StringComparison.Ordinal) &&
+                record.OriginalPersistentTemplateSha256?.Length == 64,
+            LmStudioPersistentTemplateFieldState.ManagerV3 =>
+                string.Equals(record.OriginalPersistentRuleVersion, PromptTemplateRepairService.CurrentRuleVersion, StringComparison.Ordinal) &&
+                record.OriginalPersistentTemplateSha256?.Equals(record.TargetPersistentTemplateSha256, StringComparison.OrdinalIgnoreCase) == true,
+            _ => false,
+        };
+        if (!originalStateValid)
+        {
+            return false;
+        }
+
+        bool backupRequired = record.PersistenceStage >= LmStudioPersistenceStage.BackupVerified;
+        if (backupRequired &&
+            (string.IsNullOrWhiteSpace(record.EncryptedDefaultsBackupPath) ||
+             !Path.IsPathFullyQualified(record.EncryptedDefaultsBackupPath) ||
+             record.DefaultsBackupPlaintextSha256?.Length != 64 ||
+             !record.DefaultsBackupPlaintextSha256.Equals(record.OriginalDefaultsFingerprint.Sha256, StringComparison.OrdinalIgnoreCase) ||
+             !BackupPathMatches(record)))
+        {
+            return false;
+        }
+
+        return record.State != LmStudioTemplateTransactionState.Completed ||
+            record.PersistenceStage == LmStudioPersistenceStage.PersistentDefaultVerified;
+    }
+
+    private static bool ValidV4StageState(LmStudioTemplateTransactionRecord record)
+    {
+        LmStudioPersistenceStage stage = record.PersistenceStage;
+        if (stage == LmStudioPersistenceStage.None ||
+            stage == LmStudioPersistenceStage.RecoveryBlocked && record.State != LmStudioTemplateTransactionState.RecoveryBlocked)
+        {
+            return false;
+        }
+
+        return record.State switch
+        {
+            LmStudioTemplateTransactionState.Prepared => stage is
+                LmStudioPersistenceStage.Prepared or
+                LmStudioPersistenceStage.BackupVerified or
+                LmStudioPersistenceStage.DefaultsVerified or
+                LmStudioPersistenceStage.Restored,
+            LmStudioTemplateTransactionState.OriginalUnloaded => stage is
+                LmStudioPersistenceStage.DefaultsVerified or
+                LmStudioPersistenceStage.Restored,
+            LmStudioTemplateTransactionState.PatchedLoaded => stage is
+                LmStudioPersistenceStage.DefaultsVerified or
+                LmStudioPersistenceStage.PersistentDefaultVerified or
+                LmStudioPersistenceStage.Restored,
+            LmStudioTemplateTransactionState.PatchedAndVerified => stage is
+                LmStudioPersistenceStage.PersistentDefaultVerified or
+                LmStudioPersistenceStage.Restored,
+            LmStudioTemplateTransactionState.RolledBack => stage is
+                LmStudioPersistenceStage.Prepared or
+                LmStudioPersistenceStage.Restored,
+            LmStudioTemplateTransactionState.RecoveryBlocked => stage is
+                LmStudioPersistenceStage.RecoveryBlocked or
+                LmStudioPersistenceStage.Restored,
+            LmStudioTemplateTransactionState.Completed => stage == LmStudioPersistenceStage.PersistentDefaultVerified,
+            LmStudioTemplateTransactionState.RollbackFailed => true,
+            _ => false,
+        };
+    }
+
+    private bool BackupPathMatches(LmStudioTemplateTransactionRecord record)
+    {
+        try
+        {
+            return Path.GetFullPath(record.EncryptedDefaultsBackupPath!)
+                .Equals(GetEncryptedDefaultsBackupPath(record.TransactionId), StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
+        }
+    }
 }

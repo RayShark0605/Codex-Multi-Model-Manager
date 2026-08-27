@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
+using CodexModelManager.Core.Infrastructure;
 using CodexModelManager.Core.Models;
 using CodexModelManager.Core.Security;
 
@@ -19,8 +20,8 @@ public sealed class CodexSmokeTestService
 
     public async Task<SmokeTestResult> RunAsync(SwitchRequest request, CancellationToken cancellationToken = default)
     {
-        string? codex = CodexExecutableLocator.Find();
-        if (codex is null) throw new InvalidOperationException("未找到 Codex CLI。");
+        CodexLaunchCommand? codex = CodexExecutableLocator.FindInvocation();
+        if (codex is null) throw new InvalidOperationException("未找到可安全启动的 Codex CLI。");
         if (!File.Exists(mcpServerPath)) throw new FileNotFoundException("临时 MCP 测试服务器不存在。", mcpServerPath);
         if (request.TargetProvider == ProviderKind.OpenAI)
         {
@@ -36,14 +37,10 @@ public sealed class CodexSmokeTestService
         await File.WriteAllTextAsync(Path.Combine(home, "config.toml"), BuildConfig(request), new UTF8Encoding(false), cancellationToken).ConfigureAwait(false);
 
         string prompt = "This is a harmless compatibility test in an isolated temporary directory. Read input.txt. Use the shell tool to run PowerShell Get-Content on input.txt. Call MCP tool cmm_ping. Use apply_patch to create result.txt containing exactly CMM_SMOKE_OK and a newline. Do not access paths outside the current workspace.";
-        var start = new ProcessStartInfo(codex)
-        {
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true,
-            WorkingDirectory = workspace,
-        };
+        ProcessStartInfo start = codex.CreateStartInfo([]);
+        start.RedirectStandardOutput = true;
+        start.RedirectStandardError = true;
+        start.WorkingDirectory = workspace;
         start.ArgumentList.Add("-c");
         start.ArgumentList.Add("approval_policy=\"never\"");
         start.ArgumentList.Add("-c");
@@ -57,6 +54,9 @@ public sealed class CodexSmokeTestService
         start.Environment["CODEX_HOME"] = home;
 
         start.RedirectStandardInput = true;
+        start.StandardInputEncoding = Encoding.UTF8;
+        start.StandardOutputEncoding = Encoding.UTF8;
+        start.StandardErrorEncoding = Encoding.UTF8;
         using Process process = Process.Start(start) ?? throw new InvalidOperationException("无法启动 Codex CLI smoke test。");
         process.StandardInput.Close();
         Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync(CancellationToken.None);
@@ -69,16 +69,7 @@ public sealed class CodexSmokeTestService
         }
         catch (OperationCanceledException)
         {
-            try
-            {
-                if (!process.HasExited) process.Kill(entireProcessTree: true);
-                await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
-            }
-            catch (Exception exception) when (exception is InvalidOperationException or System.ComponentModel.Win32Exception)
-            {
-            }
-
-            await Task.WhenAll(stdoutTask, stderrTask).ConfigureAwait(false);
+            await BoundedProcessCleanup.TerminateAndDrainAsync(process, [stdoutTask, stderrTask]).ConfigureAwait(false);
             DateTimeOffset stoppedAt = DateTimeOffset.Now;
             string reason = cancellationToken.IsCancellationRequested ? "测试已取消。" : "测试在 5 分钟后超时，进程树已终止。";
             CompatibilityResult[] stoppedResults =

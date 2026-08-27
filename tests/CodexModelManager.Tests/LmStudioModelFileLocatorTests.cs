@@ -34,6 +34,73 @@ public sealed class LmStudioModelFileLocatorTests
     }
 
     [Fact]
+    public async Task FullPathSourceWithMissingQuantizationResolvesExactNvfp4GgufFromProcessEvidence()
+    {
+        using var temporary = new TemporaryDirectory();
+        string downloads = ConfigureDownloads(temporary.Path);
+        const string relativePath = "esatapedico/Qwen3.8-27B-NVFP4-MTP-GGUF/Qwen3.8-27B-NVFP4-MTP-HIGHEST.gguf";
+        const string nativeSource = "esatapedico/qwen3.8-27b-nvfp4-mtp-gguf/qwen3.8-27b-nvfp4-mtp-highest.gguf";
+        string gguf = CreateFile(downloads, relativePath);
+        ModelProfile model = CreateLoadedModel() with
+        {
+            Id = "qwen3.8-27b-nvfp4-mtp",
+            LoadedInstanceId = "qwen3.8-27b-nvfp4-mtp",
+            SourceModelKey = nativeSource,
+            Quantization = null,
+            LoadedContextLength = 262_144,
+        };
+        string processes = CreatePsJson(
+            relativePath,
+            modelKey: nativeSource,
+            identifier: "qwen3.8-27b-nvfp4-mtp",
+            publisher: "esatapedico",
+            quantization: null,
+            contextLength: 262_144,
+            includeQuantization: false,
+            indexedModelIdentifier: relativePath.Replace('/', '\\'));
+        var runner = new StubLmsCliCommandRunner(Success("[]"), Success(processes));
+        var locator = new LmStudioModelFileLocator(runner, () => temporary.Path);
+
+        LmStudioModelFileResolutionAttempt attempt = await locator.ResolveAsync(
+            model,
+            new Uri("http://127.0.0.1:1234"));
+
+        Assert.True(attempt.Succeeded, attempt.Diagnostic);
+        Assert.Equal(Path.GetFullPath(gguf), attempt.Resolution?.FilePath);
+        Assert.Equal(nativeSource, attempt.Resolution?.SourceModelKey);
+        Assert.Null(attempt.Resolution?.Quantization);
+        Assert.Equal("lms ps --json", attempt.Resolution?.Source);
+        Assert.Equal(relativePath, attempt.Resolution?.ConcreteModelIdentifier);
+    }
+
+    [Fact]
+    public void FullPathSourceKeepsSupportingLegacyLoadedIdModelKey()
+    {
+        using var temporary = new TemporaryDirectory();
+        string downloads = Path.Combine(temporary.Path, "downloads");
+        Directory.CreateDirectory(downloads);
+        const string relativePath = "esatapedico/model/model.gguf";
+        CreateFile(downloads, relativePath);
+        string settings = JsonSerializer.Serialize(new { downloadsFolder = downloads });
+        ModelProfile model = CreateLoadedModel() with
+        {
+            Id = "loaded-instance",
+            LoadedInstanceId = "loaded-instance",
+            SourceModelKey = relativePath,
+            Quantization = null,
+        };
+
+        LmStudioModelFileResolutionAttempt attempt = LmStudioModelFileLocator.ResolvePsFromJson(
+            model,
+            CreatePsJson(relativePath, modelKey: "loaded-instance", identifier: "loaded-instance", publisher: "esatapedico", quantization: null, includeQuantization: false),
+            settings,
+            temporary.Path);
+
+        Assert.True(attempt.Succeeded, attempt.Diagnostic);
+        Assert.Equal(relativePath, attempt.Resolution?.ConcreteModelIdentifier);
+    }
+
+    [Fact]
     public void ProcessEvidenceSupportsPublisherQualifiedNativeSourceKey()
     {
         using var temporary = new TemporaryDirectory();
@@ -66,6 +133,7 @@ public sealed class LmStudioModelFileLocatorTests
     [InlineData("architecture")]
     [InlineData("quantization")]
     [InlineData("context")]
+    [InlineData("format")]
     public void ProcessEvidenceRejectsEveryNativeIdentityOrMetadataMismatch(string mismatch)
     {
         using var temporary = new TemporaryDirectory();
@@ -88,7 +156,8 @@ public sealed class LmStudioModelFileLocatorTests
             type: mismatch == "type" ? "embedding" : "llm",
             architecture: mismatch == "architecture" ? "wrong" : "qwen35",
             quantization: mismatch == "quantization" ? "Q4_K_M" : "Q6_K_XL",
-            contextLength: mismatch == "context" ? 131_072 : 161_024);
+            contextLength: mismatch == "context" ? 131_072 : 161_024,
+            format: mismatch == "format" ? "mlx" : "gguf");
         if (mismatch == "source")
         {
             model = model with { SourceModelKey = "other/qwen3.8-27b@q6_k_xl" };
@@ -102,6 +171,178 @@ public sealed class LmStudioModelFileLocatorTests
 
         Assert.Equal(LmStudioModelFileResolutionStatus.IdentityMismatch, attempt.Status);
         Assert.Null(attempt.Resolution);
+    }
+
+    [Fact]
+    public void ProcessEvidenceRequiresQuantizationToBeMissingOrPresentOnBothSurfaces()
+    {
+        using var temporary = new TemporaryDirectory();
+        string downloads = Path.Combine(temporary.Path, "downloads");
+        Directory.CreateDirectory(downloads);
+        CreateFile(downloads, "unsloth/model.gguf");
+        string settings = JsonSerializer.Serialize(new { downloadsFolder = downloads });
+
+        LmStudioModelFileResolutionAttempt nativeOnly = LmStudioModelFileLocator.ResolvePsFromJson(
+            CreateLoadedModel(),
+            CreatePsJson("unsloth/model.gguf", quantization: null, includeQuantization: false),
+            settings,
+            temporary.Path);
+        LmStudioModelFileResolutionAttempt cliOnly = LmStudioModelFileLocator.ResolvePsFromJson(
+            CreateLoadedModel() with { Quantization = null },
+            CreatePsJson("unsloth/model.gguf"),
+            settings,
+            temporary.Path);
+
+        Assert.Equal(LmStudioModelFileResolutionStatus.IdentityMismatch, nativeOnly.Status);
+        Assert.Contains("quantization", nativeOnly.Diagnostic, StringComparison.Ordinal);
+        Assert.Equal(LmStudioModelFileResolutionStatus.IdentityMismatch, cliOnly.Status);
+        Assert.Contains("quantization", cliOnly.Diagnostic, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(null, null, true)]
+    [InlineData("Q6_K_XL", null, false)]
+    [InlineData(null, "Q6_K_XL", false)]
+    [InlineData("Q6_K_XL", "Q6_K_XL", true)]
+    [InlineData("Q6_K_XL", "Q4_K_M", false)]
+    public void VariantEvidenceUsesTheSameNullableExactQuantizationRule(
+        string? nativeQuantization,
+        string? cliQuantization,
+        bool shouldResolve)
+    {
+        using var temporary = new TemporaryDirectory();
+        string downloads = Path.Combine(temporary.Path, "downloads");
+        Directory.CreateDirectory(downloads);
+        const string relativePath = "unsloth/model.gguf";
+        CreateFile(downloads, relativePath);
+        string settings = JsonSerializer.Serialize(new { downloadsFolder = downloads });
+        var candidate = new Dictionary<string, object?>
+        {
+            ["modelKey"] = "qwen3.8-27b@q6_k_xl",
+            ["path"] = relativePath,
+            ["architecture"] = "qwen35",
+            ["quantization"] = cliQuantization is null ? null : new { name = cliQuantization },
+        };
+        string variants = JsonSerializer.Serialize(new[] { candidate });
+
+        LmStudioModelFileResolution? resolution = LmStudioModelFileLocator.ResolveFromJson(
+            CreateLoadedModel() with { Quantization = nativeQuantization },
+            variants,
+            settings,
+            temporary.Path);
+
+        if (shouldResolve)
+        {
+            Assert.NotNull(resolution);
+            Assert.Equal(Path.GetFullPath(Path.Combine(downloads, relativePath)), resolution.FilePath);
+        }
+        else
+        {
+            Assert.Null(resolution);
+        }
+    }
+
+    [Fact]
+    public void FullPathSourceRejectsConflictingPathIdentifiers()
+    {
+        using var temporary = new TemporaryDirectory();
+        string downloads = Path.Combine(temporary.Path, "downloads");
+        Directory.CreateDirectory(downloads);
+        const string source = "esatapedico/model/model.gguf";
+        CreateFile(downloads, source);
+        string settings = JsonSerializer.Serialize(new { downloadsFolder = downloads });
+        ModelProfile model = CreateLoadedModel() with
+        {
+            SourceModelKey = source,
+            Quantization = null,
+        };
+        string processes = CreatePsJson(
+            source,
+            publisher: "esatapedico",
+            quantization: null,
+            includeQuantization: false,
+            indexedModelIdentifier: "esatapedico/other/model.gguf");
+
+        LmStudioModelFileResolutionAttempt attempt = LmStudioModelFileLocator.ResolvePsFromJson(
+            model,
+            processes,
+            settings,
+            temporary.Path);
+
+        Assert.Equal(LmStudioModelFileResolutionStatus.IdentityMismatch, attempt.Status);
+        Assert.Contains("source/path/indexedModelIdentifier", attempt.Diagnostic, StringComparison.Ordinal);
+        Assert.Null(attempt.Resolution);
+    }
+
+    [Fact]
+    public void FullPathSourceRejectsPresentNonPathIndexedIdentifier()
+    {
+        using var temporary = new TemporaryDirectory();
+        string downloads = Path.Combine(temporary.Path, "downloads");
+        Directory.CreateDirectory(downloads);
+        const string source = "esatapedico/model/model.gguf";
+        CreateFile(downloads, source);
+        string settings = JsonSerializer.Serialize(new { downloadsFolder = downloads });
+        ModelProfile model = CreateLoadedModel() with
+        {
+            SourceModelKey = source,
+            Quantization = null,
+        };
+        string processes = CreatePsJson(
+            source,
+            publisher: "esatapedico",
+            quantization: null,
+            includeQuantization: false,
+            indexedModelIdentifier: "qwen3.8-27b@loaded-instance");
+
+        LmStudioModelFileResolutionAttempt attempt = LmStudioModelFileLocator.ResolvePsFromJson(
+            model,
+            processes,
+            settings,
+            temporary.Path);
+
+        Assert.Equal(LmStudioModelFileResolutionStatus.IdentityMismatch, attempt.Status);
+        Assert.Contains("source/path/indexedModelIdentifier", attempt.Diagnostic, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(true, false, true)]
+    [InlineData(false, true, true)]
+    [InlineData(false, false, false)]
+    public void FullPathSourceRequiresAtLeastOneExactCliPathIdentifier(
+        bool includePath,
+        bool includeIndexedModelIdentifier,
+        bool expectedSuccess)
+    {
+        using var temporary = new TemporaryDirectory();
+        string downloads = Path.Combine(temporary.Path, "downloads");
+        Directory.CreateDirectory(downloads);
+        const string source = "esatapedico/model/model.gguf";
+        CreateFile(downloads, source);
+        string settings = JsonSerializer.Serialize(new { downloadsFolder = downloads });
+        ModelProfile model = CreateLoadedModel() with
+        {
+            SourceModelKey = source,
+            Quantization = null,
+        };
+        string processes = CreatePsJson(
+            source,
+            publisher: "esatapedico",
+            quantization: null,
+            includeQuantization: false,
+            includePath: includePath,
+            includeIndexedModelIdentifier: includeIndexedModelIdentifier);
+
+        LmStudioModelFileResolutionAttempt attempt = LmStudioModelFileLocator.ResolvePsFromJson(
+            model,
+            processes,
+            settings,
+            temporary.Path);
+
+        Assert.Equal(expectedSuccess, attempt.Succeeded);
+        Assert.Equal(
+            expectedSuccess ? LmStudioModelFileResolutionStatus.Success : LmStudioModelFileResolutionStatus.IdentityMismatch,
+            attempt.Status);
     }
 
     [Theory]
@@ -335,6 +576,8 @@ public sealed class LmStudioModelFileLocatorTests
             new Uri("http://127.0.0.1:1234"));
 
         Assert.Equal(LmStudioModelFileResolutionStatus.InvalidModelSnapshot, attempt.Status);
+        Assert.Contains("实际 context", attempt.Diagnostic, StringComparison.Ordinal);
+        Assert.DoesNotContain("quantization", attempt.Diagnostic, StringComparison.OrdinalIgnoreCase);
         Assert.Empty(runner.Calls);
     }
 
@@ -379,9 +622,14 @@ public sealed class LmStudioModelFileLocatorTests
         string publisher = "unsloth",
         string type = "llm",
         string architecture = "qwen35",
-        string quantization = "Q6_K_XL",
-        int contextLength = 161_024) =>
-        $"[{CreatePsObject(relativePath, modelKey, identifier, publisher, type, architecture, quantization, contextLength)}]";
+        string? quantization = "Q6_K_XL",
+        int contextLength = 161_024,
+        string format = "gguf",
+        bool includeQuantization = true,
+        string? indexedModelIdentifier = null,
+        bool includePath = true,
+        bool includeIndexedModelIdentifier = true) =>
+        $"[{CreatePsObject(relativePath, modelKey, identifier, publisher, type, architecture, quantization, contextLength, format, includeQuantization, indexedModelIdentifier, includePath, includeIndexedModelIdentifier)}]";
 
     private static string CreatePsObject(
         string relativePath,
@@ -390,21 +638,42 @@ public sealed class LmStudioModelFileLocatorTests
         string publisher = "unsloth",
         string type = "llm",
         string architecture = "qwen35",
-        string quantization = "Q6_K_XL",
-        int contextLength = 161_024) => JsonSerializer.Serialize(new
+        string? quantization = "Q6_K_XL",
+        int contextLength = 161_024,
+        string format = "gguf",
+        bool includeQuantization = true,
+        string? indexedModelIdentifier = null,
+        bool includePath = true,
+        bool includeIndexedModelIdentifier = true)
+    {
+        var value = new Dictionary<string, object?>
         {
-            type,
-            modelKey,
-            format = "gguf",
-            publisher,
-            path = relativePath,
-            indexedModelIdentifier = relativePath,
-            architecture,
-            quantization = new { name = quantization },
-            identifier,
-            maxContextLength = 262_144,
-            contextLength,
-        });
+            ["type"] = type,
+            ["modelKey"] = modelKey,
+            ["format"] = format,
+            ["publisher"] = publisher,
+            ["architecture"] = architecture,
+            ["identifier"] = identifier,
+            ["maxContextLength"] = 262_144,
+            ["contextLength"] = contextLength,
+        };
+        if (includePath)
+        {
+            value["path"] = relativePath;
+        }
+
+        if (includeIndexedModelIdentifier)
+        {
+            value["indexedModelIdentifier"] = indexedModelIdentifier ?? relativePath;
+        }
+
+        if (includeQuantization)
+        {
+            value["quantization"] = quantization is null ? null : new { name = quantization };
+        }
+
+        return JsonSerializer.Serialize(value);
+    }
 
     private static LmsCliCommandResult Success(string json) => new(LmsCliCommandStatus.Success, json);
 

@@ -10,6 +10,8 @@ public static class ReasoningEffortPolicy
         }
 
         return string.Join(",", providerOptions
+            .Where(static value => !string.IsNullOrWhiteSpace(value))
+            .Select(static value => value.Trim().ToLowerInvariant())
             .Where(ManagedConfigKeys.SupportedReasoningEfforts.Contains)
             .Distinct(StringComparer.Ordinal)
             .OrderBy(static value => value, StringComparer.Ordinal));
@@ -23,6 +25,7 @@ public static class ReasoningEffortPolicy
         }
 
         return canonical.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(static value => value.ToLowerInvariant())
             .Where(ManagedConfigKeys.SupportedReasoningEfforts.Contains)
             .ToHashSet(StringComparer.Ordinal);
     }

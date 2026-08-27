@@ -1,5 +1,8 @@
+using System.ComponentModel;
 using System.Diagnostics;
+using System.Text;
 using System.Text.RegularExpressions;
+using CodexModelManager.Core.Infrastructure;
 using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Core.LmStudio;
@@ -28,24 +31,37 @@ public sealed partial class LmStudioEndpointDetector
 
     public static int? ParsePort(string output)
     {
-        Match match = PortPattern().Match(output ?? string.Empty);
-        if (!match.Success || !int.TryParse(match.Groups[1].Value, out int port) || port is < 1 or > 65535) return null;
-        return port;
+        HashSet<int> ports = [];
+        foreach (Match match in PortPattern().Matches(output ?? string.Empty))
+        {
+            foreach (Capture capture in match.Groups["port"].Captures)
+            {
+                if (int.TryParse(capture.Value, out int port) && port is >= 1 and <= 65_535)
+                {
+                    ports.Add(port);
+                }
+            }
+        }
+
+        return ports.Count == 1 ? ports.Single() : null;
     }
 
     private static async Task<int?> QueryLmsPortAsync(string executable, CancellationToken cancellationToken)
     {
-        var start = new ProcessStartInfo(executable)
-        {
-            UseShellExecute = false,
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true,
-        };
+        ProcessStartInfo start = CreateLmsStatusStartInfo(executable);
         start.ArgumentList.Add("server");
         start.ArgumentList.Add("status");
-        using Process? process = Process.Start(start);
+        Process? started;
+        try
+        {
+            started = Process.Start(start);
+        }
+        catch (Exception exception) when (exception is Win32Exception or IOException or InvalidOperationException)
+        {
+            return null;
+        }
+
+        using Process? process = started;
         if (process is null) return null;
         process.StandardInput.Close();
         Task<string> stdout = process.StandardOutput.ReadToEndAsync(CancellationToken.None);
@@ -58,9 +74,7 @@ public sealed partial class LmStudioEndpointDetector
         }
         catch (OperationCanceledException)
         {
-            try { if (!process.HasExited) process.Kill(entireProcessTree: true); }
-            catch (Exception exception) when (exception is InvalidOperationException or System.ComponentModel.Win32Exception) { }
-            await Task.WhenAll(stdout, stderr).ConfigureAwait(false);
+            await BoundedProcessCleanup.TerminateAndDrainAsync(process, [stdout, stderr]).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             return null;
         }
@@ -68,6 +82,18 @@ public sealed partial class LmStudioEndpointDetector
         string combined = (await stdout.ConfigureAwait(false)) + "\n" + (await stderr.ConfigureAwait(false));
         return process.ExitCode == 0 ? ParsePort(combined) : null;
     }
+
+    internal static ProcessStartInfo CreateLmsStatusStartInfo(string executable) => new(executable)
+    {
+        UseShellExecute = false,
+        RedirectStandardInput = true,
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
+        CreateNoWindow = true,
+        StandardInputEncoding = Encoding.UTF8,
+        StandardOutputEncoding = Encoding.UTF8,
+        StandardErrorEncoding = Encoding.UTF8,
+    };
 
     private static string? FindLmsExecutable()
     {
@@ -91,6 +117,6 @@ public sealed partial class LmStudioEndpointDetector
         return null;
     }
 
-    [GeneratedRegex(@"(?im)\b(?:port\s+|(?:127\.0\.0\.1|localhost):)(\d{1,5})\b")]
+    [GeneratedRegex("(?im)(?:\\bport\\s*(?:(?:is|at)\\s+|[:=]\\s*|\\s+)(?<port>\\d{1,5})\\b|(?:https?://)?(?:127\\.0\\.0\\.1|localhost|\\[::1\\]):(?<port>\\d{1,5})\\b|\"port\"\\s*:\\s*(?<port>\\d{1,5})\\b)", RegexOptions.CultureInvariant)]
     private static partial Regex PortPattern();
 }

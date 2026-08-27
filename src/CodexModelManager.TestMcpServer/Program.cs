@@ -1,5 +1,12 @@
 using System.Text.Json;
 
+if (args.Contains("--emit-utf8-fixture", StringComparer.Ordinal))
+{
+    Console.OutputEncoding = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+    await Console.Out.WriteLineAsync(@"C:\用户\模型.gguf");
+    return;
+}
+
 while (await Console.In.ReadLineAsync() is { } line)
 {
     JsonDocument request;
@@ -15,7 +22,14 @@ while (await Console.In.ReadLineAsync() is { } line)
     using (request)
     {
         JsonElement root = request.RootElement;
-        if (!root.TryGetProperty("id", out JsonElement id) || !root.TryGetProperty("method", out JsonElement methodElement)) continue;
+        if (root.ValueKind != JsonValueKind.Object ||
+            !root.TryGetProperty("id", out JsonElement id) ||
+            !root.TryGetProperty("method", out JsonElement methodElement) ||
+            methodElement.ValueKind != JsonValueKind.String)
+        {
+            continue;
+        }
+
         string? method = methodElement.GetString();
         object? result = method switch
         {
@@ -50,7 +64,10 @@ while (await Console.In.ReadLineAsync() is { } line)
 
 static object HandleCall(JsonElement root)
 {
-    string? name = root.TryGetProperty("params", out JsonElement parameters) && parameters.TryGetProperty("name", out JsonElement toolName)
+    string? name = root.TryGetProperty("params", out JsonElement parameters) &&
+        parameters.ValueKind == JsonValueKind.Object &&
+        parameters.TryGetProperty("name", out JsonElement toolName) &&
+        toolName.ValueKind == JsonValueKind.String
         ? toolName.GetString()
         : null;
     return name == "cmm_ping"

@@ -41,7 +41,9 @@ public sealed class LmStudioClient : IModelProvider
 
             return new ProviderProbeResult(response.IsSuccessStatusCode, response.IsSuccessStatusCode ? "LM Studio Server 已连接。" : $"LM Studio HTTP {(int)response.StatusCode}", Endpoint: endpoint, HttpStatus: (int)response.StatusCode);
         }
-        catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException)
+        catch (Exception exception) when (
+            exception is HttpRequestException ||
+            (exception is TaskCanceledException && !cancellationToken.IsCancellationRequested))
         {
             return new ProviderProbeResult(false, $"LM Studio 未连接: {exception.Message}", Endpoint: endpoint);
         }
@@ -79,12 +81,16 @@ public sealed class LmStudioClient : IModelProvider
                 using JsonDocument document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false));
                 usedFallback = index > 0;
                 List<ModelProfile> models = index == 0 ? ParseNativeV1(document.RootElement) : ParseFallback(document.RootElement, routes[index]);
-                if (models.Count > 0)
+                if (index == 0 || models.Count > 0)
                 {
                     return models;
                 }
             }
             catch (Exception exception) when (exception is HttpRequestException or JsonException or InvalidDataException)
+            {
+                failures.Add(exception);
+            }
+            catch (OperationCanceledException exception) when (!cancellationToken.IsCancellationRequested)
             {
                 failures.Add(exception);
             }
@@ -161,6 +167,11 @@ public sealed class LmStudioClient : IModelProvider
 
         using JsonDocument document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false));
         JsonElement root = document.RootElement;
+        if (root.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidDataException("LM Studio load 响应根节点不是对象。");
+        }
+
         string? instanceId = GetString(root, "instance_id");
         if (string.IsNullOrWhiteSpace(instanceId))
         {
@@ -298,12 +309,12 @@ public sealed class LmStudioClient : IModelProvider
         string? serverMessage = null;
         try
         {
-            string body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+            string body = await response.Content.ReadAsStringAsync(CancellationToken.None).ConfigureAwait(false);
             if (!string.IsNullOrWhiteSpace(body))
             {
                 using JsonDocument document = JsonDocument.Parse(body);
                 JsonElement root = document.RootElement;
-                if (root.TryGetProperty("error", out JsonElement error))
+                if (root.ValueKind == JsonValueKind.Object && root.TryGetProperty("error", out JsonElement error))
                 {
                     if (error.ValueKind == JsonValueKind.Object)
                     {
@@ -319,7 +330,7 @@ public sealed class LmStudioClient : IModelProvider
                 }
             }
         }
-        catch (JsonException)
+        catch (Exception exception) when (exception is JsonException or IOException or OperationCanceledException)
         {
             // Never retain an unrecognized raw response body: future server
             // versions could echo request material such as a template.
@@ -395,7 +406,9 @@ public sealed class LmStudioClient : IModelProvider
 
     private static List<ModelProfile> ParseNativeV1(JsonElement root)
     {
-        if (!root.TryGetProperty("models", out JsonElement models) || models.ValueKind != JsonValueKind.Array)
+        if (root.ValueKind != JsonValueKind.Object ||
+            !root.TryGetProperty("models", out JsonElement models) ||
+            models.ValueKind != JsonValueKind.Array)
         {
             throw new InvalidDataException("/api/v1/models 缺少 models 数组。");
         }
@@ -403,6 +416,11 @@ public sealed class LmStudioClient : IModelProvider
         List<ModelProfile> result = [];
         foreach (JsonElement model in models.EnumerateArray())
         {
+            if (model.ValueKind != JsonValueKind.Object)
+            {
+                throw new InvalidDataException("LM Studio models 数组包含非对象条目。");
+            }
+
             string key = GetString(model, "key") ?? throw new InvalidDataException("LM Studio model 缺少 key。");
             string displayName = GetString(model, "display_name") ?? key;
             string? quantization = GetQuantization(model);
@@ -425,7 +443,10 @@ public sealed class LmStudioClient : IModelProvider
                 if (capabilities.TryGetProperty("reasoning", out JsonElement reasoningElement) && reasoningElement.ValueKind == JsonValueKind.Object &&
                     reasoningElement.TryGetProperty("allowed_options", out JsonElement options) && options.ValueKind == JsonValueKind.Array)
                 {
-                    reasoningOptions.AddRange(options.EnumerateArray().Select(item => item.GetString()).OfType<string>());
+                    reasoningOptions.AddRange(options.EnumerateArray()
+                        .Where(item => item.ValueKind == JsonValueKind.String)
+                        .Select(item => item.GetString())
+                        .OfType<string>());
                     if (reasoningOptions.Count > 0)
                     {
                         reasoning = reasoningOptions.Any(option => !option.Equals("off", StringComparison.OrdinalIgnoreCase));
@@ -437,6 +458,11 @@ public sealed class LmStudioClient : IModelProvider
             {
                 foreach (JsonElement instance in instances.EnumerateArray())
                 {
+                    if (instance.ValueKind != JsonValueKind.Object)
+                    {
+                        throw new InvalidDataException("LM Studio loaded_instances 包含非对象条目。");
+                    }
+
                     string instanceId = GetString(instance, "id") ?? key;
                     LmStudioLoadConfiguration configuration = instance.TryGetProperty("config", out JsonElement config) && config.ValueKind == JsonValueKind.Object
                         ? ParseLoadConfiguration(config)
@@ -523,11 +549,11 @@ public sealed class LmStudioClient : IModelProvider
         {
             array = root;
         }
-        else if (root.TryGetProperty("data", out JsonElement data) && data.ValueKind == JsonValueKind.Array)
+        else if (root.ValueKind == JsonValueKind.Object && root.TryGetProperty("data", out JsonElement data) && data.ValueKind == JsonValueKind.Array)
         {
             array = data;
         }
-        else if (root.TryGetProperty("models", out JsonElement models) && models.ValueKind == JsonValueKind.Array)
+        else if (root.ValueKind == JsonValueKind.Object && root.TryGetProperty("models", out JsonElement models) && models.ValueKind == JsonValueKind.Array)
         {
             array = models;
         }
@@ -539,6 +565,11 @@ public sealed class LmStudioClient : IModelProvider
         List<ModelProfile> result = [];
         foreach (JsonElement model in array.EnumerateArray())
         {
+            if (model.ValueKind != JsonValueKind.Object)
+            {
+                throw new InvalidDataException($"/{source} 模型数组包含非对象条目。");
+            }
+
             string? id = GetString(model, "id") ?? GetString(model, "key") ?? GetString(model, "model");
             if (string.IsNullOrWhiteSpace(id))
             {
@@ -564,23 +595,38 @@ public sealed class LmStudioClient : IModelProvider
         left is null ? right is null : right is not null && Math.Abs(left.Value - right.Value) <= 0.000000001d;
 
     private static string? GetString(JsonElement element, string name) =>
-        element.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+        element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
 
     private static int? GetInt32(JsonElement element, string name) =>
-        element.TryGetProperty(name, out JsonElement value) && value.TryGetInt32(out int number) ? number : null;
+        element.ValueKind == JsonValueKind.Object &&
+        element.TryGetProperty(name, out JsonElement value) &&
+        value.ValueKind == JsonValueKind.Number &&
+        value.TryGetInt32(out int number)
+            ? number
+            : null;
 
     private static long? GetInt64(JsonElement element, string name) =>
-        element.TryGetProperty(name, out JsonElement value) && value.TryGetInt64(out long number) ? number : null;
+        element.ValueKind == JsonValueKind.Object &&
+        element.TryGetProperty(name, out JsonElement value) &&
+        value.ValueKind == JsonValueKind.Number &&
+        value.TryGetInt64(out long number)
+            ? number
+            : null;
 
     private static double? GetDouble(JsonElement element, string name) =>
-        element.TryGetProperty(name, out JsonElement value) && value.TryGetDouble(out double number) ? number : null;
+        element.ValueKind == JsonValueKind.Object &&
+        element.TryGetProperty(name, out JsonElement value) &&
+        value.ValueKind == JsonValueKind.Number &&
+        value.TryGetDouble(out double number)
+            ? number
+            : null;
 
     private static bool? GetBool(JsonElement element, string name) =>
-        element.TryGetProperty(name, out JsonElement value) && value.ValueKind is JsonValueKind.True or JsonValueKind.False ? value.GetBoolean() : null;
+        element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out JsonElement value) && value.ValueKind is JsonValueKind.True or JsonValueKind.False ? value.GetBoolean() : null;
 
     private static string[] GetStringArray(JsonElement element, string name)
     {
-        if (!element.TryGetProperty(name, out JsonElement value) || value.ValueKind != JsonValueKind.Array)
+        if (element.ValueKind != JsonValueKind.Object || !element.TryGetProperty(name, out JsonElement value) || value.ValueKind != JsonValueKind.Array)
         {
             return [];
         }
@@ -596,7 +642,7 @@ public sealed class LmStudioClient : IModelProvider
 
     private static string? GetQuantization(JsonElement element)
     {
-        if (!element.TryGetProperty("quantization", out JsonElement value))
+        if (element.ValueKind != JsonValueKind.Object || !element.TryGetProperty("quantization", out JsonElement value))
         {
             return null;
         }

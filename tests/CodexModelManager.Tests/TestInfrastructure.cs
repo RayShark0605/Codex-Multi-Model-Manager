@@ -102,6 +102,14 @@ internal sealed class StubHttpHandler(Func<HttpRequestMessage, HttpResponseMessa
     };
 }
 
+internal sealed class AsyncStubHttpHandler(
+    Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> responseFactory) : HttpMessageHandler
+{
+    protected override Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request,
+        CancellationToken cancellationToken) => responseFactory(request, cancellationToken);
+}
+
 internal sealed class FakeLmStudioSwitchPreflight : ILmStudioSwitchPreflight
 {
     private readonly Queue<CodexInstructionHierarchyProbeResult> queued = new();

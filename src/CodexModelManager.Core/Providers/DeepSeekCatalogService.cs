@@ -68,49 +68,59 @@ public sealed partial class DeepSeekCatalogService : IModelCatalogService
             await WriteProvenanceAsync(cachedPath, script, bytes, cancellationToken).ConfigureAwait(false);
             return cachedPath;
         }
-        catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException or InvalidDataException or JsonException)
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            if (File.Exists(cachedPath))
-            {
-                try
-                {
-                    using JsonDocument validatedCache = ValidateCatalog(await File.ReadAllBytesAsync(cachedPath, cancellationToken).ConfigureAwait(false));
-                    return cachedPath;
-                }
-                catch (Exception cacheException) when (cacheException is IOException or JsonException or InvalidDataException)
-                {
-                }
-            }
-
-            byte[] snapshot = ReadEmbeddedSnapshot();
-            using JsonDocument validatedSnapshot = ValidateCatalog(snapshot);
-            await WriteCacheIfChangedAsync(cachedPath, snapshot, cancellationToken).ConfigureAwait(false);
-            await WriteCacheIfChangedAsync(cachedPath + ".provenance.json", ReadEmbeddedResource(SnapshotProvenanceResourceSuffix), cancellationToken).ConfigureAwait(false);
-            return cachedPath;
+            return await RecoverCatalogAsync(cachedPath, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is HttpRequestException or InvalidDataException or JsonException)
+        {
+            return await RecoverCatalogAsync(cachedPath, cancellationToken).ConfigureAwait(false);
         }
     }
 
     public static JsonDocument ValidateCatalog(ReadOnlyMemory<byte> bytes)
     {
         JsonDocument document = JsonDocument.Parse(bytes);
-        if (!document.RootElement.TryGetProperty("models", out JsonElement models) || models.ValueKind != JsonValueKind.Array)
+        try
+        {
+            if (document.RootElement.ValueKind != JsonValueKind.Object ||
+                !document.RootElement.TryGetProperty("models", out JsonElement models) ||
+                models.ValueKind != JsonValueKind.Array)
+            {
+                throw new InvalidDataException("DeepSeek catalog 根节点必须是对象并包含 models 数组。");
+            }
+
+            HashSet<string> slugs = new(StringComparer.Ordinal);
+            foreach (JsonElement model in models.EnumerateArray())
+            {
+                if (model.ValueKind != JsonValueKind.Object ||
+                    !TryGetRequiredString(model, "slug", out string slug) ||
+                    !slugs.Add(slug) ||
+                    !TryGetRequiredString(model, "minimal_client_version", out string minimum) ||
+                    SemanticVersion.Parse(minimum) is null ||
+                    !model.TryGetProperty("context_window", out JsonElement context) ||
+                    context.ValueKind != JsonValueKind.Number ||
+                    !context.TryGetInt32(out int contextValue) || contextValue <= 0)
+                {
+                    throw new InvalidDataException("DeepSeek catalog 包含非对象、重复 slug 或不完整的模型 metadata。");
+                }
+
+                ValidateOptionalString(model, "display_name");
+                ValidateOptionalString(model, "description");
+                ValidateOptionalString(model, "default_reasoning_level");
+                ValidateOptionalString(model, "apply_patch_tool_type");
+                ValidateOptionalString(model, "shell_type");
+                ValidateOptionalStringArray(model, "input_modalities");
+                ValidateReasoningLevels(model);
+            }
+
+            return document;
+        }
+        catch
         {
             document.Dispose();
-            throw new InvalidDataException("DeepSeek catalog 缺少 models 数组。");
+            throw;
         }
-
-        foreach (JsonElement model in models.EnumerateArray())
-        {
-            if (!model.TryGetProperty("slug", out JsonElement slug) || string.IsNullOrWhiteSpace(slug.GetString()) ||
-                !model.TryGetProperty("minimal_client_version", out JsonElement minimum) || string.IsNullOrWhiteSpace(minimum.GetString()) ||
-                !model.TryGetProperty("context_window", out JsonElement context) || !context.TryGetInt32(out int contextValue) || contextValue <= 0)
-            {
-                document.Dispose();
-                throw new InvalidDataException("DeepSeek catalog 包含不完整的模型 metadata。");
-            }
-        }
-
-        return document;
     }
 
     private static List<ModelProfile> ParseModels(JsonElement root, string source)
@@ -128,6 +138,9 @@ public sealed partial class DeepSeekCatalogService : IModelCatalogService
                 }
             }
 
+            bool supportsVision = model.TryGetProperty("input_modalities", out JsonElement modalities) &&
+                modalities.ValueKind == JsonValueKind.Array &&
+                modalities.EnumerateArray().Any(item => item.ValueKind == JsonValueKind.String && item.GetString() == "image");
             result.Add(new ModelProfile(
                 slug,
                 model.TryGetProperty("display_name", out JsonElement displayName) ? displayName.GetString() ?? slug : slug,
@@ -138,7 +151,7 @@ public sealed partial class DeepSeekCatalogService : IModelCatalogService
                 LoadedContextLength: model.GetProperty("context_window").GetInt32(),
                 TrainedForToolUse: HasCodexToolMetadata(model) ? true : null,
                 SupportsReasoning: reasoning.Count > 0,
-                SupportsVision: model.TryGetProperty("input_modalities", out JsonElement modalities) && modalities.EnumerateArray().Any(item => item.GetString() == "image"),
+                SupportsVision: supportsVision,
                 ReasoningOptions: reasoning,
                 Source: source,
                 MinimalClientVersion: model.GetProperty("minimal_client_version").GetString(),
@@ -170,6 +183,86 @@ public sealed partial class DeepSeekCatalogService : IModelCatalogService
         }
 
         return true;
+    }
+
+    private static async Task<string> RecoverCatalogAsync(string cachedPath, CancellationToken cancellationToken)
+    {
+        if (File.Exists(cachedPath))
+        {
+            try
+            {
+                using JsonDocument validatedCache = ValidateCatalog(await File.ReadAllBytesAsync(cachedPath, cancellationToken).ConfigureAwait(false));
+                return cachedPath;
+            }
+            catch (Exception exception) when (exception is IOException or JsonException or InvalidDataException)
+            {
+            }
+        }
+
+        byte[] snapshot = ReadEmbeddedSnapshot();
+        using JsonDocument validatedSnapshot = ValidateCatalog(snapshot);
+        await WriteCacheIfChangedAsync(cachedPath, snapshot, cancellationToken).ConfigureAwait(false);
+        await WriteCacheIfChangedAsync(cachedPath + ".provenance.json", ReadEmbeddedResource(SnapshotProvenanceResourceSuffix), cancellationToken).ConfigureAwait(false);
+        return cachedPath;
+    }
+
+    private static bool TryGetRequiredString(JsonElement element, string name, out string value)
+    {
+        value = string.Empty;
+        if (!element.TryGetProperty(name, out JsonElement property) || property.ValueKind != JsonValueKind.String)
+        {
+            return false;
+        }
+
+        value = property.GetString() ?? string.Empty;
+        return !string.IsNullOrWhiteSpace(value);
+    }
+
+    private static void ValidateOptionalString(JsonElement element, string name)
+    {
+        if (element.TryGetProperty(name, out JsonElement value) && value.ValueKind is not (JsonValueKind.String or JsonValueKind.Null))
+        {
+            throw new InvalidDataException($"DeepSeek catalog 字段 {name} 必须是 string 或 null。");
+        }
+    }
+
+    private static void ValidateOptionalStringArray(JsonElement element, string name)
+    {
+        if (!element.TryGetProperty(name, out JsonElement value) || value.ValueKind == JsonValueKind.Null)
+        {
+            return;
+        }
+
+        if (value.ValueKind != JsonValueKind.Array || value.EnumerateArray().Any(item => item.ValueKind != JsonValueKind.String))
+        {
+            throw new InvalidDataException($"DeepSeek catalog 字段 {name} 必须是 string array 或 null。");
+        }
+    }
+
+    private static void ValidateReasoningLevels(JsonElement model)
+    {
+        if (!model.TryGetProperty("supported_reasoning_levels", out JsonElement levels) || levels.ValueKind == JsonValueKind.Null)
+        {
+            return;
+        }
+
+        if (levels.ValueKind != JsonValueKind.Array)
+        {
+            throw new InvalidDataException("DeepSeek catalog supported_reasoning_levels 必须是 array 或 null。");
+        }
+
+        HashSet<string> efforts = new(StringComparer.Ordinal);
+        foreach (JsonElement level in levels.EnumerateArray())
+        {
+            if (level.ValueKind != JsonValueKind.Object ||
+                !TryGetRequiredString(level, "effort", out string effort) ||
+                !efforts.Add(effort))
+            {
+                throw new InvalidDataException("DeepSeek catalog reasoning level 必须是 effort 唯一的对象。");
+            }
+
+            ValidateOptionalString(level, "description");
+        }
     }
 
     private static string ExtractCatalog(string script)

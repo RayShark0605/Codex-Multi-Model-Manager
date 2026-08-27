@@ -33,6 +33,43 @@ public enum LmStudioRuntimeTemplateMode
     ManagerRule
 }
 
+public enum LmStudioPersistenceStatus
+{
+    BuiltInNoOverride,
+    LegacyRuntimeOnlyPatch,
+    PersistentV3Applied,
+    PersistentV2UpgradeRequired,
+    PersistentOverrideMissingAfterReload,
+    UnsupportedCustomOverride,
+    UnsupportedLmStudioVersion,
+    PersistenceStateAmbiguous
+}
+
+public enum LmStudioPersistentTemplateFieldState
+{
+    Missing,
+    ManagerV2,
+    ManagerV3
+}
+
+public enum LmStudioPerModelDefaultsMutation
+{
+    Add,
+    Upgrade,
+    NoOp
+}
+
+public enum LmStudioPersistenceStage
+{
+    None,
+    Prepared,
+    BackupVerified,
+    DefaultsVerified,
+    PersistentDefaultVerified,
+    Restored,
+    RecoveryBlocked
+}
+
 public enum LmStudioTemplateTransactionState
 {
     Prepared,
@@ -41,6 +78,7 @@ public enum LmStudioTemplateTransactionState
     PatchedAndVerified,
     RolledBack,
     RollbackFailed,
+    RecoveryBlocked,
     Completed
 }
 
@@ -48,6 +86,7 @@ public enum LmStudioLifecycleStage
 {
     None,
     ApplyPreflight,
+    PersistDefaults,
     UnloadOriginal,
     LoadPatched,
     ValidatePatched,
@@ -56,6 +95,7 @@ public enum LmStudioLifecycleStage
     LoadOriginal,
     ValidateOriginal,
     ProbeOriginal,
+    RestoreDefaults,
     RecoveryAssessment,
     RecoveryCommit
 }
@@ -239,7 +279,8 @@ public sealed record LmStudioModelFileResolution(
     string? SelectedVariant,
     string? Architecture,
     string? Quantization,
-    string Source);
+    string Source,
+    string? ConcreteModelIdentifier = null);
 
 public sealed record LmStudioModelFileResolutionAttempt(
     LmStudioModelFileResolutionStatus Status,
@@ -461,7 +502,42 @@ public sealed record LmStudioTemplateRepairPlan(
     PromptTemplateRepairPreview TemplatePreview,
     LmStudioRuntimeTemplateProvenance OriginalRuntimeTemplate,
     CodexInstructionHierarchyProbeResult OriginalHierarchyProbe,
-    string? OriginalRuntimeTemplateText = null);
+    string? OriginalRuntimeTemplateText = null,
+    LmStudioPerModelDefaultsPlan? PersistentDefaults = null,
+    string? LmStudioVersion = null);
+
+public sealed record LmStudioPerModelDefaultsPlan(
+    string ConcreteModelIdentifier,
+    string FilePath,
+    string LmStudioVersion,
+    FileFingerprint OriginalFingerprint,
+    FileFingerprint CandidateFingerprint,
+    LmStudioPersistentTemplateFieldState OriginalFieldState,
+    string? OriginalRuleVersion,
+    string? OriginalTemplateSha256,
+    string TargetRuleVersion,
+    string TargetTemplateSha256,
+    LmStudioPerModelDefaultsMutation Mutation,
+    byte[] OriginalBytes,
+    byte[] CandidateBytes);
+
+public sealed record LmStudioDefaultsBackupArtifact(
+    string Path,
+    string PlaintextSha256,
+    string EncryptedSha256);
+
+public sealed record LmStudioDefaultsRestoreResult(
+    bool Succeeded,
+    bool RecoveryBlocked,
+    string Detail,
+    FileFingerprint? RestoredFingerprint = null);
+
+public sealed record LmStudioPersistenceInspection(
+    LmStudioPersistenceStatus Status,
+    string? FilePath,
+    FileFingerprint? Fingerprint,
+    string? TemplateSha256,
+    string Detail);
 
 public sealed record LmStudioRuntimeTemplateProvenance(
     LmStudioRuntimeTemplateMode Mode,
@@ -495,7 +571,9 @@ public sealed record LmStudioRecoveryAssessment(
     bool RequiresLifecycleMutation,
     bool IsLegacyJournal,
     string StateFingerprint,
-    string Detail);
+    string Detail,
+    FileFingerprint? CurrentDefaultsFingerprint = null,
+    bool RequiresPersistenceRecovery = false);
 
 public sealed record LmStudioTemplateTransactionRecord(
     int SchemaVersion,
@@ -529,7 +607,20 @@ public sealed record LmStudioTemplateTransactionRecord(
     string? OriginalRuntimeTemplateSha256 = null,
     Guid? OriginalRuntimeEvidenceTransactionId = null,
     string? TargetRuntimeRuleVersion = null,
-    CodexInstructionHierarchyProbeResult? OriginalHierarchyProbe = null);
+    CodexInstructionHierarchyProbeResult? OriginalHierarchyProbe = null,
+    string? ConcreteModelIdentifier = null,
+    string? PerModelDefaultsPath = null,
+    FileFingerprint? OriginalDefaultsFingerprint = null,
+    LmStudioPersistentTemplateFieldState? OriginalPersistentTemplateState = null,
+    string? OriginalPersistentRuleVersion = null,
+    string? OriginalPersistentTemplateSha256 = null,
+    string? TargetPersistentRuleVersion = null,
+    string? TargetPersistentTemplateSha256 = null,
+    string? CandidateDefaultsSha256 = null,
+    string? EncryptedDefaultsBackupPath = null,
+    string? DefaultsBackupPlaintextSha256 = null,
+    LmStudioPersistenceStage PersistenceStage = LmStudioPersistenceStage.None,
+    string? LmStudioVersion = null);
 
 public sealed record ProviderState(
     ProviderKind Provider,
@@ -557,6 +648,16 @@ public sealed class AppSettings
     public DateTimeOffset? LastManagedAt { get; set; }
 
     public bool CreateInitialSnapshotOnLaunch { get; set; } = true;
+}
+
+public sealed record AppSettingsLoadResult(
+    AppSettings Settings,
+    string? RecoveredCorruptFilePath = null,
+    string? RecoveredCorruptSha256 = null,
+    string? Warning = null,
+    string? RecoveredCorruptExceptionType = null)
+{
+    public bool RecoveredCorruptSettings => !string.IsNullOrWhiteSpace(RecoveredCorruptFilePath);
 }
 
 public sealed class ModelPreference

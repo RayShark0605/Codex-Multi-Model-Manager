@@ -25,9 +25,15 @@ public static partial class SecondaryOverridePatcher
         IReadOnlyList<string> currentTableSegments = [];
         List<Line> lines = SplitLines(text);
         List<ConfigMutation> mutations = [];
+        var lexicalState = new TomlLineLexicalState();
         for (int index = 0; index < lines.Count; index++)
         {
             Line line = lines[index];
+            if (!lexicalState.IsCodeLineAndAdvance(line.Content))
+            {
+                continue;
+            }
+
             Match header = TableHeaderRegex().Match(line.Content);
             if (header.Success)
             {

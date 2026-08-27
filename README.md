@@ -13,8 +13,9 @@
 - 可逆备份：不可覆盖的 Initial Snapshot、显式修改外部 override 文件前的 supplemental baseline、每次切换/恢复前的 History、SHA-256 manifest。
 - 凭据：新 Token 默认进入 Windows Credential Manager；Codex 通过 command-backed auth Helper 从 stdout 获取，不进入 TOML、日志或 manifest。
 - 本地兼容性硬门槛：切换 LM Studio 前实时执行 Basic、Leading Developer、Conversation Control、Continuation Developer 四阶段差分请求；四项未全部返回 HTTP 200 且含 `output` 数组时，在备份和写盘前阻止切换。
-- Prompt Template 修复：只读解析精确 loaded instance 的 GGUF，仅对结构精确匹配的 Qwen 指令层级失败提供可预览的 `qwen-interleaved-instructions-v3` 运行时 Jinja 修补；现已覆盖当前 Unsloth 184 行 prefix-merged-system 模板族。确认后通过原生 API 事务式 unload/load、复核全部可观察加载参数并重新探测，不修改 GGUF。已验证的旧 v2 运行时实例可安全升级，失败时确定性恢复 v2；手工导出仍作为回退路径。
+- Prompt Template 修复：只读解析精确 loaded instance 的 GGUF，仅对结构精确匹配的 Qwen 指令层级失败提供可预览的 `qwen-interleaved-instructions-v3` Jinja 修补；现已覆盖当前 Unsloth 184 行 prefix-merged-system 模板族。在本机 loopback LM Studio `0.4.21.x` 上，确认后会事务式写入该 concrete GGUF 的 per-model Prompt Template default，再以**不含 REST `prompt_template`** 的请求 unload/load、复核全部可观察加载参数并执行四阶段探针。它不修改 GGUF；已验证的旧 v2 可安全升级，任何失败都会先恢复持久 defaults，再确定性恢复原运行时，手工导出仍作为回退路径。
 - 测试：Codex-shaped Level 1/2 Responses/SSE/function calling；用户主动触发的 Level 3 真实 Codex CLI 临时工作区测试。
+- 2026-08-24 审阅修复：已完成配置补丁、崩溃可恢复跨进程门控、设置隔离恢复、Provider/JSON/进程边界与 WinForms 生命周期的一轮系统性加固；逐项判定、运行时证据与测试映射见 [`docs/REMEDIATION-2026-08-24.md`](docs/REMEDIATION-2026-08-24.md)。
 
 ## 快速使用
 
@@ -27,7 +28,7 @@
 4. 若使用 DeepSeek，先在“设置与日志”页将 Token 保存到 Windows Credential Manager。LM Studio 返回 401 时同样保存 LM Token。
 5. 选择 Provider 与 Model；LM Studio 页确认 `Loaded Context` 与 `Codex Configured Context` 一致。
 6. 对 LM Studio 点击 **重新检测 Codex 指令层级**。只有 Basic、Leading、Conversation、Continuation 四项都 PASS 才能切换。
-7. 若显示 **Template Fix Required** 或 **Template Upgrade Required (v2 → v3)**，可先点击 **Preview Changes** 查看当前运行时来源、GGUF 定位证据（`lms ps --json` 或 `lms ls --json --variants`）、原始/v2/v3 哈希、目标模板和完整加载配置而不改动任何运行状态；点击 **Switch Model** 后再明确确认“应用兼容模板并继续”。若自动 GGUF 定位、v2 provenance 或当前 LM Studio 版本不满足门槛，稳定诊断会保留 **分析/导出兼容模板** 的手工回退流程。
+7. 若显示 **Template Fix Required** 或 **Template Upgrade Required (v2 → v3)**，可先点击 **Preview Changes** 查看当前运行时来源、GGUF 定位证据（`lms ps --json` 或 `lms ls --json --variants`）、精确 per-model defaults 路径、原/候选文件 SHA、Prompt Template 的 Add/Upgrade/No-op 语义、原始/v2/v3 模板 SHA、目标模板和完整加载配置；Preview 全程只读。点击 **Switch Model** 后会再次明确说明将修改该模型的 LM Studio 默认 Prompt Template 并执行一次 unload/reload。若 concrete identity、v2 provenance、defaults 结构或 LM Studio 版本不满足门槛，稳定诊断会保留 **分析/导出兼容模板** 和 LM Studio My Models 手工设置流程。“对应 GGUF”为空或当前选择不是已加载 LLM 时，**分析 Prompt Template** 保持禁用；底层入口也会返回可操作的中文校验错误，不再暴露 `ArgumentException(filePath)`。
 8. 点击 **Preview Changes**，检查 semantic diff、Secondary Overrides 和警告。Secondary 列表默认全部不勾选；只有明确勾选的项才会在 `FollowMain`/`RestoreOriginal` 策略下修改。
 9. **先完全退出 Codex Desktop/CLI，再单独启动管理器**，随后点击 **Switch Model** 并确认。当前 Codex 仍在运行时不要尝试真实切换；提交前会再次实时验证进程状态与指令层级，完成后再重新启动 Codex Desktop。
 
@@ -58,7 +59,7 @@ Codex 可能在运行期间缓存配置、更新模型 cache 或自行写回 `co
 - 默认 1234、无认证、无 `CODEX_OSS_*` 重定向时使用 Codex 内置 `lmstudio`，绝不创建 `[model_providers.lmstudio]`。
 - 非默认端口或启用认证时使用不冲突的 `lmstudio_local_cmm` custom provider。
 - 非 loopback endpoint 必须是 HTTPS；401 会提示 Token，Token 输入框使用系统密码字符。
-- 常规发现、刷新、兼容性测试与 Preview 不改变模型生命周期。自动 GGUF 定位要求 `lms ps` 的 identifier/modelKey、publisher/source、type、architecture、quantization、context 与 native loaded 快照一致，路径唯一、真实、为 `.gguf` 且位于配置的 downloads/models 根目录；不把进程 size 与单个文件长度强行等同。两数据面冲突、非法 JSON、CLI 失败/超时、歧义或非本机 endpoint 均 fail closed 并保留手工选择。只有三个已识别的模板失败码（含 v2 后置 developer 顺序错误）、精确 GGUF 解析成功且用户确认后，Switch 流程才调用原生 `/api/v1/models/unload` 与 `/load`；请求保留 native API 捕获的 context、batch、parallel、flash attention、KV cache、speculative decoding 等可观察参数，并在不一致时回滚。
+- 常规发现、刷新、兼容性测试与 Preview 不改变模型生命周期或任何 defaults 文件。自动 GGUF 定位把 `lms ps.identifier` 固定解释为 loaded instance ID，必须严格等于 native loaded ID；`modelKey` 必须非空，且只能等于 loaded ID（旧 CLI/旧加载形态）或规范化后的 native source/load key（当前重载形态）。publisher/source、type、format、architecture、context 同样严格匹配；quantization 按“双方都缺失或双方非空且相等”精确比较，单边缺失或值冲突仍会阻断。当 native source 是完整 `.gguf` 相对路径时，所有存在的 `path`/`indexedModelIdentifier` 都必须与其规范化后相等，且至少存在一个；普通 Hub source 继续使用 publisher/source 规则，并避免对已经完全限定的 `publisher/model` 重复拼接 publisher。最终路径必须唯一、真实、为 `.gguf` 且位于配置的 downloads/models 根目录；不从显示名、用户手选文件或文件名猜测 concrete identity/`NVFP4`，也不把进程 size 与单个文件长度强行等同。两数据面冲突、非法 JSON、CLI 失败/超时、歧义或非本机 endpoint 均 fail closed 并保留只读手工选择。只有三个已识别的模板失败码（含 v2 后置 developer 顺序错误）、精确 GGUF 和 concrete identity 均可证明且用户确认后，Switch 流程才修改 defaults 并调用原生 `/api/v1/models/unload` 与 `/load`；请求保留 native API 捕获的 context、batch、parallel、flash attention、KV cache、speculative decoding 等可观察参数，并在不一致时回滚。
 - LM Studio 仅报告 reasoning `on/off` 时，不会把它猜成 Codex 的 `low/medium/high`；此时本地配置明确删除 `model_reasoning_effort`。只有 Provider 返回值与 Codex 支持 effort 的精确交集才允许写入。
 
 ### Codex Instruction Hierarchy 与 Qwen Prompt Template
@@ -92,11 +93,11 @@ Continuation:  与 Conversation 相同，仅在最后一个 user 前增加 devel
   APPLY.md
 ```
 
-自动路径把 `prompt_template` 作为顶层对象随 `/api/v1/models/load` 注入，只作用于新加载实例。它在 LM Studio 0.4.21 本机运行包 schema 中已经验证，但截至本文更新时尚未列入公开 REST 参数文档，因此每次都以 load 响应、重新列举的实例配置和最终四阶段探测为准。字段被拒绝或行为无法证明时：原先为内置模板的事务恢复不带 `prompt_template` 的实例；原先为已证明 v2 的事务则从未变化的 GGUF 确定性重建相同 SHA 的 v2 并恢复，绝不错误退回内置模板。官方已文档化的模型管理端点参见 [List](https://lmstudio.ai/docs/developer/rest/list)、[Load](https://lmstudio.ai/docs/developer/rest/load) 与 [Unload](https://lmstudio.ai/docs/developer/rest/unload)，模板语法参见 [Prompt Template](https://lmstudio.ai/docs/app/advanced/prompt-template)。手工回退仍可在 **My Models → 模型设置 → Prompt Template** 中应用导出的模板。无论哪条路径，只有重载后的实时差分检测才算 PASS，原始 GGUF 从未被修改。
+自动路径仅在本机 loopback LM Studio `0.4.21.x` 上启用持久化。它使用经 locator 严格证明的 concrete model identifier，把目标字段写入 `%USERPROFILE%\.lmstudio\.internal\user-concrete-model-default-config\<publisher>\...\<file.gguf>.json` 的 `load.fields`；路径穿越、绝对/UNC 标识、root 外路径、现有 reparse point/junction、未知 JSON 结构、重复字段或用户自定义 Prompt Template 全部在任何写入和 unload 前阻断。目标 `/api/v1/models/load` 请求**不包含**顶层 REST `prompt_template`，从而由无运行时覆盖的重载与四阶段探针证明模板确实来自 per-model default。除 `llm.load.promptTemplate` 外，preset、operation/load 参数及未知 JSON 属性保持语义不变；GGUF 始终只读。官方说明 per-model defaults 会用于模型的后续加载，并支持模型级 Prompt Template 覆盖，参见 [Per-model Defaults](https://lmstudio.ai/docs/app/advanced/per-model) 与 [Prompt Template](https://lmstudio.ai/docs/app/advanced/prompt-template)；模型管理端点参见 [List](https://lmstudio.ai/docs/developer/rest/list)、[Load](https://lmstudio.ai/docs/developer/rest/load) 与 [Unload](https://lmstudio.ai/docs/developer/rest/unload)。未知版本或自动路径被阻断时，仍可在 **My Models → 模型设置 → Prompt Template** 中手工应用导出的模板。
 
 `/load` 的 `model` 始终使用 native list 返回的源模型 `key`（例如 `qwen/qwen3.8-27b`）；`selected_variant`（例如 `...@q8_0`）只用于精确 GGUF 定位、并发指纹和加载后量化校验。旧实现曾把 variant 字符串当成 load ID，LM Studio 0.4.21 会返回 `404 model_not_found`；新版禁止混用 source key、selected variant 与 instance ID，也不预测 `:2` 之类的新实例后缀。
 
-运行时修复在 `%LOCALAPPDATA%\CodexModelManager\transactions` 中先写不含模板正文和 Token 的 schema-v3 恢复记录，保存最后稳定阶段、失败阶段、脱敏 API 错误、load 前后候选 ID、原运行时模板来源/规则/SHA/evidence transaction、目标规则和原四阶段摘要。load、配置对比、层级探测、最终 Codex 配置确认或 Commit 任一步失败/取消，都会卸载可唯一归因的补丁实例并恢复事务记录证明的原运行时模板。schema-v1/v2 继续只读兼容。程序异常退出后不会静默重载；下次启动会先只读评估，并在 LM Studio 页启用 **检查/恢复未完成事务**。如果唯一当前实例已经与原始快照和原四阶段签名完全一致，确认后只关闭 journal，不做昂贵的重复 unload/load；schema 3 比较四个步骤各自的 PASS/HTTP 状态及 failure code，不再只看某一个失败标签。schema 1/2 仅兼容旧记录，状态仍有歧义时继续阻断而不猜测。
+正式持久修复在 `%LOCALAPPDATA%\CodexModelManager\transactions` 中先写不含模板正文、完整 defaults 正文和 Token 的 schema-v4 恢复记录；它额外保存 concrete identity、defaults 路径与前后 SHA、原字段状态、目标规则/SHA、CurrentUser DPAPI 加密备份路径和持久化稳定阶段。备份必须完成写盘、解密和 SHA 校验后才允许原子修改 defaults；写入后再次确认 native instance、GGUF、concrete identity 和 defaults 未漂移，才会 unload。load、配置回显、四阶段、持久字段复核、Codex Commit 或最终完成标记任一步失败/取消，都会先恢复 defaults，再卸载可唯一归因的补丁实例并恢复原运行时。若整个 defaults 仍等于管理器候选则精确恢复原始字节；若只有无关字段并发变化则只恢复管理器拥有的 Prompt Template 并保留其他变化；若该字段被外部改成未知内容则进入 `RecoveryBlocked`，绝不覆盖或继续生命周期操作。schema-v1–v3 继续按原语义读取，旧 schema-v3 `Completed` 只证明当时的 runtime-only patch，不再作为重启后的持久证明。崩溃恢复的只读评估会同时指纹化当前 instance 和 defaults；只有持久状态处理完毕、原运行时签名复现后才关闭 journal。
 
 ## Local Context、Max Context、Auto Compact 与 Tool Output Limit
 
@@ -233,6 +234,7 @@ logs\                  脱敏日志
 temp\                  管理器临时文件
 template-fixes\        原模板、兼容模板、哈希 manifest 与手动应用说明
 transactions\          不含模板正文/Token 的 LM Studio 恢复事务记录
+  encrypted-backups\   schema-v4 的 CurrentUser DPAPI defaults 精确备份
 ```
 
 Windows Credential Manager target：
@@ -247,7 +249,7 @@ Windows Credential Manager target：
 1. 完全关闭 Codex。
 2. 在“备份历史”页选择 **恢复 Initial Snapshot**；确认后当前状态会先进入 History，主 `config.toml`/`models.json` 与所有曾由管理器明确修改过的 supplemental TOML 会一起恢复到各自首次触及时的状态。
 3. 重新启动 Codex，确认模型、MCP 与 Project/Trust 均正常。
-4. 如果当前保留的是自动运行时补丁实例，先在 LM Studio 中卸载它并按原参数不带模板重新加载；若应用存在未完成事务，下次启动可使用恢复对话框。若曾手工应用 per-model override，则在模型设置中禁用/删除并手动重载。Codex Initial Snapshot 不管理 LM Studio 的独立运行状态。
+4. 若存在未完成的 schema-v4 事务，先用管理器的 **检查/恢复未完成事务**，让它从 DPAPI 备份恢复 defaults 并复核原实例；不要直接删除 journal/备份。已完成事务如需手工撤销，可在 LM Studio **My Models → 模型设置 → Prompt Template** 中删除该模型的覆盖并重新加载；高级用户也可在完全关闭 Codex 与该模型后，备份对应 JSON，再只删除 `load.fields` 中唯一的 `llm.load.promptTemplate` 条目，绝不要删除其他 load/operation/preset 字段或修改 GGUF。Codex Initial Snapshot 不管理 LM Studio 的独立运行状态。
 5. 如要卸载应用，可删除 `%LOCALAPPDATA%\CodexModelManager`，并在 Windows“凭据管理器”中删除上述两个 `CodexModelManager/*` Generic Credential。
 6. 建议先保留 `~\.codex\model-switcher-backup` 一段时间；确认无误后再由用户自行归档。不要删除或改动 `backup-deepseek`。
 
@@ -263,6 +265,7 @@ Windows Credential Manager target：
 
 ```powershell
 dotnet test .\tests\CodexModelManager.Tests\CodexModelManager.Tests.csproj
+dotnet test .\tests\CodexModelManager.App.Tests\CodexModelManager.App.Tests.csproj
 .\publish.ps1
 ```
 
@@ -284,6 +287,7 @@ src/
   CodexModelManager.TestMcpServer/     临时 MCP 测试 Helper
 tests/
   CodexModelManager.Tests/             xUnit 测试（非 live + opt-in live）
+  CodexModelManager.App.Tests/         net8.0-windows 隔离 STA WinForms 回归测试（不显示窗口）
 docs/                                  兼容性、验证与环境审计文档
 artifacts/                             构建/发布输出（默认不入库）
 ```

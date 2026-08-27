@@ -8,9 +8,12 @@ public sealed class LmStudioTemplateRepairPlanner(
     IGgufChatTemplateReader ggufReader,
     IPromptTemplateRepairService templateRepair,
     LmStudioTemplateTransactionStore transactions,
-    ILmStudioModelFileLocator? modelFileLocator = null)
+    ILmStudioModelFileLocator? modelFileLocator = null,
+    LmStudioPerModelDefaultsStore? perModelDefaultsStore = null,
+    Func<string?>? lmStudioVersionProvider = null)
 {
     private readonly ILmStudioModelFileLocator modelFileLocator = modelFileLocator ?? new LmStudioModelFileLocator();
+    private readonly Func<string?> lmStudioVersionProvider = lmStudioVersionProvider ?? LmStudioLocalVersionDetector.Detect;
     public async Task<LmStudioTemplateRepairPlan> CreatePlanAsync(
         ModelProfile selectedModel,
         CodexInstructionHierarchyProbeResult originalProbe,
@@ -86,6 +89,21 @@ public sealed class LmStudioTemplateRepairPlanner(
                 ? await ResolveV2ProvenanceAsync(snapshot, analysis, originalProbe, cancellationToken).ConfigureAwait(false)
                 : ResolveBuiltInProvenance(originalProbe);
 
+        string? lmStudioVersion = null;
+        LmStudioPerModelDefaultsPlan? persistentDefaults = null;
+        if (perModelDefaultsStore is not null)
+        {
+            lmStudioVersion = lmStudioVersionProvider();
+            persistentDefaults = await perModelDefaultsStore.CreatePlanAsync(
+                snapshot.Endpoint,
+                lmStudioVersion,
+                resolution,
+                analysis,
+                preview,
+                provenance,
+                cancellationToken).ConfigureAwait(false);
+        }
+
         return new LmStudioTemplateRepairPlan(
             Guid.NewGuid(),
             DateTimeOffset.Now,
@@ -96,7 +114,9 @@ public sealed class LmStudioTemplateRepairPlanner(
             preview,
             provenance,
             originalProbe,
-            originalRuntimeTemplate);
+            originalRuntimeTemplate,
+            persistentDefaults,
+            lmStudioVersion);
     }
 
     private async Task<(LmStudioRuntimeTemplateProvenance Provenance, string Template)> ResolveV2ProvenanceAsync(
@@ -196,7 +216,7 @@ public sealed class LmStudioTemplateRepairPlanner(
         LmStudioLoadedInstanceSnapshot snapshot,
         GgufChatTemplateAnalysis analysis) =>
         record.State == LmStudioTemplateTransactionState.Completed &&
-        record.RuleVersion.Equals(PromptTemplateRepairService.LegacyLeadingRuleVersion, StringComparison.Ordinal) &&
+        string.Equals(record.RuleVersion, PromptTemplateRepairService.LegacyLeadingRuleVersion, StringComparison.Ordinal) &&
         record.PatchedInstanceId?.Equals(snapshot.InstanceId, StringComparison.Ordinal) == true &&
         record.OriginalInstance.Endpoint.AbsoluteUri.TrimEnd('/').Equals(snapshot.Endpoint.AbsoluteUri.TrimEnd('/'), StringComparison.OrdinalIgnoreCase) &&
         record.OriginalInstance.SourceModelKey.Equals(snapshot.SourceModelKey, StringComparison.OrdinalIgnoreCase) &&

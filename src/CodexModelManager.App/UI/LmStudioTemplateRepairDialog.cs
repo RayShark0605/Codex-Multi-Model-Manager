@@ -9,7 +9,7 @@ internal sealed class LmStudioTemplateRepairDialog : Form
     public LmStudioTemplateRepairDialog(LmStudioTemplateRepairPlan plan, bool allowApply)
     {
         ArgumentNullException.ThrowIfNull(plan);
-        Text = allowApply ? "确认 LM Studio Prompt Template 运行时修复" : "LM Studio Prompt Template 运行时修复预览";
+        Text = allowApply ? "确认 LM Studio Prompt Template 持久修复" : "LM Studio Prompt Template 持久修复预览";
         StartPosition = FormStartPosition.CenterParent;
         MinimumSize = new Size(900, 640);
         Size = new Size(1120, 800);
@@ -45,10 +45,10 @@ internal sealed class LmStudioTemplateRepairDialog : Form
             Padding = new Padding(12, 10, 12, 10),
             ForeColor = Color.DarkRed,
             Text = allowApply
-                ? plan.OriginalRuntimeTemplate.Mode == LmStudioRuntimeTemplateMode.ManagerRule
-                    ? $"GGUF 不会被修改。确认后将卸载当前实例、加载 {plan.TemplatePreview.RuleVersion} 并执行四阶段探测；任何失败都会确定性恢复 {plan.OriginalRuntimeTemplate.RuleVersion}，不会错误退回内置模板。"
-                    : "GGUF 不会被修改。确认后将卸载当前实例、以完整原配置加载运行时补丁并执行四阶段探测；任何失败都会尝试恢复原始内置模板。"
-                : "这是非变更预览：不会卸载/加载模型，也不会修改 Codex 配置。",
+                ? plan.PersistentDefaults is null
+                    ? "该兼容计划没有持久 defaults 身份，自动应用已被阻断；请关闭并重新刷新模型。"
+                    : $"GGUF 不会被修改。确认后会事务式修改该模型的 LM Studio 默认 Prompt Template（{plan.PersistentDefaults.Mutation}），然后执行一次 unload/reload；目标 /load 不发送 REST prompt_template。任何失败都会先恢复 defaults，再恢复原实例。"
+                : "这是非变更 Preview：不会修改 GGUF、LM Studio defaults 或 Codex 配置，也不会 unload/load 模型。",
         };
         var buttons = new FlowLayoutPanel
         {
@@ -64,6 +64,7 @@ internal sealed class LmStudioTemplateRepairDialog : Form
             Height = 34,
             Text = allowApply ? "应用兼容模板并继续" : "关闭",
             DialogResult = DialogResult.OK,
+            Enabled = !allowApply || plan.PersistentDefaults is not null,
         };
         buttons.Controls.Add(primary);
         AcceptButton = primary;
@@ -126,6 +127,19 @@ internal sealed class LmStudioTemplateRepairDialog : Form
             .Append("Patched template SHA-256:  ").AppendLine(plan.TemplatePreview.PatchedTemplateSha256)
             .Append("Target runtime rule: ").AppendLine(plan.TemplatePreview.RuleVersion)
             .AppendLine()
+            .AppendLine("LM Studio 持久 per-model defaults")
+            .Append("LM Studio version: ").AppendLine(plan.LmStudioVersion ?? "<unsupported/unknown>")
+            .Append("Concrete model identifier: ").AppendLine(plan.PersistentDefaults?.ConcreteModelIdentifier ?? "<not proven>")
+            .Append("Defaults path: ").AppendLine(plan.PersistentDefaults?.FilePath ?? "<not available>")
+            .Append("Mutation: ").AppendLine(plan.PersistentDefaults?.Mutation.ToString() ?? "<blocked>")
+            .Append("Original defaults SHA-256: ").AppendLine(plan.PersistentDefaults?.OriginalFingerprint.Sha256 ?? "<not available>")
+            .Append("Candidate defaults SHA-256: ").AppendLine(plan.PersistentDefaults?.CandidateFingerprint.Sha256 ?? "<not available>")
+            .Append("Original persistent field: ").AppendLine(plan.PersistentDefaults?.OriginalFieldState.ToString() ?? "<not available>")
+            .Append("Original persistent template SHA-256: ").AppendLine(plan.PersistentDefaults?.OriginalTemplateSha256 ?? "<missing>")
+            .Append("Target persistent template SHA-256: ").AppendLine(plan.PersistentDefaults?.TargetTemplateSha256 ?? "<not available>")
+            .AppendLine("Only llm.load.promptTemplate changes; preset、operation、其他 load 字段和未知 JSON 属性保持语义不变。")
+            .AppendLine("GGUF remains read-only. Successful target /load omits top-level REST prompt_template so persistence is proven by per-model defaults.")
+            .AppendLine()
             .AppendLine("将保留的 LM Studio 加载配置")
             .Append("context_length: ").AppendLine(Value(config.ContextLength))
             .Append("eval_batch_size: ").AppendLine(Value(config.EvalBatchSize))
@@ -145,11 +159,11 @@ internal sealed class LmStudioTemplateRepairDialog : Form
             .Append("remaining TTL: ").AppendLine(instance.RemainingTtlSeconds is > 0 ? $"{instance.RemainingTtlSeconds} seconds（只能恢复捕获时剩余值）" : "<none>")
             .AppendLine()
             .AppendLine("回滚策略")
-            .AppendLine(plan.OriginalRuntimeTemplate.Mode == LmStudioRuntimeTemplateMode.ManagerRule
-                ? $"- load、配置一致性或四阶段探测任一步失败：卸载 v3 实例，并从未变化的 GGUF 确定性重建、校验 SHA 后恢复 {plan.OriginalRuntimeTemplate.RuleVersion}。"
-                : "- load、配置一致性或四阶段探测任一步失败：卸载补丁实例并按上述配置重新加载原始内置模板。")
-            .AppendLine("- 补丁通过后若取消最终 Codex 配置确认，或 Codex 配置提交失败：同样恢复原始实例。")
-            .AppendLine("- Codex 配置提交成功：保留补丁实例，直到该实例被卸载。")
+            .AppendLine("- Prepared 后先创建 CurrentUser DPAPI 加密备份并进行解密/SHA 回读；备份失败时不会写 defaults 或 unload。")
+            .AppendLine("- load、配置一致性或四阶段探测任一步失败：先精确/字段级恢复 per-model Prompt Template，再恢复原实例及原四阶段签名。")
+            .AppendLine("- 若 Prompt Template 字段被外部改成未知内容：进入 RecoveryBlocked，绝不覆盖用户模板，也不继续 unload/load。")
+            .AppendLine("- 补丁通过后若取消最终 Codex 配置确认，或 Codex 配置提交失败：同样恢复原 defaults 与原实例。")
+            .AppendLine("- Codex 配置提交成功：仅在持久字段、当前 instance 和四阶段再次验证后标记 Completed / PersistentDefaultVerified。")
             .AppendLine("- selected_variant 只用于量化/文件强校验；/load 的 model 固定使用 REST load key。")
             .AppendLine("- 新 instance ID 以后端响应为准，不预测 :2 后缀。")
             .AppendLine("- 卸载与重新加载可能耗时数分钟；期间请勿启动 Codex 或在其他窗口操作同一模型。");
