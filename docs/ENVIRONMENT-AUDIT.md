@@ -1,6 +1,19 @@
 # Environment Audit (redacted)
 
-审计时间：原始基线 2026-08-18；最新只读增量 2026-08-22（Asia/Shanghai）。本文件不含完整配置、Token、Authorization、Cookie 或 `auth.json` 内容。
+审计时间：原始基线 2026-08-18；最新只读增量 2026-08-31（Asia/Shanghai）。本文件不含完整配置、Token、Authorization、Cookie 或 `auth.json` 内容。
+
+## 2026-08-31 Qwen3.8 Flash Next / LM Studio 0.4.23 只读增量
+
+- LM Studio 正在运行的主程序文件版本为 `0.4.23.0`，`lms` CLI 为 `1.3.3`，endpoint 为 `http://127.0.0.1:1234`。native `/api/v1/models` 的唯一 loaded LLM 为 `qwen3.8-flash-next@iq4_xs`：publisher `unsloth`，format `gguf`，architecture `qwen4exp`，quantization `IQ4_XS`，loaded/max context `196608 / 262144`。
+- native loaded config 为：eval/physical batch `2048 / 512`、parallel `1`、flash attention `true`、context checkpoints `16`、MTP/simple/external speculative draft 均未启用、`num_experts=10`、KV cache GPU offload `true`。这是本轮 reload 前的权威运行时基线；后续真实切换必须逐字段复现，不能只比较 context。
+- `lms ps --json` 的 `identifier` 与逻辑 `modelKey` 均为 `qwen3.8-flash-next@iq4_xs`，但 concrete sharded identity 为 `unsloth/Qwen3.8-Flash-Next-GGUF/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf`。最终物理路径为 `J:\LM Studio Models\unsloth\Qwen3.8-Flash-Next-GGUF\Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf`；concrete identity 与规范化路径尾部一致，但不等于逻辑 source/load key。
+- GGUF metadata 只读解析结果：GGUF v3，第一 shard `10,946,624` bytes，最后写入 `2026-08-27T02:19:17.0812276Z`；源 Prompt Template SHA-256 为 `12827F24B742EA4E80CDC12DBCF9622227056B9F797252A3149263D4F9AAADCE`，可确定性生成 `qwen-interleaved-instructions-v3`，目标模板 SHA-256 为 `9DC0DA000D1DF280BE9F6F64D314EB52879C0DF5C3C951F74105964136592F85`。
+- 当前 concrete defaults 位于 `C:\Users\xr\.lmstudio\.internal\user-concrete-model-default-config\unsloth\Qwen3.8-Flash-Next-GGUF\Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf.json`，`946` bytes，SHA-256 `AD63A945C08969EA937B6E44FEB2443D25739933FB4906F2117EC126DC3DF94C`。根结构为 `preset`、`operation.fields`、`load.fields`；八个 load 字段依次保存 context、offload ratio、CPU thread pool、parallel sessions、context checkpoints、CPU expert ratio、K/V cache quant，Prompt Template 字段数为 0。
+- 使用当前生产代码对上述实物生成只读 defaults 计划成功：LM Studio version `0.4.23.0`，mutation `Add`，原字段状态 `Missing`，候选 `13,303` bytes，SHA-256 `65EC0194CCD81A21C21CEF9D1607F69C5F5A9115A393BF8204D74BEE21043011`。候选与原 JSON 的语义差异只有 `load.fields[llm.load.promptTemplate]`；计划生成后真实 defaults 仍保持原 SHA。
+- 四阶段只读探针仍准确报告 Basic/Leading/Conversation `HTTP 200`、Continuation `HTTP 500`，failure code `lmstudio-chat-template-system-order`；LM Studio Jinja 日志为 `System message must be at the beginning`。这是“检测成功并确认模板不兼容”，不是检测流程异常，也没有被测试伪装成 PASS。
+- server log 记录该 87.2 GiB 实例从 `2026-08-31 15:38:12` 开始 load，到 `15:47:03` 报告 `model loaded`，约 8 分 50 秒。因此生命周期与自动回滚预算使用 30 分钟；普通 Provider/Preview 仍为 3 分钟，四阶段请求仍逐阶段 45 秒。
+- `Category=LiveLmStudio` 且未启用 mutation 的现场回归为 `3 PASS / 0 FAIL / 2 条件不适用 SKIP`。它证明 0.4.23 Preview、逻辑 source key/concrete identity 分离、GGUF 模板和普通 Responses 发现路径；前后 loaded instance/config、defaults `946` bytes/SHA、Codex config `6,216` bytes/SHA `5C69961AB82C718BF3F25DDE2126FE32EE53081A7A692C1CC1E08679CAC0EEBD`、19 个 journal 集合完全一致，未完成 journal 数为 0。
+- 当前 Codex Desktop/CLI 仍在运行，CLI 实测版本为 `0.151.0-alpha.7.2`；真实配置仍是 implicit `openai`、model `gpt-5.6-sol`。本增量没有启动管理器 GUI、写 defaults、调用 `/load`/`/unload`、提交 Provider、写 Credential Manager 或运行 post-patch Level 3；这些必须在用户完全关闭全部 Codex 进程后用新发布工件执行。
 
 ## 2026-08-22 Unsloth Q6_K_XL 只读增量
 

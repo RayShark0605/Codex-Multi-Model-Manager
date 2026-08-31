@@ -1,6 +1,51 @@
 # Final Verification
 
-主验证日期：2026-08-22；最新增量验证：2026-08-27（Asia/Shanghai）。
+主验证日期：2026-08-22；最新增量验证：2026-08-31（Asia/Shanghai）。
+
+## 2026-08-31：LM Studio 0.4.23 / Qwen3.8 Flash Next 切换阻断修复
+
+### 根因与实现
+
+- `LmStudioPerModelDefaultsStore` 与 schema-v4 journal 读取器原先分别硬编码 `0.4.21.x`，导致 LM Studio `0.4.23.0` 在 Preview/事务建立前直接抛出 `NotSupportedException`。新增单一 `LmStudioPerModelDefaultsCompatibility` 判定，同时供计划生成、journal 重读与恢复使用；精确放行 `0.4.21.x / 0.4.23.x` 及可选纯数字 build metadata，继续拒绝 `0.4.22.x`、`0.4.24.x`、未来版本、prerelease、畸形与缺失版本。
+- schema-v4 恢复不再用 `0.4.21.x` 替代缺失的 journal 版本。缺少受支持版本、defaults SHA、concrete identity、Prompt Template ownership 或 DPAPI 证据时继续进入阻断路径，不会把无证据事务误判为合法旧版恢复。
+- 0.4.23 真实结构 fixture 覆盖 `preset`、`operation.fields` 和八个现场 load 字段。Add、No-op、带 completed provenance 的 Upgrade 以及未知自定义/重复/畸形/reparse/concurrent modification 反例均复用现有单一持久修复架构；候选只允许改变唯一 `llm.load.promptTemplate` 字段。
+- `AppComposition` 保留普通 Provider 客户端 3 分钟预算，新增只供 `LmStudioInstanceController` 使用、`AllowAutoRedirect=false` 的 30 分钟 lifecycle 客户端，并在 composition 释放时显式 Dispose。四阶段探针继续逐阶段 45 秒；自动回滚使用不继承已取消前台 token 的独立 30 分钟预算。
+- live identity 断言现明确区分逻辑 `SourceModelKey=qwen3.8-flash-next@iq4_xs` 与 concrete sharded identity `unsloth/Qwen3.8-Flash-Next-GGUF/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf`，并要求 concrete identity 与最终 GGUF 规范化路径尾部一致；没有放宽 native ID、publisher、format、architecture、quantization、context 或唯一性门槛。
+
+### 自动化与只读现场验证
+
+| 检查 | 命令 | 结果 |
+|---|---|---|
+| Core Release | `dotnet test .\tests\CodexModelManager.Tests\CodexModelManager.Tests.csproj -c Release` | **372 PASS / 0 FAIL / 8 opt-in SKIP** |
+| App Release | `dotnet test .\tests\CodexModelManager.App.Tests\CodexModelManager.App.Tests.csproj -c Release` | **14 PASS / 0 FAIL / 0 SKIP** |
+| 0.4.23 live read-only | `CMM_RUN_LIVE_LM=1` + `--filter "Category=LiveLmStudio"` | **3 PASS / 0 FAIL / 2 条件不适用 SKIP**；未运行 `LiveLmStudioMutation` |
+| Debug / Release build | `dotnet build .\CodexModelManager.sln -c Debug/Release --no-restore` | **PASS，均为 0 warning / 0 error** |
+| 格式 | `dotnet format .\CodexModelManager.sln --verify-no-changes --no-restore` | **PASS** |
+| Release build / 原子发布 | `.\publish.ps1` | **PASS，0 warning / 0 error**；脚本再次执行上述 372+14 普通回归 |
+
+普通回归合计 **386 PASS / 0 FAIL / 8 显式 opt-in SKIP**。新增版本矩阵覆盖 `0.4.21`、`0.4.21.0`、`0.4.23`、`0.4.23.0`、`0.4.23+1` 的 defaults 计划与 schema-v4 journal 重读，以及空值、畸形、prerelease、`0.4.22.0`、`0.4.24.0`、`0.5.0` 的写前拒绝。拒绝矩阵还逐项断言 defaults 字节、journal 集合、loaded instance、unload/load 计数均未变化。延迟 handler 回归证明前台 cancellation 后仍使用独立 token 完成原实例恢复并把 journal 结束为 `RolledBack`；App 回归同时读取实际普通/lifecycle 客户端 timeout，并证明 controller 接收的是 30 分钟客户端。
+
+现场只读复核确认：LM Studio `0.4.23.0`，loaded ID/source key `qwen3.8-flash-next@iq4_xs`，concrete sharded identity 与 GGUF 路径唯一匹配，loaded/max context `196608 / 262144`，architecture `qwen4exp`，quantization `IQ4_XS`。源/目标模板 SHA 分别为 `12827F24B742EA4E80CDC12DBCF9622227056B9F797252A3149263D4F9AAADCE` 与 `9DC0DA000D1DF280BE9F6F64D314EB52879C0DF5C3C951F74105964136592F85`。0.4.23 Preview 为 `Add`，原 defaults `946` bytes / `AD63A945C08969EA937B6E44FEB2443D25739933FB4906F2117EC126DC3DF94C`，内存候选 `13,303` bytes / `65EC0194CCD81A21C21CEF9D1607F69C5F5A9115A393BF8204D74BEE21043011`；测试前后真实 defaults、Codex config、loaded instance/config 和 journal 集合不变，未完成 journal 为 0。
+
+### 重新发布工件
+
+| 文件 | Bytes | Last write (Asia/Shanghai) | ProductVersion | SHA-256 |
+|---|---:|---|---|---|
+| `artifacts\publish\win-x64\CodexModelManager.exe` | 72,041,944 | `2026-08-31T20:15:41.3099917+08:00` | `1.0.0+2d93dfb7fa45f3933b24f9781a546517e69402b0` | `35110C743860DB6AF448E65FB23E89F9C32BEF1817003330698D8E5EC5A30C7C` |
+| `artifacts\publish\win-x64\helpers\credential\CodexModelManager.CredentialHelper.exe` | 35,486,698 | `2026-08-31T20:15:45.2172362+08:00` | `1.0.0+2d93dfb7fa45f3933b24f9781a546517e69402b0` | `B2547B91E4821416902F0DDA175B9A64ED837D082BD11E69210A8F2E4CBBEF1F` |
+| `artifacts\publish\win-x64\helpers\mcp\CodexModelManager.TestMcpServer.exe` | 35,092,933 | `2026-08-31T20:15:48.8990124+08:00` | `1.0.0+2d93dfb7fa45f3933b24f9781a546517e69402b0` | `1B9759818881B8C2527A0F11B11491FD39C49C8347E01D1EFA2DEFB62A0693C6` |
+
+发布 staging 已清理，发布后 `CodexModelManager` 进程数为 0。上表三个工件已于 2026-08-31 20:15 从已提交源码 `2d93dfb7fa45f3933b24f9781a546517e69402b0` 重新原子发布，ProductVersion 与该提交一致；较早的 `1.0.0+f0eca617…` 三工件构建自同一批源码改动但当时改动尚未提交，现已被上表工件替换。
+
+### 提交记录
+
+- `2d93dfb7fa45f3933b24f9781a546517e69402b0`：`fix: 兼容 LM Studio 0.4.23 并为大模型 unload/load 放宽生命周期预算`，只包含源码与 Core/App 回归；提交后重跑 `dotnet build -c Debug`/`-c Release`（均 0 warning / 0 error）与 `publish.ps1`（内含 372+14 回归）全通过，`dotnet format --verify-no-changes` 亦 PASS。
+- 紧随其后的文档提交只更新 `README.md` 与 `docs/`，不再改动源码、测试或发布脚本。
+- 两次提交都只在本地 `master`（仓库未配置 remote，因此不存在推送）；未执行 push、reset、rebase 或历史改写。根目录误生成的 `nul` 继续由 `.gitignore` 精确忽略，删除 Windows 保留名需要 `\\?\` 前缀，本轮未强行处理。
+
+### 当前验收边界
+
+代码、自动化、0.4.23 Preview、只读现场不变量与新发布工件均已验证。当前 Codex Desktop/CLI 仍在运行，因此产品门禁正确阻止真实 defaults 写入和 unload/load；尚未执行唯一一次正式 GUI Switch、`Completed / PersistentDefaultVerified` journal、重启管理器后的持久 v3 识别、post-patch 四阶段全 200 与隔离 Level 3 Codex Agent smoke。当前结论必须保持：**版本阻断与长生命周期超时已修复并发布；最终 Provider 切换端到端验收等待用户完全关闭 Codex 后执行**。提交时点 LM Studio Server 仍在线但 native `/api/v1/models` 已无 loaded LLM，因此本回合未重复 live 只读回归；上文 17:09 的现场只读证据是在 `qwen3.8-flash-next@iq4_xs` 已加载状态下取得的，重跑 live 只读或正式切换都需要先重新加载该 concrete 分片模型。
 
 ## 2026-08-27：目录整理与提交前回归
 
