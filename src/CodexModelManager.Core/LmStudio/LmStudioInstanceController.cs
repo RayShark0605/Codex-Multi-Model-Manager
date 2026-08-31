@@ -9,6 +9,7 @@ namespace CodexModelManager.Core.LmStudio;
 
 public sealed class LmStudioInstanceController : ILmStudioInstanceController
 {
+    internal static readonly TimeSpan AutomaticRollbackTimeout = TimeSpan.FromMinutes(30);
     private readonly LmStudioClient client;
     private readonly Uri endpoint;
     private readonly bool requiresAuthentication;
@@ -56,6 +57,7 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
     }
 
     public event EventHandler<string>? ProgressChanged;
+    internal TimeSpan RequestTimeout => httpClient.Timeout;
 
     public void Dispose()
     {
@@ -220,7 +222,7 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
                 ReportProgress(plan.OriginalRuntimeTemplate.Mode == LmStudioRuntimeTemplateMode.ManagerRule
                     ? $"修复失败：正在事务式恢复原运行时规则 {plan.OriginalRuntimeTemplate.RuleVersion}"
                     : "修复失败：正在事务式恢复原始内置模板");
-                using var rollbackTimeout = new CancellationTokenSource(TimeSpan.FromMinutes(5));
+                using var rollbackTimeout = new CancellationTokenSource(AutomaticRollbackTimeout);
                 LmStudioRollbackResult rollback = await RollbackCoreAsync(
                     plan.OriginalInstance,
                     plan.TransactionId,

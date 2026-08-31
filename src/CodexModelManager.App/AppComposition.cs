@@ -11,8 +11,11 @@ namespace CodexModelManager.App;
 
 internal sealed class AppComposition : IDisposable
 {
+    internal static readonly TimeSpan ProviderRequestTimeout = TimeSpan.FromMinutes(3);
+    internal static readonly TimeSpan LmStudioLifecycleRequestTimeout = TimeSpan.FromMinutes(30);
     private readonly IAppLogger logger;
-    private readonly HttpClient providerHttpClient = new(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromMinutes(3) };
+    private readonly HttpClient providerHttpClient = new(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = ProviderRequestTimeout };
+    private readonly HttpClient lmStudioLifecycleHttpClient = new(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = LmStudioLifecycleRequestTimeout };
     private readonly HttpClient catalogHttpClient = new() { Timeout = TimeSpan.FromSeconds(20) };
 
     public AppComposition()
@@ -63,11 +66,13 @@ internal sealed class AppComposition : IDisposable
     public LmStudioTemplateTransactionStore TemplateTransactions { get; }
     public LmStudioPerModelDefaultsStore PerModelDefaults { get; }
     public ConfigurationSwitchService Switches { get; }
+    internal TimeSpan ProviderHttpClientTimeout => providerHttpClient.Timeout;
+    internal TimeSpan LmStudioLifecycleHttpClientTimeout => lmStudioLifecycleHttpClient.Timeout;
 
     public LmStudioInstanceController CreateLmStudioInstanceController(Uri endpoint, bool requiresAuthentication) => new(
         endpoint,
         requiresAuthentication,
-        providerHttpClient,
+        lmStudioLifecycleHttpClient,
         requiresAuthentication ? ReadLmStudioSecretSafely : null,
         RuntimeProbe,
         GgufReader,
@@ -93,6 +98,7 @@ internal sealed class AppComposition : IDisposable
             disposableLogger.Dispose();
         }
         providerHttpClient.Dispose();
+        lmStudioLifecycleHttpClient.Dispose();
         catalogHttpClient.Dispose();
     }
 

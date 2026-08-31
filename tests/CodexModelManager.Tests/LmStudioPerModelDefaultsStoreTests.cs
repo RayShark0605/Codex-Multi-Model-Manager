@@ -10,6 +10,48 @@ namespace CodexModelManager.Tests;
 
 public sealed class LmStudioPerModelDefaultsStoreTests
 {
+    [Theory]
+    [InlineData("0.4.21")]
+    [InlineData("0.4.21.0")]
+    [InlineData("0.4.21+2")]
+    [InlineData("0.4.23")]
+    [InlineData("0.4.23.0")]
+    [InlineData("0.4.23+1")]
+    [InlineData("0.4.23.0+1")]
+    public async Task VerifiedVersionFamiliesCreateReadOnlyPlans(string version)
+    {
+        using var fixture = CreateFixture();
+        byte[] original = await File.ReadAllBytesAsync(fixture.DefaultsPath);
+
+        LmStudioPerModelDefaultsPlan plan = await fixture.CreatePlanAsync(version: version);
+
+        Assert.Equal(version, plan.LmStudioVersion);
+        Assert.Equal(LmStudioPerModelDefaultsMutation.Add, plan.Mutation);
+        Assert.Equal(original, await File.ReadAllBytesAsync(fixture.DefaultsPath));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("not-a-version")]
+    [InlineData("0.4.23-alpha")]
+    [InlineData("0.4.23+build")]
+    [InlineData("0.4.23+1+2")]
+    [InlineData("0.4.20.0")]
+    [InlineData("0.4.22.0")]
+    [InlineData("0.4.24.0")]
+    [InlineData("0.5.0")]
+    public async Task UnverifiedVersionsAreRejectedBeforeAnyDefaultsMutation(string? version)
+    {
+        using var fixture = CreateFixture();
+        byte[] original = await File.ReadAllBytesAsync(fixture.DefaultsPath);
+
+        NotSupportedException exception = await Assert.ThrowsAsync<NotSupportedException>(() => fixture.CreatePlanAsync(version: version));
+
+        Assert.Contains("0.4.21.x / 0.4.23.x", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(original, await File.ReadAllBytesAsync(fixture.DefaultsPath));
+    }
+
     [Fact]
     public async Task MissingPromptFieldCreatesExactV3CandidateAndPreservesAllOtherSemantics()
     {
@@ -238,8 +280,8 @@ public sealed class LmStudioPerModelDefaultsStoreTests
     private static StoreFixture CreateFixture()
     {
         var temporary = new TemporaryDirectory();
-        const string concrete = "esatapedico/Qwen3.8-27B-NVFP4-MTP-GGUF/Qwen3.8-27B-NVFP4-MTP-HIGHEST.gguf";
-        string gguf = Path.Combine(temporary.Path, "models", "Qwen3.8-27B-NVFP4-MTP-HIGHEST.gguf");
+        const string concrete = "unsloth/Qwen3.8-Flash-Next-GGUF/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf";
+        string gguf = Path.Combine(temporary.Path, "models", "Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf");
         Directory.CreateDirectory(Path.GetDirectoryName(gguf)!);
         File.WriteAllBytes(gguf, "dummy"u8.ToArray());
         const string template = SupportedTemplate;
@@ -269,6 +311,14 @@ public sealed class LmStudioPerModelDefaultsStoreTests
             {
                 ["fields"] = new JsonArray
                 {
+                    new JsonObject { ["key"] = "llm.load.contextLength", ["value"] = 196_608 },
+                    new JsonObject { ["key"] = "llm.load.llama.acceleration.offloadRatio", ["value"] = 1 },
+                    new JsonObject { ["key"] = "llm.load.llama.cpuThreadPoolSize", ["value"] = 16 },
+                    new JsonObject { ["key"] = "llm.load.numParallelSessions", ["value"] = 1 },
+                    new JsonObject { ["key"] = "llm.load.llama.contextCheckpoints", ["value"] = 16 },
+                    new JsonObject { ["key"] = "llm.load.numCpuExpertLayersRatio", ["value"] = 0.7083333333333334 },
+                    new JsonObject { ["key"] = "llm.load.llama.kCacheQuantizationType", ["value"] = new JsonObject { ["checked"] = true, ["value"] = "q8_0" } },
+                    new JsonObject { ["key"] = "llm.load.llama.vCacheQuantizationType", ["value"] = new JsonObject { ["checked"] = true, ["value"] = "q8_0" } },
                     new JsonObject { ["key"] = "llm.load.llama.evalBatchSize", ["value"] = 2048 },
                     new JsonObject { ["key"] = "unknown.future.setting", ["value"] = new JsonObject { ["nested"] = true } },
                 },

@@ -13,6 +13,12 @@ namespace CodexModelManager.Tests;
 public sealed class LmStudioInstanceControllerTests
 {
     [Fact]
+    public void AutomaticRollbackBudgetCoversLargeModelReloads()
+    {
+        Assert.Equal(TimeSpan.FromMinutes(30), LmStudioInstanceController.AutomaticRollbackTimeout);
+    }
+
+    [Fact]
     public async Task ApplyUsesPatchedObjectPreservesConfigAndCanCompleteTransaction()
     {
         using var fixture = new ControllerFixture(hierarchyPasses: true);
@@ -279,6 +285,26 @@ public sealed class LmStudioInstanceControllerTests
         Assert.Equal("qwen/root:3", fixture.Handler.CurrentInstanceId);
         LmStudioTemplateTransactionRecord record = Assert.IsType<LmStudioTemplateTransactionRecord>(await fixture.Store.ReadAsync(plan.TransactionId));
         Assert.Equal(LmStudioTemplateTransactionState.RolledBack, record.State);
+    }
+
+    [Fact]
+    public async Task CallerCancellationDuringPatchLoadUsesIndependentAutomaticRollbackToken()
+    {
+        using var fixture = new ControllerFixture(hierarchyPasses: true);
+        fixture.Handler.FirstLoadDelay = TimeSpan.FromSeconds(2);
+        LmStudioLoadedInstanceSnapshot original = await fixture.Controller.CaptureAsync(ControllerFixture.OriginalInstanceId);
+        LmStudioTemplateRepairPlan plan = fixture.CreatePlan(original);
+        using var cancellation = new CancellationTokenSource();
+
+        Task<LmStudioTemplateRepairResult> applying = fixture.Controller.ApplyTemplateAsync(plan, cancellation.Token);
+        await fixture.Handler.FirstLoadStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        cancellation.Cancel();
+        LmStudioTemplateApplyException exception = await Assert.ThrowsAsync<LmStudioTemplateApplyException>(() => applying);
+
+        Assert.True(exception.Rollback.Succeeded, exception.Rollback.Detail);
+        Assert.Equal("qwen/root:3", exception.Rollback.RestoredInstance?.InstanceId);
+        Assert.Equal(2, fixture.Handler.LoadBodies.Count);
+        Assert.Equal(LmStudioTemplateTransactionState.RolledBack, (await fixture.Store.ReadAsync(plan.TransactionId))?.State);
     }
 
     [Fact]
@@ -751,6 +777,55 @@ public sealed class LmStudioInstanceControllerTests
         Assert.Contains("patched-template", await File.ReadAllTextAsync(fixture.DefaultsPath), StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData("0.4.21")]
+    [InlineData("0.4.21.0")]
+    [InlineData("0.4.23")]
+    [InlineData("0.4.23.0")]
+    [InlineData("0.4.23+1")]
+    public async Task SchemaV4SupportedVersionsJournalRoundTripAndComplete(string version)
+    {
+        using var fixture = new ControllerFixture(hierarchyPasses: true, lmStudioVersion: version);
+        LmStudioLoadedInstanceSnapshot original = await fixture.Controller.CaptureAsync(ControllerFixture.OriginalInstanceId);
+        LmStudioTemplateRepairPlan plan = await fixture.CreatePersistentPlanAsync(original);
+
+        LmStudioTemplateRepairResult applied = await fixture.Controller.ApplyTemplateAsync(plan);
+        LmStudioTemplateTransactionRecord pending = Assert.IsType<LmStudioTemplateTransactionRecord>(await fixture.Store.ReadAsync(plan.TransactionId));
+        LmStudioDefaultsRestoreResult missingVersion = await fixture.DefaultsStore.RestoreFromTransactionAsync(pending with { LmStudioVersion = null }, fixture.Analysis);
+        await fixture.Controller.CompleteAsync(plan.TransactionId);
+        LmStudioTemplateTransactionRecord completed = Assert.IsType<LmStudioTemplateTransactionRecord>(await fixture.Store.ReadAsync(plan.TransactionId));
+
+        Assert.Equal(version, pending.LmStudioVersion);
+        Assert.False(missingVersion.Succeeded);
+        Assert.True(missingVersion.RecoveryBlocked);
+        Assert.Contains("版本", missingVersion.Detail, StringComparison.Ordinal);
+        Assert.Equal(4, pending.SchemaVersion);
+        Assert.Equal(LmStudioTemplateTransactionState.PatchedAndVerified, pending.State);
+        Assert.Equal(LmStudioTemplateTransactionState.Completed, completed.State);
+        Assert.Equal(LmStudioPersistenceStage.PersistentDefaultVerified, completed.PersistenceStage);
+        Assert.Equal(applied.PatchedInstance.InstanceId, completed.PatchedInstanceId);
+    }
+
+    [Theory]
+    [InlineData("0.4.22.0")]
+    [InlineData("0.4.23-alpha")]
+    [InlineData("0.4.24.0")]
+    [InlineData("0.5.0")]
+    public async Task UnsupportedPersistenceVersionsLeaveDefaultsJournalsAndLoadedStateUntouched(string version)
+    {
+        using var fixture = new ControllerFixture(hierarchyPasses: true, lmStudioVersion: version);
+        byte[] defaultsBefore = await File.ReadAllBytesAsync(fixture.DefaultsPath);
+        LmStudioLoadedInstanceSnapshot original = await fixture.Controller.CaptureAsync(ControllerFixture.OriginalInstanceId);
+
+        await Assert.ThrowsAsync<NotSupportedException>(() => fixture.CreatePersistentPlanAsync(original));
+
+        Assert.Equal(defaultsBefore, await File.ReadAllBytesAsync(fixture.DefaultsPath));
+        Assert.Empty(await fixture.Store.ListAllAsync());
+        Assert.Equal(ControllerFixture.OriginalInstanceId, fixture.Handler.CurrentInstanceId);
+        Assert.Equal(0, fixture.Handler.UnloadCount);
+        Assert.Empty(fixture.Handler.LoadBodies);
+    }
+
     [Fact]
     public async Task SchemaV4RollbackRestoresDefaultsBeforeExplicitBuiltInReload()
     {
@@ -1020,6 +1095,7 @@ public sealed class LmStudioInstanceControllerTests
         private readonly StubTemplateRepair repair;
         private readonly bool codexRunning;
         private readonly FixedModelFileLocator modelFileLocator;
+        private readonly string lmStudioVersion;
 
         public ControllerFixture(
             bool hierarchyPasses,
@@ -1030,9 +1106,11 @@ public sealed class LmStudioInstanceControllerTests
             bool firstLoadWithoutSuffix = false,
             int? remainingTtlSeconds = null,
             int? firstReloadedTtlSeconds = null,
-            bool codexRunning = false)
+            bool codexRunning = false,
+            string lmStudioVersion = "0.4.21.0")
         {
             this.codexRunning = codexRunning;
+            this.lmStudioVersion = lmStudioVersion;
             string ggufPath = Path.Combine(temporary.Path, "model.gguf");
             File.WriteAllText(ggufPath, "fixture", new UTF8Encoding(false));
             FileInfo file = new(ggufPath);
@@ -1099,7 +1177,7 @@ public sealed class LmStudioInstanceControllerTests
                 Store,
                 new FakeLogger(),
                 DefaultsStore,
-                () => "0.4.21.0",
+                () => lmStudioVersion,
                 modelFileLocator);
 
         public string GgufPath { get; }
@@ -1127,7 +1205,7 @@ public sealed class LmStudioInstanceControllerTests
         {
             LmStudioPerModelDefaultsPlan defaults = await DefaultsStore.CreatePlanAsync(
                 original.Endpoint,
-                "0.4.21.0",
+                lmStudioVersion,
                 Resolution,
                 Analysis,
                 Preview,
@@ -1136,7 +1214,7 @@ public sealed class LmStudioInstanceControllerTests
             {
                 ModelFile = Resolution,
                 PersistentDefaults = defaults,
-                LmStudioVersion = "0.4.21.0",
+                LmStudioVersion = lmStudioVersion,
             };
         }
 
@@ -1196,7 +1274,7 @@ public sealed class LmStudioInstanceControllerTests
             await File.WriteAllTextAsync(DefaultsPath, defaultsRoot.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
             LmStudioPerModelDefaultsPlan defaults = await DefaultsStore.CreatePlanAsync(
                 original.Endpoint,
-                "0.4.21.0",
+                lmStudioVersion,
                 Resolution,
                 Analysis,
                 Preview,
@@ -1205,7 +1283,7 @@ public sealed class LmStudioInstanceControllerTests
             {
                 ModelFile = Resolution,
                 PersistentDefaults = defaults,
-                LmStudioVersion = "0.4.21.0",
+                LmStudioVersion = lmStudioVersion,
             };
         }
 
@@ -1290,6 +1368,8 @@ public sealed class LmStudioInstanceControllerTests
         public string CurrentSelectedVariant { get; set; } = "qwen/root@q8_0";
         public string? SelectedVariantAfterNextUnload { get; set; }
         public bool FirstLoadOmitsInstanceId { get; set; }
+        public TimeSpan FirstLoadDelay { get; set; }
+        public TaskCompletionSource FirstLoadStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public void SimulateNoLoadedInstance()
         {
@@ -1364,6 +1444,14 @@ public sealed class LmStudioInstanceControllerTests
                     ? ttl
                     : null;
                 loadCount++;
+                if (loadCount == 1)
+                {
+                    FirstLoadStarted.TrySetResult();
+                    if (FirstLoadDelay > TimeSpan.Zero)
+                    {
+                        await Task.Delay(FirstLoadDelay, cancellationToken);
+                    }
+                }
                 if (loadCount == 1 && firstLoadFails || loadCount == 2 && secondLoadFails)
                 {
                     CurrentInstanceId = null;

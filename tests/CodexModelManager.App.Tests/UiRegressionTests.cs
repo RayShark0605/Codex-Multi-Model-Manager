@@ -10,6 +10,20 @@ namespace CodexModelManager.App.Tests;
 public sealed class UiRegressionTests
 {
     [Fact]
+    public void ProviderAndLmStudioLifecycleTimeoutBudgetsRemainSeparated()
+    {
+        using var temporary = new TemporaryDirectory();
+        using var composition = new AppComposition(new AppPaths(temporary.Path), new ThrowingSecretStore(), new RecordingLogger());
+        using var controller = composition.CreateLmStudioInstanceController(new Uri("http://127.0.0.1:1234"), requiresAuthentication: false);
+
+        Assert.Equal(TimeSpan.FromMinutes(3), AppComposition.ProviderRequestTimeout);
+        Assert.Equal(TimeSpan.FromMinutes(30), AppComposition.LmStudioLifecycleRequestTimeout);
+        Assert.Equal(AppComposition.ProviderRequestTimeout, composition.ProviderHttpClientTimeout);
+        Assert.Equal(AppComposition.LmStudioLifecycleRequestTimeout, composition.LmStudioLifecycleHttpClientTimeout);
+        Assert.Equal(AppComposition.LmStudioLifecycleRequestTimeout, controller.RequestTimeout);
+    }
+
+    [Fact]
     public Task MainOperationPanelsDockAboveTheirTables() => StaTest.RunAsync(() =>
     {
         using var current = new CurrentSwitchControl { Size = new Size(1_000, 800) };

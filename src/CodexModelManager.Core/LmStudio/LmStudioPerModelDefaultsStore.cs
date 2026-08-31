@@ -385,9 +385,10 @@ public sealed class LmStudioPerModelDefaultsStore
             string.IsNullOrWhiteSpace(record.TargetPersistentTemplateSha256) ||
             string.IsNullOrWhiteSpace(record.CandidateDefaultsSha256) ||
             string.IsNullOrWhiteSpace(record.EncryptedDefaultsBackupPath) ||
-            string.IsNullOrWhiteSpace(record.DefaultsBackupPlaintextSha256))
+            string.IsNullOrWhiteSpace(record.DefaultsBackupPlaintextSha256) ||
+            !LmStudioPerModelDefaultsCompatibility.IsSupportedVersion(record.LmStudioVersion))
         {
-            return new LmStudioDefaultsRestoreResult(false, true, "schema-v4 事务缺少持久 defaults 恢复证据。");
+            return new LmStudioDefaultsRestoreResult(false, true, "schema-v4 事务缺少受支持的 LM Studio 版本或持久 defaults 恢复证据。");
         }
 
         string expectedPath;
@@ -453,7 +454,7 @@ public sealed class LmStudioPerModelDefaultsStore
         var plan = new LmStudioPerModelDefaultsPlan(
             record.ConcreteModelIdentifier,
             expectedPath,
-            record.LmStudioVersion ?? "0.4.21.x",
+            record.LmStudioVersion!,
             record.OriginalDefaultsFingerprint,
             FingerprintCandidate(candidateBytes),
             record.OriginalPersistentTemplateState.Value,
@@ -732,9 +733,9 @@ public sealed class LmStudioPerModelDefaultsStore
             throw new InvalidOperationException("仅本机 loopback LM Studio 允许自动写入 per-model defaults。");
         }
 
-        if (!Version.TryParse(lmStudioVersion, out Version? version) || version.Major != 0 || version.Minor != 4 || version.Build != 21)
+        if (!LmStudioPerModelDefaultsCompatibility.IsSupportedVersion(lmStudioVersion))
         {
-            throw new NotSupportedException($"LM Studio {lmStudioVersion ?? "unknown"} 的 per-model defaults 格式未经验证；当前仅支持 0.4.21.x。");
+            throw new NotSupportedException($"LM Studio {lmStudioVersion ?? "unknown"} 的 per-model defaults 格式未经验证；当前仅支持 {LmStudioPerModelDefaultsCompatibility.SupportedVersionFamilies}。");
         }
     }
 

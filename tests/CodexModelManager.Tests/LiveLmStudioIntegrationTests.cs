@@ -73,12 +73,16 @@ public sealed class LiveLmStudioIntegrationTests
     [Trait("Category", "LiveLmStudio")]
     public async Task CurrentLoadedLmStudioModelResolvesExactVariantGguf()
     {
+        const string expectedSourceModelKey = "qwen3.8-flash-next@iq4_xs";
+        const string expectedConcreteIdentifier = "unsloth/Qwen3.8-Flash-Next-GGUF/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf";
         Assert.SkipUnless(string.Equals(Environment.GetEnvironmentVariable("CMM_RUN_LIVE_LM"), "1", StringComparison.Ordinal), "Set CMM_RUN_LIVE_LM=1 to run the live LM Studio test.");
         using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(3) };
         var client = new LmStudioClient(new Uri("http://127.0.0.1:1234"), null, http);
-        ModelProfile? loaded = (await client.DiscoverNativeModelsAsync(TestContext.Current.CancellationToken))
-            .FirstOrDefault(model => model.IsLoaded == true && model.ModelType == "llm");
-        Assert.NotNull(loaded);
+        ModelProfile loaded = Assert.Single(
+            await client.DiscoverNativeModelsAsync(TestContext.Current.CancellationToken),
+            model => model.IsLoaded == true &&
+                model.ModelType == "llm" &&
+                string.Equals(model.SourceModelKey, expectedSourceModelKey, StringComparison.OrdinalIgnoreCase));
 
         var locator = new LmStudioModelFileLocator();
         LmStudioModelFileResolutionAttempt attempt = await locator.ResolveAsync(
@@ -94,7 +98,12 @@ public sealed class LiveLmStudioIntegrationTests
         Assert.Equal(loaded.SelectedVariant, resolution.SelectedVariant, ignoreCase: true);
         Assert.Equal(loaded.Quantization, resolution.Quantization, ignoreCase: true);
         Assert.NotNull(resolution.ConcreteModelIdentifier);
-        Assert.Equal(loaded.SourceModelKey!.Replace('\\', '/').TrimStart('.', '/'), resolution.ConcreteModelIdentifier, ignoreCase: true);
+        string concreteIdentifier = resolution.ConcreteModelIdentifier.Replace('\\', '/').TrimStart('.', '/');
+        string normalizedFilePath = Path.GetFullPath(resolution.FilePath).Replace('\\', '/');
+        Assert.Equal(expectedSourceModelKey, loaded.SourceModelKey, ignoreCase: true);
+        Assert.Equal(expectedConcreteIdentifier, concreteIdentifier, ignoreCase: true);
+        Assert.EndsWith(concreteIdentifier, normalizedFilePath, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(Path.GetFileName(resolution.FilePath), Path.GetFileName(concreteIdentifier), ignoreCase: true);
         GgufChatTemplateAnalysis analysis = await new GgufChatTemplateReader().ReadAsync(resolution.FilePath, TestContext.Current.CancellationToken);
         Assert.Equal(loaded.Architecture, analysis.Architecture, ignoreCase: true);
         Assert.Equal(PromptTemplateRepairStatus.Supported, new PromptTemplateRepairService().CreatePreview(analysis).Status);

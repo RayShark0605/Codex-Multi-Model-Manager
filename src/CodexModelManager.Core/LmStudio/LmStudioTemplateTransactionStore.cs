@@ -239,8 +239,7 @@ public sealed class LmStudioTemplateTransactionStore
 
     private bool ValidV4Persistence(LmStudioTemplateTransactionRecord record)
     {
-        bool supportedVersion = Version.TryParse(record.LmStudioVersion, out Version? version) &&
-            version.Major == 0 && version.Minor == 4 && version.Build == 21;
+        bool supportedVersion = LmStudioPerModelDefaultsCompatibility.IsSupportedVersion(record.LmStudioVersion);
         if (string.IsNullOrWhiteSpace(record.ConcreteModelIdentifier) ||
             Path.IsPathFullyQualified(record.ConcreteModelIdentifier) ||
             !record.ConcreteModelIdentifier.EndsWith(".gguf", StringComparison.OrdinalIgnoreCase) ||
