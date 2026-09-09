@@ -1,5 +1,47 @@
 using System.Text.Json;
 
+if (args.Contains("--process-fixture-hold-pipes", StringComparer.Ordinal))
+{
+    await Task.Delay(TimeSpan.FromSeconds(4));
+    return;
+}
+
+if (args.Contains("--process-fixture-inherited-pipes", StringComparer.Ordinal))
+{
+    var start = new System.Diagnostics.ProcessStartInfo(Environment.ProcessPath!)
+    {
+        UseShellExecute = false,
+        CreateNoWindow = true,
+        RedirectStandardInput = true,
+    };
+    if (string.Equals(Path.GetFileNameWithoutExtension(Environment.ProcessPath), "dotnet", StringComparison.OrdinalIgnoreCase))
+    {
+        start.ArgumentList.Add(typeof(Program).Assembly.Location);
+    }
+    start.ArgumentList.Add("--process-fixture-hold-pipes");
+    using System.Diagnostics.Process child = System.Diagnostics.Process.Start(start) ?? throw new InvalidOperationException("无法启动有界 pipe fixture。");
+    child.StandardInput.Close();
+    Console.WriteLine("codex-cli 1.2.3");
+    return;
+}
+
+if (args.Contains("--process-fixture-large-stdout", StringComparer.Ordinal) || args.Contains("--process-fixture-large-stderr", StringComparer.Ordinal))
+{
+    TextWriter output = args.Contains("--process-fixture-large-stderr", StringComparer.Ordinal) ? Console.Error : Console.Out;
+    await output.WriteAsync(new string('x', 512 * 1024));
+    await output.FlushAsync();
+    return;
+}
+
+if (args.Contains("--process-fixture-combined-output", StringComparer.Ordinal))
+{
+    await Console.Out.WriteAsync(new string('x', 192 * 1024));
+    await Console.Out.FlushAsync();
+    await Console.Error.WriteAsync(new string('y', 192 * 1024));
+    await Console.Error.FlushAsync();
+    return;
+}
+
 if (args.Contains("--emit-utf8-fixture", StringComparer.Ordinal))
 {
     Console.OutputEncoding = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false);

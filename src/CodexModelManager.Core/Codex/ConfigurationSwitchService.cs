@@ -92,6 +92,18 @@ public sealed class ConfigurationSwitchService
         return await CreatePlanCoreAsync(effectiveRequest, preflight, cancellationToken).ConfigureAwait(false);
     }
 
+    // Only for the combined repair confirmation; this does not authorize a commit.
+    // CommitAsync always repeats the live compatibility gate, including for this plan.
+    internal Task<SwitchPlan> CreateRepairPreviewAsync(SwitchRequest request, CodexInstructionHierarchyProbeResult failure, CancellationToken cancellationToken = default)
+    {
+        if (request.TargetProvider != ProviderKind.LmStudio || failure.IsCompatible || failure.FailureCode is not
+            (CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder or CompatibilityFailureCodes.LmStudioChatTemplateDeveloperRole or CompatibilityFailureCodes.LmStudioChatTemplateContinuationInstructionOrder))
+        {
+            throw new InvalidOperationException("只有待修复的 LM Studio 请求可以生成修复预览。");
+        }
+        return CreatePlanCoreAsync(NormalizeSwitchRequest(request), failure, cancellationToken);
+    }
+
     private async Task<SwitchPlan> CreatePlanCoreAsync(
         SwitchRequest request,
         CodexInstructionHierarchyProbeResult? preflight,
@@ -104,7 +116,18 @@ public sealed class ConfigurationSwitchService
         ConfigReadResult read = patchEngine.Read(source.Text);
         ProviderKind sourceProvider = CodexRuntimeProbe.ParseProvider(CodexRuntimeProbe.Unquote(read.RootValues.GetValueOrDefault("model_provider")) ?? "openai");
         string? sourceModel = CodexRuntimeProbe.Unquote(read.RootValues.GetValueOrDefault("model"));
+        string settingsPath = Path.GetFullPath(settingsRepository.SettingsPath);
+        FileFingerprint settingsFingerprint = await FileFingerprintService.CaptureAsync(settingsPath, cancellationToken).ConfigureAwait(false);
         AppSettings settings = await settingsRepository.LoadAsync(cancellationToken).ConfigureAwait(false);
+        if (!FileFingerprintService.Matches(settingsFingerprint, await FileFingerprintService.CaptureAsync(settingsPath, cancellationToken).ConfigureAwait(false)))
+        {
+            throw new IOException("生成预览期间应用设置发生变化，请重新预览。");
+        }
+        Dictionary<string, FileFingerprint> readFingerprints = new(StringComparer.OrdinalIgnoreCase)
+        {
+            [Path.GetFullPath(configPath)] = source.Fingerprint,
+            [settingsPath] = settingsFingerprint,
+        };
         List<string> warnings = [];
         IReadOnlyList<SecondaryModelOverride> overrides = await overrideScanner.ScanAsync(configPath, cancellationToken).ConfigureAwait(false);
 
@@ -162,6 +185,7 @@ public sealed class ConfigurationSwitchService
         {
             TextFileSnapshot external = await TextFileCodec.ReadAsync(filePath, cancellationToken).ConfigureAwait(false);
             if (!external.Fingerprint.Exists) throw new IOException($"选中的 Secondary Override 配置已不存在: {filePath}");
+            readFingerprints[Path.GetFullPath(filePath)] = external.Fingerprint;
             patchEngine.Validate(external.Text);
             (string externalCandidate, IReadOnlyList<ConfigMutation> externalMutations) = SecondaryOverridePatcher.Apply(external.Text, replacements);
             if (externalMutations.Count == 0) continue;
@@ -190,7 +214,7 @@ public sealed class ConfigurationSwitchService
             warnings.Add("主模型将切换为本地模型，但 Secondary Model Overrides 仍可能访问云 Provider。");
         }
 
-        return new SwitchPlan(
+        SwitchPlan plan = new(
             Guid.NewGuid(),
             DateTimeOffset.Now,
             request,
@@ -202,7 +226,12 @@ public sealed class ConfigurationSwitchService
             overrides,
             patch.Preservation,
             planHash,
-            preflight);
+            preflight)
+        {
+            ReadFingerprints = readFingerprints,
+        };
+        await VerifyConfirmationAsync(plan, cancellationToken).ConfigureAwait(false);
+        return plan;
     }
 
     public async Task CommitAsync(SwitchPlan preview, CancellationToken cancellationToken = default)
@@ -213,7 +242,7 @@ public sealed class ConfigurationSwitchService
             throw new InvalidOperationException("检测到 Codex/ChatGPT Desktop 或 codex 子进程仍在运行。请完全关闭后重新检测。");
         }
 
-        await VerifyPreviewFingerprintsAsync(preview.Files, cancellationToken).ConfigureAwait(false);
+        await VerifyConfirmationAsync(preview, cancellationToken).ConfigureAwait(false);
         SwitchRequest effectiveRequest = NormalizeSwitchRequest(preview.Request);
         CodexInstructionHierarchyProbeResult? preflight = await EnsureLmStudioPreflightAsync(effectiveRequest, cancellationToken).ConfigureAwait(false);
         SwitchPlan regenerated = await CreatePlanCoreAsync(effectiveRequest, preflight, cancellationToken).ConfigureAwait(false);
@@ -221,6 +250,7 @@ public sealed class ConfigurationSwitchService
         {
             throw new IOException("配置文件在预览后发生变化，请重新加载并再次预览。");
         }
+        await VerifyConfirmationAsync(preview, cancellationToken).ConfigureAwait(false);
 
         string configPath = Path.GetFullPath(Path.Combine(homeProvider.GetCodexHome(), "config.toml"));
         string[] supplementalFiles = regenerated.Files
@@ -283,7 +313,7 @@ public sealed class ConfigurationSwitchService
 
         byte[] settingsBytes = AppSettingsRepository.Serialize(settings);
         string settingsPath = settingsRepository.SettingsPath;
-        FileFingerprint settingsFingerprint = await FileFingerprintService.CaptureAsync(settingsPath, cancellationToken).ConfigureAwait(false);
+        FileFingerprint settingsFingerprint = regenerated.ReadFingerprints![Path.GetFullPath(settingsPath)];
         var settingsChange = new PlannedFileChange(
             settingsPath,
             settingsFingerprint,
@@ -294,20 +324,32 @@ public sealed class ConfigurationSwitchService
                 using JsonDocument _ = JsonDocument.Parse(bytes);
                 return ValueTask.CompletedTask;
             });
+        await VerifyConfirmationAsync(regenerated, cancellationToken).ConfigureAwait(false);
         await writer.WriteAsync([.. regenerated.Files, settingsChange], cancellationToken).ConfigureAwait(false);
     }
 
-    private static async Task VerifyPreviewFingerprintsAsync(
-        IReadOnlyList<PlannedFileChange> files,
-        CancellationToken cancellationToken)
+    internal static async Task VerifyConfirmationAsync(SwitchPlan plan, CancellationToken cancellationToken = default)
     {
-        foreach (PlannedFileChange file in files)
+        ArgumentNullException.ThrowIfNull(plan);
+        Dictionary<string, FileFingerprint> fingerprints = new(StringComparer.OrdinalIgnoreCase);
+        if (plan.ReadFingerprints is not null)
         {
-            FileFingerprint actual = await FileFingerprintService.CaptureAsync(file.Path, cancellationToken).ConfigureAwait(false);
-            if (!FileFingerprintService.Matches(file.ExpectedFingerprint, actual))
+            foreach ((string path, FileFingerprint fingerprint) in plan.ReadFingerprints) fingerprints[Path.GetFullPath(path)] = fingerprint;
+        }
+        foreach (PlannedFileChange file in plan.Files)
+        {
+            string path = Path.GetFullPath(file.Path);
+            if (fingerprints.TryGetValue(path, out FileFingerprint? readFingerprint) && !FileFingerprintService.Matches(readFingerprint, file.ExpectedFingerprint))
             {
-                throw new IOException($"配置文件在预览后发生变化，请重新加载: {Path.GetFileName(file.Path)}");
+                throw new IOException("预览的读取指纹与写入指纹不一致，请重新预览。");
             }
+            fingerprints[path] = file.ExpectedFingerprint;
+        }
+        foreach ((string path, FileFingerprint expected) in fingerprints)
+        {
+            FileFingerprint actual = await FileFingerprintService.CaptureAsync(path, cancellationToken).ConfigureAwait(false);
+            if (!FileFingerprintService.Matches(expected, actual))
+                throw new IOException($"配置或应用设置在预览后发生变化，请重新预览: {Path.GetFileName(path)}");
         }
     }
 
@@ -593,7 +635,7 @@ public sealed class ConfigurationSwitchService
         HashSet<string>? selected = ParseOverrideSelection(request.SecondaryOverrideSelectionJson);
         if (selected is not null)
         {
-            HashSet<string> known = overrides.Select(OverrideStateKey).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            HashSet<string> known = overrides.Select(OverrideStateKey).ToHashSet(SecondaryOverrideKeyComparer.Instance);
             string[] unknown = selected.Where(item => !known.Contains(item)).ToArray();
             if (unknown.Length > 0) throw new InvalidOperationException("Secondary Override 选择在扫描后已失效，请重新加载。");
         }
@@ -658,7 +700,7 @@ public sealed class ConfigurationSwitchService
         try
         {
             List<SecondaryOverrideTarget> targets = JsonSerializer.Deserialize<List<SecondaryOverrideTarget>>(json) ?? [];
-            return targets.Select(target => OverrideStateKey(target.FilePath, target.KeyPath)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            return targets.Select(target => OverrideStateKey(target.FilePath, target.KeyPath)).ToHashSet(SecondaryOverrideKeyComparer.Instance);
         }
         catch (JsonException exception)
         {
@@ -674,10 +716,12 @@ public sealed class ConfigurationSwitchService
 
     private static bool WasOverrideMutated(SwitchPlan plan, SecondaryModelOverride item)
     {
-        string externalKey = $"{Path.GetFullPath(item.FilePath)}::{item.KeyPath}";
+        string externalSuffix = "::" + item.KeyPath;
+        string filePath = Path.GetFullPath(item.FilePath);
         return plan.Mutations.Any(mutation => item.CanEdit
             ? mutation.KeyPath.Equals(item.KeyPath, StringComparison.Ordinal)
-            : mutation.KeyPath.Equals(externalKey, StringComparison.OrdinalIgnoreCase));
+            : mutation.KeyPath.EndsWith(externalSuffix, StringComparison.Ordinal) &&
+              mutation.KeyPath[..^externalSuffix.Length].Equals(filePath, StringComparison.OrdinalIgnoreCase));
     }
 
     private static void ValidateCandidateSemantics(ConfigReadResult read, SwitchRequest request)

@@ -1,5 +1,6 @@
 using System.Text.Json;
 using CodexModelManager.Core.Abstractions;
+using CodexModelManager.Core.Codex;
 using CodexModelManager.Core.Models;
 using CodexModelManager.Core.Providers;
 
@@ -12,6 +13,27 @@ public sealed class LmStudioSwitchPreflight(
     public async Task<CodexInstructionHierarchyProbeResult> ProbeAsync(
         SwitchRequest request,
         CancellationToken cancellationToken = default)
+    {
+        string? baseline = null;
+        bool AcceptSnapshot(ModelProfile model)
+        {
+            string fingerprint = JsonSerializer.Serialize(new { model.Id, model.SourceModelKey, model.ModelType, model.Architecture, model.Quantization, model.Parameters, model.SelectedVariant, model.MaxContextLength, model.LoadedConfiguration, model.Format });
+            baseline ??= fingerprint;
+            return baseline.Equals(fingerprint, StringComparison.Ordinal);
+        }
+
+        CodexInstructionHierarchyProbeResult result = await ProbeOnceAsync(request, AcceptSnapshot, cancellationToken).ConfigureAwait(false);
+        if (SwitchRetryBudget.IsTransient(result) && await SwitchRetryBudget.TryConsumeAsync(cancellationToken).ConfigureAwait(false))
+        {
+            result = await ProbeOnceAsync(request, AcceptSnapshot, cancellationToken).ConfigureAwait(false);
+        }
+        return result;
+    }
+
+    private async Task<CodexInstructionHierarchyProbeResult> ProbeOnceAsync(
+        SwitchRequest request,
+        Func<ModelProfile, bool> acceptSnapshot,
+        CancellationToken cancellationToken)
     {
         if (request.TargetProvider != ProviderKind.LmStudio)
         {
@@ -36,7 +58,7 @@ public sealed class LmStudioSwitchPreflight(
             // auto-load an otherwise unloaded model.
             var client = new LmStudioClient(request.LmStudioEndpoint, effectiveTokenProvider, httpClient);
             IReadOnlyList<ModelProfile> models = await client.DiscoverNativeModelsAsync(cancellationToken).ConfigureAwait(false);
-            ModelProfile? loaded = models.FirstOrDefault(model =>
+            ModelProfile? loaded = models.SingleOrDefault(model =>
                 model.Id.Equals(request.TargetModel, StringComparison.Ordinal) &&
                 model.IsLoaded == true);
             if (loaded is null)
@@ -50,7 +72,7 @@ public sealed class LmStudioSwitchPreflight(
             if (loaded.ModelType is not null && !loaded.ModelType.Equals("llm", StringComparison.OrdinalIgnoreCase))
             {
                 return Failure(
-                    CompatibilityFailureCodes.OtherProviderError,
+                    "lmstudio-non-llm-instance",
                     $"当前 loaded instance 类型为 {loaded.ModelType}，不是可供 Codex 使用的 LLM。",
                     checkedAt);
             }
@@ -64,6 +86,19 @@ public sealed class LmStudioSwitchPreflight(
                     "LM Studio 实际 loaded context 已变化或未知；请刷新模型并重新 Preview。",
                     checkedAt);
             }
+
+            if (!acceptSnapshot(loaded))
+            {
+                return Failure(CompatibilityFailureCodes.LmStudioLoadedContextChanged, "LM Studio 实例身份或加载配置已漂移；未重试推理。", checkedAt);
+            }
+
+            var probe = new CodexInstructionHierarchyProbe(httpClient, request.LmStudioEndpoint, effectiveTokenProvider);
+            CodexInstructionHierarchyProbeResult hierarchy = await probe.ProbeAsync(request.TargetModel, cancellationToken).ConfigureAwait(false);
+            IReadOnlyList<ModelProfile> after = await client.DiscoverNativeModelsAsync(cancellationToken).ConfigureAwait(false);
+            ModelProfile? current = after.SingleOrDefault(model => model.Id.Equals(request.TargetModel, StringComparison.Ordinal) && model.IsLoaded == true);
+            if (current is null) return Failure(CompatibilityFailureCodes.LmStudioLoadedInstanceMissing, "四阶段检测后所选 native loaded instance 已不存在。", checkedAt);
+            if (!acceptSnapshot(current)) return Failure(CompatibilityFailureCodes.LmStudioLoadedContextChanged, "四阶段检测期间实例身份或完整加载配置发生变化。", checkedAt);
+            return hierarchy;
         }
         catch (UnauthorizedAccessException)
         {
@@ -79,19 +114,19 @@ public sealed class LmStudioSwitchPreflight(
                 "LM Studio loaded instance 实时检查超时。",
                 checkedAt);
         }
-        catch (Exception exception) when (exception is HttpRequestException or JsonException or InvalidDataException or AggregateException)
+        catch (HttpRequestException exception)
+        {
+            return Failure(SwitchRetryBudget.IsTransient(exception, cancellationToken) ? CompatibilityFailureCodes.OtherProviderError : "lmstudio-native-state-unavailable",
+                "无法从 LM Studio native Models API 重新确认 loaded instance。", checkedAt);
+        }
+        catch (Exception exception) when (exception is JsonException or InvalidDataException or AggregateException)
         {
             return Failure(
-                CompatibilityFailureCodes.OtherProviderError,
+                "lmstudio-native-state-invalid",
                 "无法从 LM Studio native Models API 重新确认 loaded instance。",
                 checkedAt);
         }
 
-        var probe = new CodexInstructionHierarchyProbe(
-            httpClient,
-            request.LmStudioEndpoint,
-            effectiveTokenProvider);
-        return await probe.ProbeAsync(request.TargetModel, cancellationToken).ConfigureAwait(false);
     }
 
     private static CodexInstructionHierarchyProbeResult Failure(string code, string detail, DateTimeOffset checkedAt) => new(

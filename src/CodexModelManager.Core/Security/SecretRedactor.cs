@@ -28,22 +28,33 @@ public sealed partial class SecretRedactor
             result = result.Replace(secret, "<redacted>", StringComparison.Ordinal);
         }
 
-        result = AuthorizationRegex().Replace(result, "$1<redacted>");
-        result = TomlSecretRegex().Replace(result, "$1\"<redacted>\"");
-        result = ApiKeyRegex().Replace(result, "<redacted-api-key>");
-        result = QuerySecretRegex().Replace(result, "$1=<redacted>");
+        try
+        {
+            result = JsonSecretRegex().Replace(result, "$1\"<redacted>\"");
+            result = TomlSecretRegex().Replace(result, "$1\"<redacted>\"");
+            result = AuthorizationRegex().Replace(result, "$1<redacted>");
+            result = ApiKeyRegex().Replace(result, "<redacted-api-key>");
+            result = QuerySecretRegex().Replace(result, "$1=<redacted>");
+        }
+        catch (RegexMatchTimeoutException)
+        {
+            return "<redacted diagnostic: input exceeded redaction budget>";
+        }
         return result;
     }
 
-    [GeneratedRegex("(?i)(authorization\\s*[:=]\\s*(?:bearer\\s+)?)\\S+")]
+    [GeneratedRegex("(?i)(authorization\\s*[:=]\\s*(?:bearer\\s+)?)\\S+", RegexOptions.None, matchTimeoutMilliseconds: 100)]
     private static partial Regex AuthorizationRegex();
 
-    [GeneratedRegex("(?i)(\\b(?:experimental_bearer_token|api[_-]?key|token|password)\\s*=\\s*)[\"'].*?[\"']")]
+    [GeneratedRegex("(?i)(\\b(?:experimental_bearer_token|api[_-]?key|access[_-]?token|token|password|secret)\\s*=\\s*)(?:\"\"\"[\\s\\S]*?(?:\"\"\"|\\z)|'''[\\s\\S]*?(?:'''|\\z)|\"(?:\\\\.|[^\"\\\\\\r\\n])*(?:\"|$)|'[^'\\r\\n]*(?:'|$)|[^\\s#]+)", RegexOptions.None, matchTimeoutMilliseconds: 100)]
     private static partial Regex TomlSecretRegex();
 
-    [GeneratedRegex("(?i)\\bsk-[A-Za-z0-9_-]{8,}\\b")]
+    [GeneratedRegex("(?i)(\"(?:authorization|experimental_bearer_token|api[_-]?key|access[_-]?token|token|password|secret)\"\\s*:\\s*)\"(?:\\\\.|[^\"\\\\])*(?:\"|$)", RegexOptions.None, matchTimeoutMilliseconds: 100)]
+    private static partial Regex JsonSecretRegex();
+
+    [GeneratedRegex("(?i)\\bsk-[A-Za-z0-9_-]{8,}\\b", RegexOptions.None, matchTimeoutMilliseconds: 100)]
     private static partial Regex ApiKeyRegex();
 
-    [GeneratedRegex("(?i)(api[_-]?key|access[_-]?token|token|secret)=([^&\\s]+)")]
+    [GeneratedRegex("(?i)(api[_-]?key|access[_-]?token|token|secret)=([^&\\s]+)", RegexOptions.None, matchTimeoutMilliseconds: 100)]
     private static partial Regex QuerySecretRegex();
 }

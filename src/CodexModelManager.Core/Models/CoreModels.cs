@@ -463,7 +463,12 @@ public sealed record SwitchPlan(
     IReadOnlyList<SecondaryModelOverride> SecondaryOverrides,
     PreservationSummary Preservation,
     string PlanHash,
-    CodexInstructionHierarchyProbeResult? LmStudioPreflight = null);
+    CodexInstructionHierarchyProbeResult? LmStudioPreflight = null)
+{
+    // Inputs that affect the candidate even when they produce no file mutation.
+    // Null retains the original Files-only contract for existing callers.
+    internal IReadOnlyDictionary<string, FileFingerprint>? ReadFingerprints { get; init; }
+}
 
 public sealed record GgufChatTemplateAnalysis(
     string FilePath,
@@ -641,7 +646,7 @@ public sealed class AppSettings
 
     public Dictionary<string, ProviderState> ProviderStates { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
-    public Dictionary<string, string> SecondaryOverrideOriginals { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, string> SecondaryOverrideOriginals { get; set; } = new(Codex.SecondaryOverrideKeyComparer.Instance);
 
     public string? LastManagedConfigSha256 { get; set; }
 

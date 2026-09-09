@@ -51,36 +51,21 @@ public sealed partial class LmStudioEndpointDetector
         ProcessStartInfo start = CreateLmsStatusStartInfo(executable);
         start.ArgumentList.Add("server");
         start.ArgumentList.Add("status");
-        Process? started;
         try
         {
-            started = Process.Start(start);
+            BoundedProcessResult result = await BoundedProcessRunner.RunAsync(
+                start, TimeSpan.FromSeconds(4), BoundedProcessRunner.StatusOutputLimit, BoundedProcessRunner.StatusOutputLimit,
+                cancellationToken, combineOutputBudget: true).ConfigureAwait(false);
+            return result.ExitCode == 0 ? ParsePort(result.StandardOutput + "\n" + result.StandardError) : null;
         }
         catch (Exception exception) when (exception is Win32Exception or IOException or InvalidOperationException)
         {
             return null;
         }
-
-        using Process? process = started;
-        if (process is null) return null;
-        process.StandardInput.Close();
-        Task<string> stdout = process.StandardOutput.ReadToEndAsync(CancellationToken.None);
-        Task<string> stderr = process.StandardError.ReadToEndAsync(CancellationToken.None);
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(TimeSpan.FromSeconds(4));
-        try
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            await BoundedProcessCleanup.TerminateAndDrainAsync(process, [stdout, stderr]).ConfigureAwait(false);
-            cancellationToken.ThrowIfCancellationRequested();
             return null;
         }
-
-        string combined = (await stdout.ConfigureAwait(false)) + "\n" + (await stderr.ConfigureAwait(false));
-        return process.ExitCode == 0 ? ParsePort(combined) : null;
     }
 
     internal static ProcessStartInfo CreateLmsStatusStartInfo(string executable) => new(executable)

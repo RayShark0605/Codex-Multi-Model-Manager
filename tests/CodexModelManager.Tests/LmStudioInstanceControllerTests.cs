@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using CodexModelManager.Core.Abstractions;
+using CodexModelManager.Core.Codex;
 using CodexModelManager.Core.Infrastructure;
 using CodexModelManager.Core.LmStudio;
 using CodexModelManager.Core.Models;
@@ -12,6 +13,174 @@ namespace CodexModelManager.Tests;
 
 public sealed class LmStudioInstanceControllerTests
 {
+    [Fact]
+    public async Task PersistentBackupFailureDoesNotUnloadOriginalInstance()
+    {
+        using var fixture = new ControllerFixture(hierarchyPasses: true);
+        LmStudioLoadedInstanceSnapshot original = await fixture.Controller.CaptureAsync(ControllerFixture.OriginalInstanceId);
+        LmStudioTemplateRepairPlan plan = await fixture.CreatePersistentPlanAsync(original);
+        string backupPath = fixture.Store.GetEncryptedDefaultsBackupPath(plan.TransactionId);
+        Directory.CreateDirectory(Path.GetDirectoryName(backupPath)!);
+        await File.WriteAllTextAsync(backupPath, "existing-backup");
+
+        LmStudioTemplateApplyException exception = await Assert.ThrowsAsync<LmStudioTemplateApplyException>(() => fixture.Controller.ApplyTemplateAsync(plan));
+
+        Assert.True(exception.Rollback.Succeeded, exception.Rollback.Detail);
+        Assert.Equal(LmStudioLifecycleStage.PersistDefaults, exception.FailureStage);
+        Assert.Equal(0, fixture.Handler.UnloadCount);
+        Assert.Empty(fixture.Handler.LoadBodies);
+        Assert.Equal(original.InstanceId, fixture.Handler.CurrentInstanceId);
+        Assert.Null((await fixture.Store.ReadAsync(plan.TransactionId))?.CandidateInstanceId);
+    }
+
+    [Fact]
+    public async Task FailureEvidenceTimeoutAndBrokenLoggerCannotSkipPersistentRollback()
+    {
+        using var fixture = new ControllerFixture(hierarchyPasses: true, firstLoadFails: true);
+        bool failNextModels = false;
+        fixture.ConfigureTransport(inner => new InterceptingLifecycleHandler(inner, async (request, send) =>
+        {
+            if (failNextModels && request.Method == HttpMethod.Get)
+            {
+                failNextModels = false;
+                throw new TaskCanceledException("evidence internal timeout");
+            }
+            HttpResponseMessage response = await send();
+            if (request.RequestUri!.AbsolutePath.EndsWith("/load", StringComparison.Ordinal) && !response.IsSuccessStatusCode) failNextModels = true;
+            return response;
+        }), new ThrowingLifecycleLogger());
+        LmStudioLoadedInstanceSnapshot original = await fixture.Controller.CaptureAsync(ControllerFixture.OriginalInstanceId);
+        LmStudioTemplateRepairPlan plan = await fixture.CreatePersistentPlanAsync(original);
+
+        LmStudioTemplateApplyException exception = await Assert.ThrowsAsync<LmStudioTemplateApplyException>(() => fixture.Controller.ApplyTemplateAsync(plan));
+
+        Assert.Equal(TimeSpan.FromSeconds(5), LmStudioInstanceController.FailureEvidenceTimeout);
+        Assert.True(exception.Rollback.Succeeded, exception.Rollback.Detail);
+        Assert.IsType<LmStudioApiException>(exception.InnerException);
+        Assert.Equal(2, fixture.Handler.LoadBodies.Count);
+        Assert.Equal(plan.PersistentDefaults!.OriginalBytes, await File.ReadAllBytesAsync(fixture.DefaultsPath));
+        Assert.Equal(LmStudioTemplateTransactionState.RolledBack, (await fixture.Store.ReadAsync(plan.TransactionId))?.State);
+    }
+
+    [Fact]
+    public async Task RestoredInstanceWithTransientFinalProbeFailureIsAdoptedOnNextRecovery()
+    {
+        using var fixture = new ControllerFixture(hierarchyPasses: true, firstLoadFails: true);
+        int loads = 0;
+        bool failOriginalProbe = false;
+        fixture.ConfigureTransport(inner => new InterceptingLifecycleHandler(inner, async (request, send) =>
+        {
+            string path = request.RequestUri!.AbsolutePath;
+            if (failOriginalProbe && path.EndsWith("/responses", StringComparison.Ordinal))
+            {
+                failOriginalProbe = false;
+                return StubHttpHandler.Json("{}", HttpStatusCode.ServiceUnavailable);
+            }
+            HttpResponseMessage response = await send();
+            if (path.EndsWith("/load", StringComparison.Ordinal) && ++loads == 2) failOriginalProbe = true;
+            return response;
+        }));
+        LmStudioLoadedInstanceSnapshot original = await fixture.Controller.CaptureAsync(ControllerFixture.OriginalInstanceId);
+        LmStudioTemplateRepairPlan plan = await fixture.CreatePersistentPlanAsync(original);
+        LmStudioTemplateApplyException exception = await Assert.ThrowsAsync<LmStudioTemplateApplyException>(() => fixture.Controller.ApplyTemplateAsync(plan));
+        Assert.False(exception.Rollback.Succeeded);
+        LmStudioTemplateTransactionRecord record = (await fixture.Store.ReadAsync(plan.TransactionId))!;
+        Assert.Equal(LmStudioLifecycleStage.ProbeOriginal, record.LastRecoveryFailureStage);
+        int unloads = fixture.Handler.UnloadCount;
+
+        LmStudioRecoveryAssessment assessment = await fixture.Controller.AssessRecoveryAsync(record);
+        Assert.Equal(LmStudioRecoveryDisposition.AlreadyRestored, assessment.Disposition);
+        LmStudioRollbackResult result = await fixture.Controller.RecoverAsync(record, assessment);
+
+        Assert.True(result.Succeeded, result.Detail);
+        Assert.Equal(unloads, fixture.Handler.UnloadCount);
+        Assert.Equal(2, fixture.Handler.LoadBodies.Count);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ConfirmedLoadRetryReconcilesStateBeforeConsideringAnotherPost(bool responseLostAfterSuccess)
+    {
+        using var fixture = new ControllerFixture(hierarchyPasses: true, firstLoadFails: !responseLostAfterSuccess);
+        bool intercepted = false;
+        fixture.ConfigureTransport(inner => new InterceptingLifecycleHandler(inner, async (request, send) =>
+        {
+            HttpResponseMessage response = await send();
+            if (!intercepted && request.RequestUri!.AbsolutePath.EndsWith("/load", StringComparison.Ordinal))
+            {
+                intercepted = true;
+                response.Dispose();
+                throw new HttpRequestException("connection interrupted");
+            }
+            return response;
+        }));
+        LmStudioLoadedInstanceSnapshot original = await fixture.Controller.CaptureAsync(ControllerFixture.OriginalInstanceId);
+        LmStudioTemplateRepairPlan plan = await fixture.CreatePersistentPlanAsync(original);
+        int validations = 0;
+        using IDisposable scope = SwitchRetryBudget.BeginConfirmedSwitch(_ => { validations++; return Task.CompletedTask; });
+
+        LmStudioTemplateRepairResult result = await fixture.Controller.ApplyTemplateAsync(plan);
+
+        Assert.True(result.HierarchyProbe.IsCompatible);
+        Assert.Equal(responseLostAfterSuccess ? 1 : 2, fixture.Handler.LoadBodies.Count);
+        Assert.Equal(1, validations);
+        Assert.False(await SwitchRetryBudget.TryConsumeAsync());
+        await fixture.Controller.CompleteAsync(plan.TransactionId);
+    }
+
+    private sealed class InterceptingLifecycleHandler(HttpMessageHandler inner, Func<HttpRequestMessage, Func<Task<HttpResponseMessage>>, Task<HttpResponseMessage>> intercept) : DelegatingHandler(inner)
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => intercept(request, () => base.SendAsync(request, cancellationToken));
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task UnloadTransientFailureReconcilesOriginalStateAndNeverBlindlyRepeats(bool confirmed, bool responseLostAfterSuccess)
+    {
+        using var fixture = new ControllerFixture(hierarchyPasses: true);
+        int unloadRequests = 0;
+        fixture.ConfigureTransport(inner => new InterceptingLifecycleHandler(inner, async (request, send) =>
+        {
+            if (request.RequestUri!.AbsolutePath.EndsWith("/unload", StringComparison.Ordinal) && ++unloadRequests == 1)
+            {
+                if (responseLostAfterSuccess) (await send()).Dispose();
+                return StubHttpHandler.Json("{}", HttpStatusCode.ServiceUnavailable);
+            }
+            return await send();
+        }));
+        LmStudioLoadedInstanceSnapshot original = await fixture.Controller.CaptureAsync(ControllerFixture.OriginalInstanceId);
+        LmStudioTemplateRepairPlan plan = await fixture.CreatePersistentPlanAsync(original);
+        using IDisposable? scope = confirmed ? SwitchRetryBudget.BeginConfirmedSwitch() : null;
+        if (confirmed)
+        {
+            LmStudioTemplateRepairResult result = await fixture.Controller.ApplyTemplateAsync(plan);
+            Assert.True(result.HierarchyProbe.IsCompatible);
+            Assert.Equal(responseLostAfterSuccess ? 1 : 2, unloadRequests);
+            Assert.Equal(1, fixture.Handler.UnloadCount);
+            Assert.Single(fixture.Handler.LoadBodies);
+            await fixture.Controller.CompleteAsync(plan.TransactionId);
+        }
+        else
+        {
+            LmStudioTemplateApplyException exception = await Assert.ThrowsAsync<LmStudioTemplateApplyException>(() => fixture.Controller.ApplyTemplateAsync(plan));
+            Assert.True(exception.Rollback.Succeeded, exception.Rollback.Detail);
+            Assert.Equal(1, unloadRequests);
+            Assert.Equal(0, fixture.Handler.UnloadCount);
+            Assert.Empty(fixture.Handler.LoadBodies);
+        }
+    }
+
+    private sealed class ThrowingLifecycleLogger : IAppLogger
+    {
+        public event EventHandler<string>? MessageLogged { add { } remove { } }
+        public void Info(string message) => throw new IOException("log unavailable");
+        public void Warning(string message) => throw new IOException("log unavailable");
+        public void LogError(string message, Exception? exception = null) => throw new IOException("log unavailable");
+    }
+
     [Fact]
     public void AutomaticRollbackBudgetCoversLargeModelReloads()
     {
@@ -1096,6 +1265,16 @@ public sealed class LmStudioInstanceControllerTests
         private readonly bool codexRunning;
         private readonly FixedModelFileLocator modelFileLocator;
         private readonly string lmStudioVersion;
+        private HttpMessageHandler? transport;
+        private IAppLogger logger = new FakeLogger();
+
+        public void ConfigureTransport(Func<HttpMessageHandler, HttpMessageHandler> factory, IAppLogger? replacementLogger = null)
+        {
+            Controller.Dispose();
+            transport = factory(Handler);
+            logger = replacementLogger ?? logger;
+            Controller = CreateAdditionalController();
+        }
 
         public ControllerFixture(
             bool hierarchyPasses,
@@ -1169,13 +1348,13 @@ public sealed class LmStudioInstanceControllerTests
         public LmStudioInstanceController CreateAdditionalController() => new(
                 new Uri("http://127.0.0.1:1234"),
                 false,
-                new HttpClient(Handler) { Timeout = TimeSpan.FromSeconds(10) },
+                new HttpClient(transport ?? Handler) { Timeout = TimeSpan.FromSeconds(10) },
                 null,
                 new FakeRuntimeProbe(home, running: codexRunning),
                 reader,
                 repair,
                 Store,
-                new FakeLogger(),
+                logger,
                 DefaultsStore,
                 () => lmStudioVersion,
                 modelFileLocator);
@@ -1188,7 +1367,7 @@ public sealed class LmStudioInstanceControllerTests
         public LmStudioPerModelDefaultsStore DefaultsStore { get; }
         public string DefaultsPath { get; }
         public LmStudioModelFileResolution Resolution { get; }
-        public LmStudioInstanceController Controller { get; }
+        public LmStudioInstanceController Controller { get; private set; }
 
         public LmStudioTemplateRepairPlan CreatePlan(LmStudioLoadedInstanceSnapshot original) => new(
             Guid.NewGuid(),

@@ -57,55 +57,42 @@ public sealed class CodexSmokeTestService
         start.StandardInputEncoding = Encoding.UTF8;
         start.StandardOutputEncoding = Encoding.UTF8;
         start.StandardErrorEncoding = Encoding.UTF8;
-        using Process process = Process.Start(start) ?? throw new InvalidOperationException("无法启动 Codex CLI smoke test。");
-        process.StandardInput.Close();
-        Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync(CancellationToken.None);
-        Task<string> stderrTask = process.StandardError.ReadToEndAsync(CancellationToken.None);
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(TimeSpan.FromMinutes(5));
+        var evidence = new CodexSmokeEvidenceParser();
+        BoundedProcessResult execution;
         try
         {
-            await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
+            execution = await BoundedProcessRunner.RunAsync(
+                start, TimeSpan.FromMinutes(5), BoundedProcessRunner.CatalogOutputLimit, BoundedProcessRunner.SmokeErrorOutputLimit,
+                cancellationToken, evidence.AcceptLine).ConfigureAwait(false);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            await BoundedProcessCleanup.TerminateAndDrainAsync(process, [stdoutTask, stderrTask]).ConfigureAwait(false);
-            DateTimeOffset stoppedAt = DateTimeOffset.Now;
-            string reason = cancellationToken.IsCancellationRequested ? "测试已取消。" : "测试在 5 分钟后超时，进程树已终止。";
-            CompatibilityResult[] stoppedResults =
-            [
-                new("Codex Agent", CompatibilityStatus.Failed, reason, stoppedAt),
-                new("Shell", CompatibilityStatus.Failed, reason, stoppedAt),
-                new("File Editing", CompatibilityStatus.Failed, reason, stoppedAt),
-                new("Apply Patch", CompatibilityStatus.Failed, reason, stoppedAt),
-                new("MCP", CompatibilityStatus.Failed, reason, stoppedAt),
-                new("Plan", CompatibilityStatus.Untested, "本次 Level 3 未验证 Plan。", stoppedAt),
-                new("Goal", CompatibilityStatus.Untested, "本次 Level 3 未验证 Goal。", stoppedAt),
-            ];
-            return new SmokeTestResult(false, root, -1, stoppedResults, reason);
+            return FailedExecution(root, "测试在 5 分钟后超时，子进程清理已完成。");
+        }
+        catch (ProcessOutputLimitException)
+        {
+            return FailedExecution(root, "测试输出超过允许上限；未将截断日志作为成功证据。");
         }
 
-        string stdout = await stdoutTask.ConfigureAwait(false);
-        string stderr = await stderrTask.ConfigureAwait(false);
-
-        bool shell = HasTypedEvent(stdout, "command_execution", "shell", "shell_command", "exec_command") || HasNamedTool(stdout, "exec_command", "shell_command");
-        bool patch = HasTypedEvent(stdout, "file_change", "apply_patch") || HasNamedTool(stdout, "apply_patch");
-        bool mcp = HasNamedTool(stdout, "cmm_ping") || (HasTypedEvent(stdout, "mcp_tool_call") && stdout.Contains("CMM_PONG", StringComparison.Ordinal));
-        bool file = File.Exists(Path.Combine(workspace, "result.txt")) && (await File.ReadAllTextAsync(Path.Combine(workspace, "result.txt"), cancellationToken).ConfigureAwait(false)).Trim() == "CMM_SMOKE_OK";
-        bool passed = process.ExitCode == 0 && shell && patch && mcp && file;
+        cancellationToken.ThrowIfCancellationRequested();
+        bool shell = evidence.ShellSucceeded;
+        bool patch = evidence.PatchSucceeded;
+        bool mcp = evidence.McpSucceeded;
+        bool file = await HasExpectedResultFileAsync(Path.Combine(workspace, "result.txt"), cancellationToken).ConfigureAwait(false);
+        bool passed = execution.ExitCode == 0 && shell && patch && mcp && file;
         DateTimeOffset now = DateTimeOffset.Now;
         List<CompatibilityResult> results =
         [
             new("Codex Agent", passed ? CompatibilityStatus.Supported : CompatibilityStatus.Failed, passed ? "真实 Codex CLI 在隔离工作区完成全部必需步骤。" : "未完成全部 shell/file/apply_patch/MCP 步骤。", now),
-            new("Shell", shell ? CompatibilityStatus.Supported : CompatibilityStatus.Failed, shell ? "检测到安全 shell 调用。" : "未检测到 shell 事件。", now),
+            new("Shell", shell ? CompatibilityStatus.Supported : CompatibilityStatus.Failed, shell ? "检测到成功完成且 exit code 为 0 的 shell 调用。" : "未检测到成功完成的 shell 事件。", now),
             new("File Editing", file ? CompatibilityStatus.Supported : CompatibilityStatus.Failed, file ? "临时 result.txt 内容正确。" : "未生成预期文件。", now),
-            new("Apply Patch", patch ? CompatibilityStatus.Supported : CompatibilityStatus.Failed, patch ? "检测到 apply_patch 工具事件。" : "未检测到 apply_patch 工具事件。", now),
-            new("MCP", mcp ? CompatibilityStatus.Supported : CompatibilityStatus.Failed, mcp ? "临时 cmm_ping MCP 被调用。" : "未检测到 cmm_ping。", now),
+            new("Apply Patch", patch ? CompatibilityStatus.Supported : CompatibilityStatus.Failed, patch ? "检测到 result.txt 的成功 file_change 事件。" : "未检测到 result.txt 的成功 file_change 事件。", now),
+            new("MCP", mcp ? CompatibilityStatus.Supported : CompatibilityStatus.Failed, mcp ? "临时 cmm_ping MCP 成功返回 CMM_PONG。" : "未检测到成功的 cmm_ping/CMM_PONG 结果。", now),
             new("Plan", CompatibilityStatus.Untested, "本次 Level 3 不进入 Plan Mode。", now),
             new("Goal", CompatibilityStatus.Untested, "本次 Level 3 不创建用户 Goal。", now),
         ];
-        string summary = passed ? "Codex Agent Level 3 通过。" : $"Codex Agent Level 3 未通过（exit {process.ExitCode}，stderr 类型: {ClassifyError(stderr)}）。";
-        return new SmokeTestResult(passed, root, process.ExitCode, results, summary);
+        string summary = passed ? "Codex Agent Level 3 通过。" : $"Codex Agent Level 3 未通过（exit {execution.ExitCode}，stderr 类型: {ClassifyError(execution.StandardError)}）。";
+        return new SmokeTestResult(passed, root, execution.ExitCode, results, summary);
     }
 
     private string BuildConfig(SwitchRequest request)
@@ -146,50 +133,32 @@ public sealed class CodexSmokeTestService
         return builder.ToString();
     }
 
-    private static bool HasTypedEvent(string output, params string[] expected) => HasStructuredValue(output, "type", expected);
-
-    private static bool HasNamedTool(string output, params string[] expected) =>
-        HasStructuredValue(output, "name", expected) ||
-        HasStructuredValue(output, "tool", expected) ||
-        HasStructuredValue(output, "tool_name", expected);
-
-    private static bool HasStructuredValue(string output, string propertyName, IReadOnlyCollection<string> expected)
+    private static SmokeTestResult FailedExecution(string root, string reason)
     {
-        foreach (string line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-        {
-            try
-            {
-                using JsonDocument document = JsonDocument.Parse(line);
-                if (ContainsPropertyValue(document.RootElement, propertyName, expected)) return true;
-            }
-            catch (JsonException)
-            {
-            }
-        }
-
-        return false;
+        DateTimeOffset stoppedAt = DateTimeOffset.Now;
+        CompatibilityResult[] results =
+        [
+            new("Codex Agent", CompatibilityStatus.Failed, reason, stoppedAt),
+            new("Shell", CompatibilityStatus.Failed, reason, stoppedAt),
+            new("File Editing", CompatibilityStatus.Failed, reason, stoppedAt),
+            new("Apply Patch", CompatibilityStatus.Failed, reason, stoppedAt),
+            new("MCP", CompatibilityStatus.Failed, reason, stoppedAt),
+            new("Plan", CompatibilityStatus.Untested, "本次 Level 3 未验证 Plan。", stoppedAt),
+            new("Goal", CompatibilityStatus.Untested, "本次 Level 3 未验证 Goal。", stoppedAt),
+        ];
+        return new SmokeTestResult(false, root, -1, results, reason);
     }
 
-    private static bool ContainsPropertyValue(JsonElement element, string propertyName, IReadOnlyCollection<string> expected)
+    private static async Task<bool> HasExpectedResultFileAsync(string path, CancellationToken cancellationToken)
     {
-        if (element.ValueKind == JsonValueKind.Object)
+        if (!File.Exists(path)) return false;
+        try
         {
-            foreach (JsonProperty property in element.EnumerateObject())
-            {
-                if (property.NameEquals(propertyName) && property.Value.ValueKind == JsonValueKind.String &&
-                    expected.Contains(property.Value.GetString() ?? string.Empty, StringComparer.OrdinalIgnoreCase)) return true;
-                if (ContainsPropertyValue(property.Value, propertyName, expected)) return true;
-            }
+            await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            var reader = new BoundedUtf8LineReader(stream, new ProcessOutputBudget(1024));
+            return (await reader.ReadToEndAsync(cancellationToken).ConfigureAwait(false)).Trim() == "CMM_SMOKE_OK";
         }
-        else if (element.ValueKind == JsonValueKind.Array)
-        {
-            foreach (JsonElement item in element.EnumerateArray())
-            {
-                if (ContainsPropertyValue(item, propertyName, expected)) return true;
-            }
-        }
-
-        return false;
+        catch (ProcessOutputLimitException) { return false; }
     }
 
     private static string ClassifyError(string value)

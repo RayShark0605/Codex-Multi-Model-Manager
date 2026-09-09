@@ -90,8 +90,19 @@ public sealed partial class CodexRuntimeProbe : ICodexRuntimeProbe
         string value = raw.Trim();
         if (value.Length >= 2 && ((value[0] == '"' && value[^1] == '"') || (value[0] == '\'' && value[^1] == '\'')))
         {
-            if (value[0] == '\'') return value[1..^1];
-            try { return System.Text.Json.JsonSerializer.Deserialize<string>(value); } catch (System.Text.Json.JsonException) { }
+            try
+            {
+                TomlSourceDocument document = TomlSourceDocument.Parse("value = " + value);
+                if (document.Tables.Count == 0 && document.Assignments.Count == 1 && document.Assignments[0].RawValue == value &&
+                    document.Assignments[0].StringValue is string decoded)
+                {
+                    return decoded;
+                }
+            }
+            catch (InvalidDataException)
+            {
+                // Keep the existing tolerant read contract for non-TOML input.
+            }
         }
 
         return value;

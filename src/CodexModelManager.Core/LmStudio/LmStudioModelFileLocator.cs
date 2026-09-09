@@ -10,7 +10,6 @@ namespace CodexModelManager.Core.LmStudio;
 
 public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
 {
-    private const int MaximumOutputCharacters = 4 * 1024 * 1024;
     private static readonly Uri DefaultEndpoint = new("http://127.0.0.1:1234");
     private static readonly TimeSpan CommandTimeout = TimeSpan.FromSeconds(8);
     private readonly ILmsCliCommandRunner commandRunner;
@@ -992,63 +991,33 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         {
             string executable = FindLmsExecutable() ?? (OperatingSystem.IsWindows() ? "lms.exe" : "lms");
             ProcessStartInfo startInfo = CreateLmsProcessStartInfo(executable, arguments);
-            using var process = new Process { StartInfo = startInfo };
             try
             {
-                if (!process.Start())
+                BoundedProcessResult result = await BoundedProcessRunner.RunAsync(
+                    startInfo, timeout, BoundedProcessRunner.CatalogOutputLimit, BoundedProcessRunner.CatalogOutputLimit,
+                    cancellationToken, combineOutputBudget: true).ConfigureAwait(false);
+                if (result.ExitCode != 0 || string.IsNullOrWhiteSpace(result.StandardOutput))
                 {
                     return new LmsCliCommandResult(LmsCliCommandStatus.Failed, null);
                 }
+                return new LmsCliCommandResult(LmsCliCommandStatus.Success, result.StandardOutput);
             }
             catch (Win32Exception)
             {
                 return new LmsCliCommandResult(LmsCliCommandStatus.Unavailable, null);
             }
-            catch (IOException)
+            catch (ProcessOutputLimitException)
+            {
+                return new LmsCliCommandResult(LmsCliCommandStatus.OutputTooLarge, null);
+            }
+            catch (Exception exception) when (exception is IOException or InvalidOperationException)
             {
                 return new LmsCliCommandResult(LmsCliCommandStatus.Failed, null);
             }
-
-            process.StandardInput.Close();
-            Task<BoundedOutput> stdoutTask = ReadBoundedOutputAsync(process.StandardOutput);
-            Task stderrTask = DrainOutputAsync(process.StandardError);
-            using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeoutSource.CancelAfter(timeout);
-            try
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
             {
-                await process.WaitForExitAsync(timeoutSource.Token).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                await BoundedProcessCleanup.TerminateAndDrainAsync(process, [stdoutTask, stderrTask]).ConfigureAwait(false);
-                cancellationToken.ThrowIfCancellationRequested();
                 return new LmsCliCommandResult(LmsCliCommandStatus.TimedOut, null);
             }
-
-            BoundedOutput output;
-            try
-            {
-                output = await stdoutTask.ConfigureAwait(false);
-                await stderrTask.ConfigureAwait(false);
-            }
-            catch (IOException)
-            {
-                return new LmsCliCommandResult(LmsCliCommandStatus.Failed, null);
-            }
-
-            if (process.ExitCode != 0)
-            {
-                return new LmsCliCommandResult(LmsCliCommandStatus.Failed, null);
-            }
-
-            if (output.TooLarge || output.Text.Length == 0)
-            {
-                return new LmsCliCommandResult(
-                    output.TooLarge ? LmsCliCommandStatus.OutputTooLarge : LmsCliCommandStatus.Failed,
-                    null);
-            }
-
-            return new LmsCliCommandResult(LmsCliCommandStatus.Success, output.Text);
         }
 
         private static string? FindLmsExecutable()
@@ -1066,38 +1035,6 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
             return null;
         }
 
-        private static async Task<BoundedOutput> ReadBoundedOutputAsync(StreamReader reader)
-        {
-            var output = new StringBuilder();
-            char[] buffer = new char[8192];
-            bool tooLarge = false;
-            int charactersRead;
-            while ((charactersRead = await reader.ReadAsync(buffer.AsMemory(), CancellationToken.None).ConfigureAwait(false)) > 0)
-            {
-                int remaining = MaximumOutputCharacters - output.Length;
-                if (remaining > 0)
-                {
-                    output.Append(buffer, 0, Math.Min(remaining, charactersRead));
-                }
-
-                if (charactersRead > remaining)
-                {
-                    tooLarge = true;
-                }
-            }
-
-            return new BoundedOutput(output.ToString(), tooLarge);
-        }
-
-        private static async Task DrainOutputAsync(StreamReader reader)
-        {
-            char[] buffer = new char[8192];
-            while (await reader.ReadAsync(buffer.AsMemory(), CancellationToken.None).ConfigureAwait(false) > 0)
-            {
-            }
-        }
-
-        private sealed record BoundedOutput(string Text, bool TooLarge);
     }
 }
 

@@ -65,14 +65,8 @@ internal static class TomlDottedKey
         if (segment.Length >= 2 && segment[0] == '\'' && segment[^1] == '\'') return segment[1..^1];
         if (segment.Length >= 2 && segment[0] == '"' && segment[^1] == '"')
         {
-            try
-            {
-                return JsonSerializer.Deserialize<string>(segment) ?? segment[1..^1];
-            }
-            catch (JsonException)
-            {
-                return segment[1..^1];
-            }
+            // TOML supports escapes (including \UXXXXXXXX) that are not JSON.
+            return TomlSourceDocument.GetSegments(TomlSourceDocument.ParseSyntax(segment + " = 0").KeyValues.First().Key)[0];
         }
 
         return segment;

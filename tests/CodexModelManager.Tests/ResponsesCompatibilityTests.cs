@@ -17,7 +17,7 @@ public sealed class ResponsesCompatibilityTests
             2 => StubHttpHandler.Json("{\"output\":[{\"type\":\"message\"}]}"),
             3 => StubHttpHandler.Json("{\"output\":[{\"type\":\"message\"}]}"),
             4 => StubHttpHandler.Json("{\"output\":[{\"type\":\"message\"}]}"),
-            5 => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("event: response.completed\ndata: {}\n") },
+            5 => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n") },
             6 => StubHttpHandler.Json("{\"output\":[{\"type\":\"function_call\",\"name\":\"cmm_echo\",\"arguments\":\"{\\\"value\\\":\\\"CMM_TOOL_OK\\\"}\"}]}"),
             7 => StubHttpHandler.Json("{\"output\":[{\"type\":\"reasoning\",\"summary\":[]}]}"),
             _ => throw new InvalidOperationException("Unexpected request."),
@@ -49,7 +49,7 @@ public sealed class ResponsesCompatibilityTests
             2 => StubHttpHandler.Json("{\"output\":[{\"type\":\"message\"}]}"),
             3 => StubHttpHandler.Json("{\"output\":[{\"type\":\"message\"}]}"),
             4 => StubHttpHandler.Json("{\"output\":[{\"type\":\"message\"}]}"),
-            5 => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("data: {}\n") },
+            5 => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("data: {\"type\":\"response.created\"}\n\n") },
             6 => StubHttpHandler.Json("{\"output\":[{\"type\":\"message\",\"text\":\"cmm_echo CMM_TOOL_OK\"}]}"),
             _ => throw new InvalidOperationException("Unexpected request."),
         }));

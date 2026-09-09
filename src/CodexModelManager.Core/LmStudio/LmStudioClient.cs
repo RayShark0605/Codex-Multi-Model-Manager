@@ -14,6 +14,7 @@ public sealed class LmStudioClient : IModelProvider
     private readonly Uri endpoint;
     private readonly Func<string?>? tokenProvider;
     private bool usedFallback;
+    private readonly HashSet<string> unusableNativeSourceKeys = new(StringComparer.OrdinalIgnoreCase);
 
     public LmStudioClient(Uri endpoint, Func<string?>? tokenProvider = null, HttpClient? httpClient = null)
     {
@@ -28,6 +29,10 @@ public sealed class LmStudioClient : IModelProvider
     public Uri Endpoint => endpoint;
 
     public bool UsedFallback => usedFallback;
+
+    public IReadOnlyList<string> DiscoveryDiagnostics { get; private set; } = [];
+
+    internal bool HasUnusableNativeInstances(string sourceModelKey) => unusableNativeSourceKeys.Contains(sourceModelKey);
 
     public async Task<ProviderProbeResult> ProbeAsync(CancellationToken cancellationToken = default)
     {
@@ -60,7 +65,11 @@ public sealed class LmStudioClient : IModelProvider
         response.EnsureSuccessStatusCode();
         using JsonDocument document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false));
         usedFallback = false;
-        return ParseNativeV1(document.RootElement);
+        List<string> diagnostics = [];
+        unusableNativeSourceKeys.Clear();
+        List<ModelProfile> models = ParseNativeV1(document.RootElement, diagnostics, unusableNativeSourceKeys);
+        DiscoveryDiagnostics = diagnostics.ToArray();
+        return models;
     }
 
     public async Task<IReadOnlyList<ModelProfile>> DiscoverModelsAsync(CancellationToken cancellationToken = default)
@@ -80,7 +89,10 @@ public sealed class LmStudioClient : IModelProvider
                 response.EnsureSuccessStatusCode();
                 using JsonDocument document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false));
                 usedFallback = index > 0;
-                List<ModelProfile> models = index == 0 ? ParseNativeV1(document.RootElement) : ParseFallback(document.RootElement, routes[index]);
+                List<string> diagnostics = [];
+                unusableNativeSourceKeys.Clear();
+                List<ModelProfile> models = index == 0 ? ParseNativeV1(document.RootElement, diagnostics, unusableNativeSourceKeys) : ParseFallback(document.RootElement, routes[index]);
+                DiscoveryDiagnostics = diagnostics.ToArray();
                 if (index == 0 || models.Count > 0)
                 {
                     return models;
@@ -404,7 +416,7 @@ public sealed class LmStudioClient : IModelProvider
         return Truncate(safe, maximumLength);
     }
 
-    private static List<ModelProfile> ParseNativeV1(JsonElement root)
+    private static List<ModelProfile> ParseNativeV1(JsonElement root, List<string> diagnostics, HashSet<string> unusableSourceKeys)
     {
         if (root.ValueKind != JsonValueKind.Object ||
             !root.TryGetProperty("models", out JsonElement models) ||
@@ -463,7 +475,13 @@ public sealed class LmStudioClient : IModelProvider
                         throw new InvalidDataException("LM Studio loaded_instances 包含非对象条目。");
                     }
 
-                    string instanceId = GetString(instance, "id") ?? key;
+                    string? instanceId = GetString(instance, "id");
+                    if (string.IsNullOrWhiteSpace(instanceId))
+                    {
+                        unusableSourceKeys.Add(key);
+                        diagnostics.Add("已忽略缺失、空白或非字符串 id 的 native loaded instance；不会从 source key 猜测实例身份。");
+                        continue;
+                    }
                     LmStudioLoadConfiguration configuration = instance.TryGetProperty("config", out JsonElement config) && config.ValueKind == JsonValueKind.Object
                         ? ParseLoadConfiguration(config)
                         : new LmStudioLoadConfiguration();
@@ -522,6 +540,15 @@ public sealed class LmStudioClient : IModelProvider
             }
         }
 
+        HashSet<string> duplicateIds = result.Where(model => model.IsLoaded == true)
+            .GroupBy(model => model.Id, StringComparer.Ordinal).Where(group => group.Count() > 1)
+            .Select(group => group.Key).ToHashSet(StringComparer.Ordinal);
+        if (duplicateIds.Count > 0)
+        {
+            foreach (ModelProfile duplicate in result.Where(model => model.IsLoaded == true && duplicateIds.Contains(model.Id))) unusableSourceKeys.Add(duplicate.SourceModelKey!);
+            result.RemoveAll(model => model.IsLoaded == true && duplicateIds.Contains(model.Id));
+            diagnostics.Add($"已隔离 {duplicateIds.Count} 组重复 native loaded instance id；其他身份有效的模型仍可使用。");
+        }
         return result;
     }
 

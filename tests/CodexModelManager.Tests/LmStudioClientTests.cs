@@ -432,7 +432,7 @@ public sealed class LmStudioClientTests
         CodexInstructionHierarchyProbeResult result = await preflight.ProbeAsync(request);
 
         Assert.True(result.IsCompatible);
-        Assert.Equal(1, modelsRequests);
+        Assert.Equal(2, modelsRequests);
         Assert.Equal(4, responsesRequests);
     }
 

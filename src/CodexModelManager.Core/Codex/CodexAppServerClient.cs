@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Text;
 using System.Text.Json;
 using CodexModelManager.Core.Infrastructure;
 using CodexModelManager.Core.Models;
@@ -41,10 +40,11 @@ public sealed class CodexAppServerClient
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
         }
-        catch (Exception exception) when (exception is IOException or JsonException or InvalidOperationException or System.ComponentModel.Win32Exception)
+        catch (Exception exception) when (exception is IOException or InvalidDataException or JsonException or InvalidOperationException or System.ComponentModel.Win32Exception)
         {
         }
 
+        LastCapabilities = null;
         return await ReadCacheAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -54,26 +54,10 @@ public sealed class CodexAppServerClient
         try
         {
             ProcessStartInfo start = launchCommand.CreateStartInfo(["--version"]);
-            start.RedirectStandardOutput = true;
-            start.RedirectStandardError = true;
-            start.StandardOutputEncoding = Encoding.UTF8;
-            start.StandardErrorEncoding = Encoding.UTF8;
-            using Process process = Process.Start(start) ?? throw new InvalidOperationException("无法启动 Codex CLI。");
-            Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync(CancellationToken.None);
-            Task<string> stderrTask = process.StandardError.ReadToEndAsync(CancellationToken.None);
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeout.CancelAfter(TimeSpan.FromSeconds(5));
-            try
-            {
-                await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
-                string output = await stdoutTask.ConfigureAwait(false);
-                await stderrTask.ConfigureAwait(false);
-                return output.Trim();
-            }
-            finally
-            {
-                await BoundedProcessCleanup.TerminateAndDrainAsync(process, [stdoutTask, stderrTask]).ConfigureAwait(false);
-            }
+            BoundedProcessResult result = await BoundedProcessRunner.RunAsync(
+                start, TimeSpan.FromSeconds(5), BoundedProcessRunner.StatusOutputLimit, BoundedProcessRunner.StatusOutputLimit,
+                cancellationToken, combineOutputBudget: true).ConfigureAwait(false);
+            return result.ExitCode == 0 ? result.StandardOutput.Trim() : null;
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -88,66 +72,53 @@ public sealed class CodexAppServerClient
     private async Task<IReadOnlyList<ModelProfile>> ListLiveAsync(CancellationToken cancellationToken)
     {
         ProcessStartInfo start = launchCommand!.CreateStartInfo(["app-server"]);
-        start.RedirectStandardInput = true;
-        start.RedirectStandardOutput = true;
-        start.RedirectStandardError = true;
-        start.StandardInputEncoding = Encoding.UTF8;
-        start.StandardOutputEncoding = Encoding.UTF8;
-        start.StandardErrorEncoding = Encoding.UTF8;
         start.WorkingDirectory = Environment.CurrentDirectory;
         start.Environment["CODEX_HOME"] = codexHome;
-        using Process process = Process.Start(start) ?? throw new InvalidOperationException("无法启动 Codex app-server。");
-        Task<string> stderrTask = process.StandardError.ReadToEndAsync(CancellationToken.None);
-        try
-        {
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeout.CancelAfter(TimeSpan.FromSeconds(12));
-            await WriteMessageAsync(process, new
+        return await BoundedProcessRunner.RunProtocolAsync(
+            start, TimeSpan.FromSeconds(12), BoundedProcessRunner.CatalogOutputLimit,
+            async (connection, token) =>
             {
-                id = 1,
-                method = "initialize",
-                @params = new
+                await WriteMessageAsync(connection, new
                 {
-                    clientInfo = new { name = "codex-model-manager", title = "Codex Multi-Model Manager", version = "1.0.0" },
-                    capabilities = new { },
-                },
-            }).ConfigureAwait(false);
-            await WaitForResponseAsync(process, 1, timeout.Token).ConfigureAwait(false);
-            await WriteMessageAsync(process, new { method = "initialized", @params = new { } }).ConfigureAwait(false);
-            await WriteMessageAsync(process, new { id = 2, method = "model/list", @params = new { includeHidden = false, limit = 100 } }).ConfigureAwait(false);
-            JsonElement response = await WaitForResponseAsync(process, 2, timeout.Token).ConfigureAwait(false);
-            List<ModelProfile> models = ParseAppServerModels(response);
-            try
-            {
-                await WriteMessageAsync(process, new { id = 3, method = "modelProvider/capabilities/read", @params = new { } }).ConfigureAwait(false);
-                JsonElement capabilities = await WaitForResponseAsync(process, 3, timeout.Token).ConfigureAwait(false);
-                LastCapabilities = ParseProviderCapabilities(capabilities);
-            }
-            catch (Exception exception) when (!cancellationToken.IsCancellationRequested && exception is IOException or JsonException or InvalidOperationException or OperationCanceledException)
-            {
-                // Older app-server builds may not expose this endpoint. The model list is
-                // still authoritative; unsupported capabilities remain Unknown/Untested.
-            }
+                    id = 1,
+                    method = "initialize",
+                    @params = new
+                    {
+                        clientInfo = new { name = "codex-model-manager", title = "Codex Multi-Model Manager", version = "1.0.0" },
+                        capabilities = new { },
+                    },
+                }, token).ConfigureAwait(false);
+                await WaitForResponseAsync(connection, 1, token).ConfigureAwait(false);
+                await WriteMessageAsync(connection, new { method = "initialized", @params = new { } }, token).ConfigureAwait(false);
+                await WriteMessageAsync(connection, new { id = 2, method = "model/list", @params = new { includeHidden = false, limit = 100 } }, token).ConfigureAwait(false);
+                JsonElement response = await WaitForResponseAsync(connection, 2, token).ConfigureAwait(false);
+                List<ModelProfile> models = ParseAppServerModels(response);
+                try
+                {
+                    using var capabilityTimeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+                    capabilityTimeout.CancelAfter(TimeSpan.FromSeconds(2));
+                    await WriteMessageAsync(connection, new { id = 3, method = "modelProvider/capabilities/read", @params = new { } }, capabilityTimeout.Token).ConfigureAwait(false);
+                    JsonElement capabilities = await WaitForResponseAsync(connection, 3, capabilityTimeout.Token).ConfigureAwait(false);
+                    LastCapabilities = ParseProviderCapabilities(capabilities);
+                }
+                catch (Exception exception) when (!cancellationToken.IsCancellationRequested && exception is IOException or JsonException or InvalidOperationException or OperationCanceledException)
+                {
+                    // Older app-server builds may not expose this endpoint. The model list is
+                    // still authoritative; unsupported capabilities remain Unknown/Untested.
+                }
 
-            return models;
-        }
-        finally
-        {
-            await BoundedProcessCleanup.TerminateAndDrainAsync(process, [stderrTask]).ConfigureAwait(false);
-        }
+                return (IReadOnlyList<ModelProfile>)models;
+            }, cancellationToken).ConfigureAwait(false);
     }
 
-    private static async Task WriteMessageAsync<T>(Process process, T message)
-    {
-        await process.StandardInput.WriteLineAsync(JsonSerializer.Serialize(message)).ConfigureAwait(false);
-        await process.StandardInput.FlushAsync().ConfigureAwait(false);
-    }
+    private static Task WriteMessageAsync<T>(BoundedProcessConnection connection, T message, CancellationToken cancellationToken) =>
+        connection.WriteLineAsync(JsonSerializer.Serialize(message), cancellationToken);
 
-    private static async Task<JsonElement> WaitForResponseAsync(Process process, int id, CancellationToken cancellationToken)
+    private static async Task<JsonElement> WaitForResponseAsync(BoundedProcessConnection connection, int id, CancellationToken cancellationToken)
     {
         while (true)
         {
-            string? line = await process.StandardOutput.ReadLineAsync(cancellationToken).ConfigureAwait(false);
+            string? line = await connection.ReadLineAsync(cancellationToken).ConfigureAwait(false);
             if (line is null) throw new IOException("Codex app-server 在返回结果前退出。");
             using JsonDocument document = JsonDocument.Parse(line);
             JsonElement root = document.RootElement;
@@ -226,7 +197,9 @@ public sealed class CodexAppServerClient
             if (!File.Exists(path)) continue;
             try
             {
-                using JsonDocument document = JsonDocument.Parse(await File.ReadAllBytesAsync(path, cancellationToken).ConfigureAwait(false));
+                await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                var reader = new BoundedUtf8LineReader(stream, new ProcessOutputBudget(BoundedProcessRunner.CatalogOutputLimit));
+                using JsonDocument document = JsonDocument.Parse(await reader.ReadToEndAsync(cancellationToken).ConfigureAwait(false));
                 JsonElement root = document.RootElement;
                 if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty("models", out JsonElement models) || models.ValueKind != JsonValueKind.Array) continue;
                 List<ModelProfile> result = [];
@@ -241,7 +214,7 @@ public sealed class CodexAppServerClient
 
                 if (result.Count > 0) return result;
             }
-            catch (JsonException)
+            catch (Exception exception) when (exception is JsonException or IOException)
             {
             }
         }

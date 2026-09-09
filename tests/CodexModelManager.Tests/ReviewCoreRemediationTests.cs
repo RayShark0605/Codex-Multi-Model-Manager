@@ -50,7 +50,9 @@ public sealed class ReviewCoreRemediationTests
                 new Dictionary<string, string?> { ["model"] = "\"new\"" },
                 new Dictionary<string, string?>())));
 
-        Assert.Contains("Invalid \\r", exception.ToString(), StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("语法或语义无效", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("行:列", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("preserve", exception.ToString(), StringComparison.Ordinal);
     }
 
     [Fact]

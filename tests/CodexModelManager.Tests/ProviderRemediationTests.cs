@@ -38,7 +38,7 @@ public sealed class ProviderRemediationTests
             <= 4 => StubHttpHandler.Json("{\"output\":[]}"),
             5 => new HttpResponseMessage(HttpStatusCode.OK)
             {
-                Content = new StreamContent(new FirstChunkThenBlockStream("event: response.output_text.delta\ndata: {\"delta\":\"ok\"}\n")),
+                Content = new StreamContent(new FirstChunkThenBlockStream("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n")),
             },
             6 => StubHttpHandler.Json("\"not-an-object\""),
             _ => throw new InvalidOperationException("Unexpected request."),
@@ -66,7 +66,7 @@ public sealed class ProviderRemediationTests
         using var http = new HttpClient(new AsyncStubHttpHandler((_, _) => Task.FromResult(++requestCount switch
         {
             <= 4 => StubHttpHandler.Json("{\"output\":[]}"),
-            5 => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("data: {}\n") },
+            5 => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("data: {\"type\":\"response.created\"}\n\n") },
             6 => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StreamContent(new NeverEndingStream()) },
             _ => throw new InvalidOperationException("Unexpected request."),
         })));
@@ -92,7 +92,7 @@ public sealed class ProviderRemediationTests
         using var http = new HttpClient(new StubHttpHandler(_ => ++requestCount switch
         {
             <= 4 => StubHttpHandler.Json("{\"output\":[]}"),
-            5 => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("data: {}\n") },
+            5 => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("data: {\"type\":\"response.created\"}\n\n") },
             6 => StubHttpHandler.Json("{\"output\":[{\"type\":\"function_call\",\"name\":\"cmm_echo\",\"arguments\":{\"value\":\"CMM_TOOL_OK\"}}]}"),
             7 => StubHttpHandler.Json("[1,2,3]"),
             _ => throw new InvalidOperationException("Unexpected request."),

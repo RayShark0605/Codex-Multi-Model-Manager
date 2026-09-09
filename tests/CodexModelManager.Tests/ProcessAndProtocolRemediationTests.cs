@@ -176,6 +176,81 @@ public sealed class ProcessAndProtocolRemediationTests
             TimeSpan.FromMilliseconds(50));
     }
 
+    [Fact]
+    public async Task VersionCancellationCoversInheritedPipesAfterParentExit()
+    {
+        var command = new CodexLaunchCommand(GetDotnetHost(), [GetTestMcpServerDll(), "--process-fixture-inherited-pipes"], "bounded pipe fixture");
+        using var temporary = new TemporaryDirectory();
+        var client = new CodexAppServerClient(temporary.Path, command);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+        var stopwatch = Stopwatch.StartNew();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => client.GetVersionAsync(cancellation.Token));
+
+        Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(3), stopwatch.Elapsed.ToString());
+    }
+
+    [Fact]
+    public async Task ProcessDeadlineCoversInheritedPipesAfterParentExit()
+    {
+        ProcessStartInfo start = new CodexLaunchCommand(GetDotnetHost(), [GetTestMcpServerDll()], "bounded pipe fixture")
+            .CreateStartInfo(["--process-fixture-inherited-pipes"]);
+        var stopwatch = Stopwatch.StartNew();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => BoundedProcessRunner.RunAsync(
+            start, TimeSpan.FromSeconds(1), 256 * 1024, 256 * 1024, CancellationToken.None, combineOutputBudget: true));
+
+        Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(3), stopwatch.Elapsed.ToString());
+    }
+
+    [Theory]
+    [InlineData("--process-fixture-large-stdout")]
+    [InlineData("--process-fixture-large-stderr")]
+    public async Task ProcessOutputLimitsRejectRatherThanAcceptATruncatedPrefix(string fixture)
+    {
+        ProcessStartInfo start = new CodexLaunchCommand(GetDotnetHost(), [GetTestMcpServerDll()], "output cap fixture")
+            .CreateStartInfo([fixture]);
+
+        await Assert.ThrowsAsync<ProcessOutputLimitException>(() => BoundedProcessRunner.RunAsync(
+            start, TimeSpan.FromSeconds(5), 256 * 1024, 256 * 1024, CancellationToken.None, combineOutputBudget: true));
+    }
+
+    [Fact]
+    public async Task CombinedProcessBudgetIncludesBothOutputStreams()
+    {
+        ProcessStartInfo start = new CodexLaunchCommand(GetDotnetHost(), [GetTestMcpServerDll()], "combined output fixture")
+            .CreateStartInfo(["--process-fixture-combined-output"]);
+
+        await Assert.ThrowsAsync<ProcessOutputLimitException>(() => BoundedProcessRunner.RunAsync(
+            start, TimeSpan.FromSeconds(5), 256 * 1024, 256 * 1024, CancellationToken.None, combineOutputBudget: true));
+    }
+
+    [Fact]
+    public async Task ProtocolOutputFailureInterruptsAStalledResponseRead()
+    {
+        ProcessStartInfo start = new CodexLaunchCommand(GetDotnetHost(), [GetTestMcpServerDll()], "protocol output fixture")
+            .CreateStartInfo(["--process-fixture-large-stderr"]);
+
+        await Assert.ThrowsAsync<ProcessOutputLimitException>(() => BoundedProcessRunner.RunProtocolAsync(
+            start, TimeSpan.FromSeconds(5), 256 * 1024,
+            async (connection, cancellationToken) => await connection.ReadLineAsync(cancellationToken), CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task IncrementalProcessLinesAreConsumedWithoutRetainingRawSmokeOutput()
+    {
+        ProcessStartInfo start = new CodexLaunchCommand(GetDotnetHost(), [GetTestMcpServerDll()], "incremental fixture")
+            .CreateStartInfo(["--emit-utf8-fixture"]);
+        List<string> lines = [];
+
+        BoundedProcessResult result = await BoundedProcessRunner.RunAsync(
+            start, TimeSpan.FromSeconds(5), 16 * 1024 * 1024, 1024 * 1024, CancellationToken.None, lines.Add);
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.Empty(result.StandardOutput);
+        Assert.Equal([@"C:\用户\模型.gguf"], lines);
+    }
+
     private static string GetTestMcpServerDll()
     {
         string configuration =

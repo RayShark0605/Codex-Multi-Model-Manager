@@ -73,6 +73,14 @@ public sealed class AppSettingsRepository
             AppSettings settings = JsonSerializer.Deserialize<AppSettings>(bytes, JsonOptions)
                 ?? throw new InvalidDataException("appsettings.json 根值不能为 null。");
             ValidateShape(settings);
+            try
+            {
+                settings.SecondaryOverrideOriginals = new Dictionary<string, string>(settings.SecondaryOverrideOriginals, SecondaryOverrideKeyComparer.Instance);
+            }
+            catch (ArgumentException)
+            {
+                throw new InvalidDataException("appsettings.json 包含重复的 Secondary Override 原始值键。");
+            }
             return priorRecovery is null
                 ? new AppSettingsLoadResult(Migrate(settings))
                 : priorRecovery with { Settings = Migrate(settings) };

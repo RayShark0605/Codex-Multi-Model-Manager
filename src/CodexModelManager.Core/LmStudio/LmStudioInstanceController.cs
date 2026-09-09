@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text.Json;
 using CodexModelManager.Core.Abstractions;
+using CodexModelManager.Core.Codex;
 using CodexModelManager.Core.Infrastructure;
 using CodexModelManager.Core.Models;
 using CodexModelManager.Core.Providers;
@@ -10,6 +11,7 @@ namespace CodexModelManager.Core.LmStudio;
 public sealed class LmStudioInstanceController : ILmStudioInstanceController
 {
     internal static readonly TimeSpan AutomaticRollbackTimeout = TimeSpan.FromMinutes(30);
+    internal static readonly TimeSpan FailureEvidenceTimeout = TimeSpan.FromSeconds(5);
     private readonly LmStudioClient client;
     private readonly Uri endpoint;
     private readonly bool requiresAuthentication;
@@ -82,6 +84,7 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
         }
 
         string? sourceModelKey = matches[0].SourceModelKey;
+        if (sourceModelKey is not null) EnsureNativeSourceIdentityUsable(sourceModelKey);
         int sameSourceCount = models.Count(model =>
             model.IsLoaded == true &&
             !string.IsNullOrWhiteSpace(sourceModelKey) &&
@@ -112,9 +115,10 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
             ReportProgress("写入 Prepared 恢复事务");
             LmStudioTemplateTransactionRecord record = CreateRecord(plan);
             await transactions.WriteAsync(record, cancellationToken).ConfigureAwait(false);
-            logger.Info($"LM Studio template transaction prepared: id={plan.TransactionId:N}, instance={plan.OriginalInstance.InstanceId}, variant={plan.OriginalInstance.SelectedVariant ?? plan.OriginalInstance.SourceModelKey}, originalSha={ShortHash(plan.GgufAnalysis.TemplateSha256)}, patchedSha={ShortHash(plan.TemplatePreview.PatchedTemplateSha256!)}");
+            LogSafely(() => logger.Info($"LM Studio template transaction prepared: id={plan.TransactionId:N}, instance={plan.OriginalInstance.InstanceId}, variant={plan.OriginalInstance.SelectedVariant ?? plan.OriginalInstance.SourceModelKey}, originalSha={ShortHash(plan.GgufAnalysis.TemplateSha256)}, patchedSha={ShortHash(plan.TemplatePreview.PatchedTemplateSha256!)}"));
 
             string? patchedInstanceId = null;
+            bool patchedLoadStarted = false;
             LmStudioLifecycleStage failureStage = plan.PersistentDefaults is null ? LmStudioLifecycleStage.UnloadOriginal : LmStudioLifecycleStage.PersistDefaults;
             try
             {
@@ -150,7 +154,7 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
 
                 ReportProgress("卸载原始 LM Studio 实例");
                 failureStage = LmStudioLifecycleStage.UnloadOriginal;
-                await client.UnloadAsync(plan.OriginalInstance.InstanceId, cancellationToken).ConfigureAwait(false);
+                await UnloadOriginalWithReconciliationAsync(plan, cancellationToken).ConfigureAwait(false);
                 if (await TryCaptureAsync(plan.OriginalInstance.InstanceId, cancellationToken).ConfigureAwait(false) is not null)
                 {
                     throw new InvalidOperationException("LM Studio unload 返回成功，但原 instance 仍存在；已停止加载补丁实例。");
@@ -164,16 +168,12 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
                     : "按持久 per-model defaults 重载精确模型变体（REST 请求不含 prompt_template）");
                 failureStage = LmStudioLifecycleStage.LoadPatched;
                 await ValidateLoadTargetCurrentAsync(plan.OriginalInstance, cancellationToken).ConfigureAwait(false);
-                string loadModel = plan.OriginalInstance.SourceModelKey;
                 LmStudioPromptTemplateConfiguration? promptTemplate = plan.PersistentDefaults is null
                     ? new LmStudioPromptTemplateConfiguration("jinja", plan.TemplatePreview.PatchedTemplate!, [])
                     : null;
-                LmStudioLoadResponse load = await client.LoadAsync(
-                    loadModel,
-                    plan.OriginalInstance.LoadConfiguration,
-                    promptTemplate,
-                    PositiveTtl(plan.OriginalInstance.RemainingTtlSeconds),
-                    cancellationToken).ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
+                patchedLoadStarted = true;
+                LmStudioLoadResponse load = await LoadPatchedWithReconciliationAsync(plan, promptTemplate, cancellationToken).ConfigureAwait(false);
                 patchedInstanceId = load.InstanceId;
                 if (!LmStudioClient.LoadConfigurationsEqual(plan.OriginalInstance.LoadConfiguration, load.EchoedConfiguration))
                 {
@@ -188,8 +188,7 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
 
                 ReportProgress("验证四阶段 Codex 指令层级（含多轮后置 developer）");
                 failureStage = LmStudioLifecycleStage.ProbePatched;
-                var probe = new CodexInstructionHierarchyProbe(httpClient, endpoint, tokenProvider);
-                CodexInstructionHierarchyProbeResult hierarchy = await probe.ProbeAsync(patchedInstanceId, cancellationToken).ConfigureAwait(false);
+                CodexInstructionHierarchyProbeResult hierarchy = await ProbeWithRetryAsync(patched, cancellationToken).ConfigureAwait(false);
                 if (!hierarchy.IsCompatible)
                 {
                     throw new LmStudioCompatibilityException(hierarchy);
@@ -210,14 +209,14 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
                         cancellationToken).ConfigureAwait(false);
                 }
                 record = await UpdateRecordAsync(record, LmStudioTemplateTransactionState.PatchedAndVerified, patchedInstanceId, "补丁实例 Codex 指令层级 PASS。", cancellationToken).ConfigureAwait(false);
-                logger.Info($"LM Studio template transaction verified: id={plan.TransactionId:N}, instance={patchedInstanceId}, control={hierarchy.Control.HttpStatus}, leading={hierarchy.LeadingDeveloper.HttpStatus}, conversation={hierarchy.ConversationControl.HttpStatus}, continuation={hierarchy.ContinuationDeveloper.HttpStatus}");
+                LogSafely(() => logger.Info($"LM Studio template transaction verified: id={plan.TransactionId:N}, instance={patchedInstanceId}, control={hierarchy.Control.HttpStatus}, leading={hierarchy.LeadingDeveloper.HttpStatus}, conversation={hierarchy.ConversationControl.HttpStatus}, continuation={hierarchy.ContinuationDeveloper.HttpStatus}"));
                 ReportProgress("PatchedAndVerified：等待 Codex 配置最终确认");
                 retainLease = true;
                 return new LmStudioTemplateRepairResult(plan, patched, hierarchy, transactions.GetPath(plan.TransactionId));
             }
             catch (Exception exception)
             {
-                record = await RecordApplyFailureEvidenceAsync(record, plan.OriginalInstance.SourceModelKey, patchedInstanceId, failureStage, exception).ConfigureAwait(false);
+                record = await RecordApplyFailureEvidenceAsync(record, plan.OriginalInstance.SourceModelKey, patchedInstanceId, patchedLoadStarted, failureStage, exception).ConfigureAwait(false);
                 patchedInstanceId ??= record.CandidateInstanceId;
                 ReportProgress(plan.OriginalRuntimeTemplate.Mode == LmStudioRuntimeTemplateMode.ManagerRule
                     ? $"修复失败：正在事务式恢复原运行时规则 {plan.OriginalRuntimeTemplate.RuleVersion}"
@@ -228,7 +227,8 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
                     plan.TransactionId,
                     patchedInstanceId,
                     record,
-                    rollbackTimeout.Token).ConfigureAwait(false);
+                    rollbackTimeout.Token,
+                    patchedLoadStarted).ConfigureAwait(false);
                 throw new LmStudioTemplateApplyException(
                     $"LM Studio 运行时 Prompt Template 修复失败。{rollback.Detail}",
                     exception,
@@ -244,6 +244,80 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
                 ReleaseLifecycleLease(plan.TransactionId);
             }
         }
+    }
+
+    private async Task UnloadOriginalWithReconciliationAsync(LmStudioTemplateRepairPlan plan, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await client.UnloadAsync(plan.OriginalInstance.InstanceId, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (SwitchRetryBudget.IsTransient(exception, cancellationToken))
+        {
+            if (!await SwitchRetryBudget.TryConsumeAsync(cancellationToken).ConfigureAwait(false)) throw;
+            LmStudioLoadedInstanceSnapshot? current = await TryCaptureAsync(plan.OriginalInstance.InstanceId, cancellationToken).ConfigureAwait(false);
+            if (current is null)
+            {
+                await EnsureSourceAbsentAsync(plan.OriginalInstance.SourceModelKey, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+            if (!current.Fingerprint.Equals(plan.OriginalInstance.Fingerprint, StringComparison.Ordinal)) throw new IOException("unload 响应异常后原实例发生变化；不会重复卸载。", exception);
+            CodexInstructionHierarchyProbeResult hierarchy = await new CodexInstructionHierarchyProbe(httpClient, endpoint, tokenProvider)
+                .ProbeAsync(current.InstanceId, cancellationToken).ConfigureAwait(false);
+            if (!SameProbeSignature(hierarchy, plan.OriginalHierarchyProbe)) throw new IOException("重试 unload 前原始四阶段签名已变化。", exception);
+            if (plan.PersistentDefaults is not null) await ValidatePlanAfterDefaultsWriteAsync(plan, cancellationToken).ConfigureAwait(false);
+            current = await CaptureAsync(current.InstanceId, cancellationToken).ConfigureAwait(false);
+            if (!current.Fingerprint.Equals(plan.OriginalInstance.Fingerprint, StringComparison.Ordinal)) throw new IOException("重试 unload 前实例身份或配置已漂移。", exception);
+            await client.UnloadAsync(current.InstanceId, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task<LmStudioLoadResponse> LoadPatchedWithReconciliationAsync(
+        LmStudioTemplateRepairPlan plan,
+        LmStudioPromptTemplateConfiguration? promptTemplate,
+        CancellationToken cancellationToken)
+    {
+        LmStudioLoadedInstanceSnapshot original = plan.OriginalInstance;
+        try
+        {
+            return await client.LoadAsync(original.SourceModelKey, original.LoadConfiguration, promptTemplate, PositiveTtl(original.RemainingTtlSeconds), cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (SwitchRetryBudget.IsTransient(exception, cancellationToken))
+        {
+            if (!await SwitchRetryBudget.TryConsumeAsync(cancellationToken).ConfigureAwait(false)) throw;
+            IReadOnlyList<ModelProfile> models = await client.DiscoverNativeModelsAsync(cancellationToken).ConfigureAwait(false);
+            ModelProfile[] sameSource = models.Where(model => model.IsLoaded == true && string.Equals(model.SourceModelKey, original.SourceModelKey, StringComparison.OrdinalIgnoreCase)).ToArray();
+            if (sameSource.Length == 1)
+            {
+                LmStudioLoadedInstanceSnapshot current = await CaptureAsync(sameSource[0].Id, cancellationToken).ConfigureAwait(false);
+                ValidateReloadedSnapshot(original, current);
+                // The successful operation may have lost only its HTTP response. The
+                // caller still runs the full hierarchy and persistent-default checks.
+                return new LmStudioLoadResponse(current.InstanceId, "loaded", current.LoadConfiguration);
+            }
+            if (sameSource.Length != 0) throw new IOException("load 响应异常后出现多个同源实例；不会重发 load。", exception);
+            EnsureNativeSourceIdentityUsable(original.SourceModelKey);
+            await ValidateLoadTargetCurrentAsync(original, cancellationToken).ConfigureAwait(false);
+            await ValidateJournalGgufAsync(CreateRecord(plan), cancellationToken).ConfigureAwait(false);
+            if (plan.PersistentDefaults is not null) await LmStudioPerModelDefaultsStore.VerifyAppliedAsync(plan.PersistentDefaults, cancellationToken).ConfigureAwait(false);
+            await EnsureSourceAbsentAsync(original.SourceModelKey, cancellationToken).ConfigureAwait(false);
+            return await client.LoadAsync(original.SourceModelKey, original.LoadConfiguration, promptTemplate, PositiveTtl(original.RemainingTtlSeconds), cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task<CodexInstructionHierarchyProbeResult> ProbeWithRetryAsync(LmStudioLoadedInstanceSnapshot expected, CancellationToken cancellationToken)
+    {
+        var probe = new CodexInstructionHierarchyProbe(httpClient, endpoint, tokenProvider);
+        CodexInstructionHierarchyProbeResult result = await probe.ProbeAsync(expected.InstanceId, cancellationToken).ConfigureAwait(false);
+        if (SwitchRetryBudget.IsTransient(result) && await SwitchRetryBudget.TryConsumeAsync(cancellationToken).ConfigureAwait(false))
+        {
+            LmStudioLoadedInstanceSnapshot current = await CaptureAsync(expected.InstanceId, cancellationToken).ConfigureAwait(false);
+            if (!current.Fingerprint.Equals(expected.Fingerprint, StringComparison.Ordinal)) throw new IOException("四阶段重试前实例身份或完整加载配置发生变化。");
+            result = await probe.ProbeAsync(expected.InstanceId, cancellationToken).ConfigureAwait(false);
+        }
+        LmStudioLoadedInstanceSnapshot after = await CaptureAsync(expected.InstanceId, cancellationToken).ConfigureAwait(false);
+        if (!after.Fingerprint.Equals(expected.Fingerprint, StringComparison.Ordinal)) throw new IOException("四阶段检测期间实例身份或完整加载配置发生变化。");
+        return result;
     }
 
     public async Task<LmStudioRollbackResult> RollbackAsync(
@@ -291,6 +365,7 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
             !FileFingerprintService.Matches(transaction.OriginalDefaultsFingerprint, currentDefaultsFingerprint);
 
         IReadOnlyList<ModelProfile> models = await client.DiscoverNativeModelsAsync(cancellationToken).ConfigureAwait(false);
+        EnsureNativeSourceIdentityUsable(transaction.OriginalInstance.SourceModelKey);
         ModelProfile[] sameSource = models.Where(model =>
             model.IsLoaded == true &&
             string.Equals(model.SourceModelKey, transaction.OriginalInstance.SourceModelKey, StringComparison.OrdinalIgnoreCase)).ToArray();
@@ -311,7 +386,7 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
         bool knownPatchPresent = !string.IsNullOrWhiteSpace(knownPatchId) &&
             candidates.Any(candidate => candidate.Snapshot.InstanceId.Equals(knownPatchId, StringComparison.Ordinal));
         LmStudioRecoveryCandidate? alreadyRestored = candidates.Count == 1 ? candidates[0] : null;
-        bool originalStageEvidence = transaction.FailureStage is LmStudioLifecycleStage.LoadOriginal or LmStudioLifecycleStage.ValidateOriginal or LmStudioLifecycleStage.ProbeOriginal;
+        bool originalStageEvidence = HasOriginalRecoveryEvidence(transaction);
         bool canCloseAsAlreadyRestored = alreadyRestored is not null &&
             alreadyRestored.MatchesOriginalSnapshot &&
             alreadyRestored.ReproducesOriginalFailure &&
@@ -524,7 +599,7 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
                     ? "Codex 配置切换已提交；Completed / PersistentDefaultVerified。"
                     : "Codex 配置切换已提交；保留补丁实例。",
                 cancellationToken).ConfigureAwait(false);
-            logger.Info($"LM Studio template transaction completed: id={transactionId:N}, instance={record.PatchedInstanceId ?? "unknown"}");
+            LogSafely(() => logger.Info($"LM Studio template transaction completed: id={transactionId:N}, instance={record.PatchedInstanceId ?? "unknown"}"));
             ReportProgress("Completed：Codex 配置已提交，保留补丁实例");
         }
         finally
@@ -538,7 +613,8 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
         Guid transactionId,
         string? patchedInstanceId,
         LmStudioTemplateTransactionRecord record,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool? patchLoadStarted = null)
     {
         string transactionPath = transactions.GetPath(transactionId);
         LmStudioLifecycleStage failureStage = LmStudioLifecycleStage.RecoveryCommit;
@@ -582,6 +658,7 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
 
             LmStudioPromptTemplateConfiguration? originalPromptTemplate = RecreateOriginalRuntimeTemplate(record, rollbackAnalysis);
             IReadOnlyList<ModelProfile> models = await client.DiscoverNativeModelsAsync(cancellationToken).ConfigureAwait(false);
+            EnsureNativeSourceIdentityUsable(original.SourceModelKey);
 
             if (!string.IsNullOrWhiteSpace(effectivePatchedInstanceId))
             {
@@ -620,17 +697,18 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
                 bool canAdoptExisting = record.State == LmStudioTemplateTransactionState.Prepared ||
                     record.LastStableState == LmStudioTemplateTransactionState.Prepared ||
                     knownPatchWasUnloaded ||
-                    record.FailureStage is LmStudioLifecycleStage.LoadOriginal or LmStudioLifecycleStage.ValidateOriginal or LmStudioLifecycleStage.ProbeOriginal;
+                    HasOriginalRecoveryEvidence(record);
                 if (matchesOriginal && canAdoptExisting && await ReproducesOriginalRuntimeAsync(candidate.InstanceId, record, cancellationToken).ConfigureAwait(false))
                 {
                     await UpdateRecordAsync(record, LmStudioTemplateTransactionState.RolledBack, null, "检测到已恢复的原实例。", cancellationToken).ConfigureAwait(false);
                     return new LmStudioRollbackResult(true, "原实例已经恢复，并复现原始 Prompt Template 失败签名。", candidate, transactionPath);
                 }
 
-                bool patchLoadWasLastStable = effectivePatchedInstanceId is null &&
+                bool patchLoadWasLastStable = patchLoadStarted != false && effectivePatchedInstanceId is null &&
+                    record.FailureStage == LmStudioLifecycleStage.LoadPatched &&
                     (record.State == LmStudioTemplateTransactionState.OriginalUnloaded ||
-                     record.LastStableState == LmStudioTemplateTransactionState.OriginalUnloaded) &&
-                    record.FailureStage is not (LmStudioLifecycleStage.LoadOriginal or LmStudioLifecycleStage.ValidateOriginal or LmStudioLifecycleStage.ProbeOriginal);
+                      record.LastStableState == LmStudioTemplateTransactionState.OriginalUnloaded) &&
+                    !HasOriginalRecoveryEvidence(record) && matchesOriginal;
                 if (!patchLoadWasLastStable)
                 {
                     throw new InvalidOperationException("同一源模型存在无法唯一归因的 loaded instance；为避免卸载错误实例，自动回滚已停止。");
@@ -689,7 +767,7 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
             }
 
             await UpdateRecordAsync(record, LmStudioTemplateTransactionState.RolledBack, null, $"原实例已恢复为 {restored.InstanceId}。", cancellationToken).ConfigureAwait(false);
-            logger.Info($"LM Studio template transaction rolled back: id={transactionId:N}, restored={restored.InstanceId}");
+            LogSafely(() => logger.Info($"LM Studio template transaction rolled back: id={transactionId:N}, restored={restored.InstanceId}"));
             ReportProgress($"RolledBack：已恢复原始实例 {restored.InstanceId}");
             return new LmStudioRollbackResult(true, $"已恢复原始 LM Studio 实例 {restored.InstanceId}。", restored, transactionPath);
         }
@@ -713,7 +791,7 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
                 detail += $"；事务记录更新也失败：{journalException.GetType().Name}";
             }
 
-            logger.LogError($"LM Studio template rollback failed: id={transactionId:N}", exception);
+            LogSafely(() => logger.LogError($"LM Studio template rollback failed: id={transactionId:N}", exception));
             ReportProgress("RollbackFailed：自动恢复已停止");
             return new LmStudioRollbackResult(false, detail, null, transactionPath);
         }
@@ -746,6 +824,22 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
         LmStudioTemplateRepairPlan plan,
         CancellationToken cancellationToken)
     {
+        try
+        {
+            return await ValidatePlanBeforeMutationCoreAsync(plan, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (SwitchRetryBudget.IsTransient(exception, cancellationToken))
+        {
+            if (!await SwitchRetryBudget.TryConsumeAsync(cancellationToken).ConfigureAwait(false)) throw;
+            // Retry the whole pre-mutation validation, never only the failed request.
+            return await ValidatePlanBeforeMutationCoreAsync(plan, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task<LmStudioLoadedInstanceSnapshot> ValidatePlanBeforeMutationCoreAsync(
+        LmStudioTemplateRepairPlan plan,
+        CancellationToken cancellationToken)
+    {
         LmStudioLoadedInstanceSnapshot current = await CaptureAsync(plan.OriginalInstance.InstanceId, cancellationToken).ConfigureAwait(false);
         if (!current.Fingerprint.Equals(plan.OriginalInstance.Fingerprint, StringComparison.Ordinal))
         {
@@ -765,8 +859,7 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
             await client.ProbePromptTemplateSchemaAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        var hierarchyProbe = new CodexInstructionHierarchyProbe(httpClient, endpoint, tokenProvider);
-        CodexInstructionHierarchyProbeResult currentHierarchy = await hierarchyProbe.ProbeAsync(current.InstanceId, cancellationToken).ConfigureAwait(false);
+        CodexInstructionHierarchyProbeResult currentHierarchy = await ProbeWithRetryAsync(current, cancellationToken).ConfigureAwait(false);
         if (!SameProbeSignature(currentHierarchy, plan.OriginalHierarchyProbe))
         {
             throw new IOException("LM Studio 四阶段指令层级行为在预览后发生变化；未卸载模型，请重新 Preview。");
@@ -1006,6 +1099,7 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
     private async Task EnsureSourceAbsentAsync(string sourceModelKey, CancellationToken cancellationToken)
     {
         IReadOnlyList<ModelProfile> models = await client.DiscoverNativeModelsAsync(cancellationToken).ConfigureAwait(false);
+        EnsureNativeSourceIdentityUsable(sourceModelKey);
         if (models.Any(model =>
             model.IsLoaded == true &&
             string.Equals(model.SourceModelKey, sourceModelKey, StringComparison.OrdinalIgnoreCase)))
@@ -1447,42 +1541,59 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
         LmStudioTemplateTransactionRecord record,
         string sourceModelKey,
         string? patchedInstanceId,
+        bool patchedLoadStarted,
         LmStudioLifecycleStage failureStage,
         Exception exception)
     {
+        LmStudioTemplateTransactionRecord updated = record with
+        {
+            FailureStage = failureStage,
+            LastApiFailure = exception is LmStudioApiException apiException ? apiException.Failure : record.LastApiFailure,
+        };
         try
         {
-            IReadOnlyList<ModelProfile> models = await client.DiscoverNativeModelsAsync(CancellationToken.None).ConfigureAwait(false);
+            using var evidenceTimeout = new CancellationTokenSource(FailureEvidenceTimeout);
+            IReadOnlyList<ModelProfile> models = await client.DiscoverNativeModelsAsync(evidenceTimeout.Token).ConfigureAwait(false);
             string[] after = models
                 .Where(model => model.IsLoaded == true && string.Equals(model.SourceModelKey, sourceModelKey, StringComparison.OrdinalIgnoreCase))
                 .Select(model => model.Id)
                 .Distinct(StringComparer.Ordinal)
                 .OrderBy(value => value, StringComparer.Ordinal)
                 .ToArray();
-            string? candidate = string.IsNullOrWhiteSpace(patchedInstanceId) && after.Length == 1
+            string? candidate = patchedLoadStarted && string.IsNullOrWhiteSpace(patchedInstanceId) && after.Length == 1 &&
+                SnapshotsReloadEquivalent(record.OriginalInstance, CreateSnapshot(models.Single(model => model.IsLoaded == true && model.Id == after[0])))
                 ? after[0]
                 : record.CandidateInstanceId;
-            LmStudioTemplateTransactionRecord updated = record with
+            updated = updated with
             {
                 SchemaVersion = Math.Max(record.SchemaVersion, 2),
                 UpdatedAt = DateTimeOffset.Now,
                 LoadModelKey = record.LoadModelKey ?? sourceModelKey,
                 LastStableState = record.LastStableState ?? record.State,
-                FailureStage = failureStage,
-                LastApiFailure = exception is LmStudioApiException apiException ? apiException.Failure : record.LastApiFailure,
                 SameSourceInstanceIdsBeforeLoad = record.SameSourceInstanceIdsBeforeLoad ?? [],
                 SameSourceInstanceIdsAfterLoad = after,
                 CandidateInstanceId = candidate,
             };
-            await transactions.WriteAsync(updated, CancellationToken.None).ConfigureAwait(false);
+            await transactions.WriteAsync(updated, evidenceTimeout.Token).ConfigureAwait(false);
             return updated;
         }
-        catch (Exception evidenceException) when (evidenceException is not OperationCanceledException)
+        catch (Exception evidenceException)
         {
-            logger.Warning($"LM Studio apply failure evidence unavailable: {evidenceException.GetType().Name}");
-            return record;
+            LogSafely(() => logger.Warning($"LM Studio apply failure evidence unavailable: {evidenceException.GetType().Name}"));
+            return updated;
         }
     }
+
+    private void EnsureNativeSourceIdentityUsable(string sourceModelKey)
+    {
+        if (client.HasUnusableNativeInstances(sourceModelKey)) throw new InvalidDataException("目标源模型含缺失或重复 native instance id；无法安全确定生命周期状态。");
+    }
+
+    private static bool HasOriginalRecoveryEvidence(LmStudioTemplateTransactionRecord record) =>
+        IsOriginalRecoveryStage(record.FailureStage) || IsOriginalRecoveryStage(record.LastRecoveryFailureStage);
+
+    private static bool IsOriginalRecoveryStage(LmStudioLifecycleStage stage) => stage is
+        LmStudioLifecycleStage.LoadOriginal or LmStudioLifecycleStage.ValidateOriginal or LmStudioLifecycleStage.ProbeOriginal or LmStudioLifecycleStage.RecoveryCommit;
 
     private async Task<LmStudioTemplateTransactionRecord> UpdateRecordAsync(
         LmStudioTemplateTransactionRecord record,
@@ -1596,17 +1707,23 @@ public sealed class LmStudioInstanceController : ILmStudioInstanceController
 
     private void ReportProgress(string stage)
     {
-        logger.Info("LM Studio lifecycle stage: " + stage);
+        LogSafely(() => logger.Info("LM Studio lifecycle stage: " + stage));
         try
         {
             ProgressChanged?.Invoke(this, stage);
         }
-        catch (InvalidOperationException exception)
+        catch (Exception exception)
         {
             // UI progress is observational only. A closing/disposed WinForms
             // subscriber must never turn a verified lifecycle step into a rollback.
-            logger.Warning($"LM Studio lifecycle progress subscriber unavailable: {exception.GetType().Name}");
+            LogSafely(() => logger.Warning($"LM Studio lifecycle progress subscriber unavailable: {exception.GetType().Name}"));
         }
+    }
+
+    private static void LogSafely(Action write)
+    {
+        try { write(); }
+        catch (Exception) { /* Logging and progress are observational, never transaction prerequisites. */ }
     }
 
     private static string ShortHash(string value) => value[..Math.Min(12, value.Length)];

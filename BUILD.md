@@ -3,7 +3,7 @@
 ## 工具链
 
 - Windows 10/11 x64
-- .NET SDK `9.0.316`（由 `global.json` 固定）；所有产品项目目标框架均为 .NET 8。
+- .NET SDK `9.0.316` 基线（`global.json` 的 `latestPatch` 允许同 feature band 补丁；本轮实际为 `9.0.317`）；所有产品项目目标框架均为 .NET 8。
 - PowerShell 7 或 Windows PowerShell 5.1。
 - NuGet 网络访问仅在首次 restore/publish 缺少 runtime pack 时需要。
 
@@ -118,10 +118,30 @@ git status --short --untracked-files=all
 3. 运行 Core 与 App 两个测试项目的非 live 单元测试；
 4. 分别发布主 WinForms、Credential Helper 与 Test MCP Helper；
 5. 将 Helper 放入主发布目录的 `helpers\`；
-6. 生成 self-contained、single-file、`PublishTrimmed=false` 产物。
+6. 生成 self-contained、single-file、`PublishTrimmed=false` 产物；
+7. 校验三个候选 EXE，串行提升 staging；旧版先移动到同目录的 `win-x64.previous-<guid>`，提升或哈希复核失败则还原旧版，不提前删除；
+8. 记录源码内容身份与三个 EXE 的 SHA-256 到 `source-manifest.json`。身份由 Git HEAD 和源码/测试/构建脚本的逐文件哈希共同组成，包含未提交及未跟踪的产品输入；三个 EXE 的 `ProductVersion` 也包含此内容身份。构建过程中源码变化则不提升；
+9. 在 `finally` 中恢复脚本改动的进程环境变量（包括原来不存在的变量），无论 restore/build/test/publish/提升在哪一步失败。
 
 最终入口（相对仓库根目录）：
 
 `artifacts\publish\win-x64\CodexModelManager.exe`
 
-发布脚本只允许递归清理工程 `artifacts` 下已验证的 staging/目标路径。
+发布脚本仅在成功后清理工程 `artifacts` 下已验证且没有 reparse point 的 staging；失败时保留 staging/manifest 供取证，成功后的清理失败只告警，不覆盖发布结论。旧版保留供恢复，不自动清理历史发布。`source-manifest.json` 中的 source 文件集不包含文档和生成的 `bin/obj`，因此补记验收文档不会改变二进制源码身份。该身份是内容可追踪证据，不承诺不同时间生成的 EXE 必然逐字节一致。
+
+隔离验证发布失败窗口、旧版回退、越界/reparse 拒绝与环境还原：
+
+```powershell
+.\scripts\Test-PublishPromotion.ps1
+```
+
+该脚本只创建 `artifacts\publish-audit-<guid>` 下的假 EXE，不启动产品，不调用 LM Studio。真实发布工件的结构、版本与哈希由发布阶段及验收记录单独复核。
+
+## 有界进程与协议诊断
+
+- CLI version/status：stdout + stderr 累计上限 **256 KiB**；catalog/locator/app-server：单次累计上限 **16 MiB**。
+- smoke stdout JSONL 增量解析，上限 **16 MiB**；stderr 单独上限 **1 MiB**。超限明确失败，不将截断内容当作有效结果。
+- 共享 process runner 的同一 deadline 覆盖父进程退出及 stdout/stderr drain；后代持有管道也不能无限等待。退出、取消和异常均进入有界清理。
+- SSE 必须读到完整、合法、非错误的 Responses 事件帧才标为支持；首个合格事件即可返回，不等流关闭。`[DONE]`、error、非法 JSON 或半帧不能充当成功证据。
+- Level 3 检查真实完成事件、调用 ID、退出/错误状态及 `CMM_PONG` 结果，不把失败 `cmm_ping` 当成功；它仍需显式启动，不自动运行，不是新增切换门槛。
+- 验收关注 deadline、资源上限和减少不必要 unload/load；没有测量则不报告整体提速或真实成功率百分比。

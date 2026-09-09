@@ -146,7 +146,7 @@ public sealed class ResponsesCompatibilityClient
         {
             return new CompatibilityResult("Streaming", CompatibilityStatus.Failed, "Streaming 阶段在完整响应读取前超时。", checkedAt);
         }
-        catch (Exception exception) when (exception is HttpRequestException or IOException or JsonException)
+        catch (Exception exception) when (exception is HttpRequestException or IOException or JsonException or InvalidDataException)
         {
             return new CompatibilityResult("Streaming", CompatibilityStatus.Failed, $"Streaming 阶段协议失败（{exception.GetType().Name}）。", checkedAt);
         }
@@ -274,28 +274,7 @@ public sealed class ResponsesCompatibilityClient
     private static async Task<bool> HasSseDataEventAsync(HttpContent content, CancellationToken cancellationToken)
     {
         await using Stream stream = await content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-        using var buffer = new MemoryStream();
-        byte[] chunk = new byte[4096];
-        while (buffer.Length < MaximumStreamingBodyBytes)
-        {
-            int remaining = MaximumStreamingBodyBytes - checked((int)buffer.Length);
-            int read = await stream.ReadAsync(chunk.AsMemory(0, Math.Min(chunk.Length, remaining)), cancellationToken).ConfigureAwait(false);
-            if (read == 0)
-            {
-                break;
-            }
-
-            buffer.Write(chunk, 0, read);
-            string text = Encoding.UTF8.GetString(buffer.GetBuffer(), 0, checked((int)buffer.Length));
-            if (text.Split('\n').Any(line =>
-                line.TrimEnd('\r').StartsWith("data:", StringComparison.Ordinal) &&
-                line.TrimEnd('\r')[5..].Trim().Length > 0))
-            {
-                return true;
-            }
-        }
-
-        return false;
+        return await ResponsesSseParser.HasValidEventAsync(stream, MaximumStreamingBodyBytes, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task<string> ReadLimitedUtf8BodyAsync(
@@ -327,7 +306,14 @@ public sealed class ResponsesCompatibilityClient
             }
         }
 
-        return new UTF8Encoding(false, true).GetString(buffer.GetBuffer(), 0, checked((int)buffer.Length));
+        try
+        {
+            return new UTF8Encoding(false, true).GetString(buffer.GetBuffer(), 0, checked((int)buffer.Length));
+        }
+        catch (DecoderFallbackException exception)
+        {
+            throw new InvalidDataException("Responses JSON 响应包含无效 UTF-8。", exception);
+        }
     }
 
     private static CompatibilityReport Complete(

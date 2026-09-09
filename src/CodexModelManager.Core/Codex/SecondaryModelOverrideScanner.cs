@@ -1,10 +1,9 @@
-using System.Text.RegularExpressions;
 using CodexModelManager.Core.Abstractions;
 using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Core.Codex;
 
-public sealed partial class SecondaryModelOverrideScanner : ISecondaryModelOverrideScanner
+public sealed class SecondaryModelOverrideScanner : ISecondaryModelOverrideScanner
 {
     private readonly IConfigPatchEngine validator;
 
@@ -42,11 +41,12 @@ public sealed partial class SecondaryModelOverrideScanner : ISecondaryModelOverr
 
             return;
         }
-        string text;
+        TomlSourceDocument document;
         try
         {
-            text = await File.ReadAllTextAsync(path, cancellationToken).ConfigureAwait(false);
+            string text = await File.ReadAllTextAsync(path, cancellationToken).ConfigureAwait(false);
             validator.Validate(text);
+            document = TomlSourceDocument.Parse(text);
         }
         catch (Exception exception) when (!isPrimary && exception is
             InvalidDataException or ArgumentException or NotSupportedException or PathTooLongException or UnauthorizedAccessException or IOException)
@@ -62,68 +62,39 @@ public sealed partial class SecondaryModelOverrideScanner : ISecondaryModelOverr
             return;
         }
 
-        IReadOnlyList<string> currentTableSegments = [];
         Dictionary<string, string> providersByTable = new(StringComparer.Ordinal);
-        List<(string KeyPath, string Table, string Model, string RawValue, int Line)> pendingModels = [];
         List<(string Table, string Relative)> referencedConfigs = [];
-        List<string> projectRoots = [];
-        int lineNumber = 0;
-        var lexicalState = new TomlLineLexicalState();
-        foreach (string line in text.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n'))
+        List<string> projectRoots = isPrimary
+            ? document.Tables.Select(table => TryParseProjectRoot(table.Segments)).OfType<string>().ToList()
+            : [];
+        foreach (TomlSourceAssignment assignment in document.Assignments.Where(item => item.StringValue is not null && !item.IsArrayMember))
         {
-            lineNumber++;
-            if (!lexicalState.IsCodeLineAndAdvance(line))
+            string leafKey = assignment.Segments[^1];
+            if (leafKey == "model_provider") providersByTable[assignment.OwnerPath] = assignment.StringValue!;
+            else if (leafKey == "config_file" && assignment.Segments.Count >= 3 && assignment.Segments[0] == "agents")
             {
-                continue;
+                referencedConfigs.Add((assignment.OwnerPath, assignment.StringValue!));
             }
-
-            Match header = TableHeaderRegex().Match(line);
-            if (header.Success)
-            {
-                string rawTable = header.Groups["table"].Success ? header.Groups["table"].Value : header.Groups["array"].Value;
-                currentTableSegments = TomlDottedKey.ParseSegments(rawTable);
-                if (isPrimary && TryParseProjectRoot(currentTableSegments) is string projectRoot) projectRoots.Add(projectRoot);
-                continue;
-            }
-
-            Match assignment = AssignmentRegex().Match(line);
-            if (!assignment.Success) continue;
-            IReadOnlyList<string> keySegments = TomlDottedKey.ParseSegments(assignment.Groups["key"].Value);
-            string[] fullSegments = [.. currentTableSegments, .. keySegments];
-            string keyPath = TomlDottedKey.Canonical(fullSegments);
-            string ownerTable = TomlDottedKey.Canonical(fullSegments.Take(fullSegments.Length - 1));
-            string leafKey = fullSegments[^1];
-            string value = ReadString(assignment);
-            if (leafKey.Equals("model_provider", StringComparison.Ordinal))
-            {
-                providersByTable[ownerTable] = value;
-                continue;
-            }
-
-            if (leafKey.Equals("config_file", StringComparison.Ordinal) && ownerTable.StartsWith("agents.", StringComparison.Ordinal))
-            {
-                referencedConfigs.Add((ownerTable, value));
-                continue;
-            }
-
-            if (!IsSecondaryModelKey(leafKey, ownerTable, isPrimary)) continue;
-            pendingModels.Add((keyPath, ownerTable, value, assignment.Groups["quoted"].Value, lineNumber));
         }
 
-        foreach ((string keyPath, string ownerTable, string model, string rawValue, int line) in pendingModels)
+        foreach (IGrouping<string, TomlSourceAssignment> group in document.Assignments
+                     .Where(item => item.StringValue is not null && IsSecondaryModelKey(item.Segments[^1], item.OwnerPath, isPrimary))
+                     .GroupBy(item => item.Path, StringComparer.Ordinal))
         {
-            string? provider = providersByTable.GetValueOrDefault(ownerTable);
+            TomlSourceAssignment assignment = group.First();
+            bool ambiguous = assignment.IsArrayMember || group.Count() != 1;
+            string? provider = providersByTable.GetValueOrDefault(assignment.OwnerPath);
+            string model = assignment.StringValue!;
             results.Add(new SecondaryModelOverride(
                 path,
-                keyPath,
+                assignment.Path,
                 model,
                 provider,
                 IsPotentialCloud(model, provider),
-                isPrimary,
-                $"{Path.GetFileName(path)}:{line}",
-                rawValue));
+                isPrimary && !ambiguous,
+                ambiguous ? "Array-table override 无法通过当前选择键唯一定位，禁止自动修改。" : $"{Path.GetFileName(path)}:{assignment.LineNumber}",
+                ambiguous ? null : assignment.RawValue));
         }
-
         string? baseDirectory = Path.GetDirectoryName(path);
         foreach ((string table, string relative) in referencedConfigs)
         {
@@ -195,17 +166,4 @@ public sealed partial class SecondaryModelOverrideScanner : ISecondaryModelOverr
             : null;
     }
 
-    private static string ReadString(Match assignment)
-    {
-        if (assignment.Groups["literal"].Success) return assignment.Groups["literal"].Value;
-        string value = assignment.Groups["basic"].Value;
-        string raw = '"' + value + '"';
-        try { return System.Text.Json.JsonSerializer.Deserialize<string>(raw) ?? value; } catch (System.Text.Json.JsonException) { return value; }
-    }
-
-    [GeneratedRegex("^\\s*(?:\\[\\[(?<array>[^]]+)\\]\\]|\\[(?<table>[^]]+)\\])\\s*(?:#.*)?$", RegexOptions.CultureInvariant)]
-    private static partial Regex TableHeaderRegex();
-
-    [GeneratedRegex("""^\s*(?<key>(?:[A-Za-z0-9_-]+|"(?:\\.|[^"\\])*"|'[^']*')(?:\s*\.\s*(?:[A-Za-z0-9_-]+|"(?:\\.|[^"\\])*"|'[^']*'))*)\s*=\s*(?<quoted>"(?<basic>(?:\\.|[^"\\])*)"|'(?<literal>[^']*)')\s*(?:#.*)?$""", RegexOptions.CultureInvariant)]
-    private static partial Regex AssignmentRegex();
 }

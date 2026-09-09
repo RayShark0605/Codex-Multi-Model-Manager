@@ -127,25 +127,26 @@ public sealed class AtomicBatchWriter : IAtomicBatchWriter
 
                 Directory.CreateDirectory(directory);
                 string token = Guid.NewGuid().ToString("N");
-                string? tempPath = null;
+                string? tempPath = change.CandidateBytes is null ? null : Path.Combine(directory, $".{Path.GetFileName(fullPath)}.cmm-{token}.tmp");
+                string rollbackPath = Path.Combine(directory, $".{Path.GetFileName(fullPath)}.cmm-{token}.rollback");
+                // Register cleanup ownership before the first operation that can
+                // create a partial candidate or fail/cancel during validation.
+                staged.Add(new StagedChange(change, fullPath, tempPath, rollbackPath));
                 if (change.CandidateBytes is not null)
                 {
-                    tempPath = Path.Combine(directory, $".{Path.GetFileName(fullPath)}.cmm-{token}.tmp");
-                    await WriteTempAsync(tempPath, change.CandidateBytes, cancellationToken).ConfigureAwait(false);
+                    await WriteTempAsync(tempPath!, change.CandidateBytes, cancellationToken).ConfigureAwait(false);
                     if (change.Validator is not null)
                     {
                         await change.Validator(change.CandidateBytes).ConfigureAwait(false);
                     }
 
-                    byte[] stagedBytes = await File.ReadAllBytesAsync(tempPath, cancellationToken).ConfigureAwait(false);
+                    byte[] stagedBytes = await File.ReadAllBytesAsync(tempPath!, cancellationToken).ConfigureAwait(false);
                     if (!CryptographicOperations.FixedTimeEquals(SHA256.HashData(stagedBytes), SHA256.HashData(change.CandidateBytes)))
                     {
                         throw new IOException($"临时文件校验失败: {Path.GetFileName(fullPath)}");
                     }
                 }
 
-                string rollbackPath = Path.Combine(directory, $".{Path.GetFileName(fullPath)}.cmm-{token}.rollback");
-                staged.Add(new StagedChange(change, fullPath, tempPath, rollbackPath));
             }
 
             // Deny concurrent writers while still allowing File.Replace/File.Move to
@@ -310,7 +311,13 @@ public sealed class AtomicBatchWriter : IAtomicBatchWriter
                 }
                 else
                 {
-                    SafeDelete(item.TargetPath);
+                    // Restoring a missing baseline is a transactional operation,
+                    // not best-effort cleanup. Never hide a failed deletion.
+                    File.Delete(item.TargetPath);
+                    if (File.Exists(item.TargetPath) || Directory.Exists(item.TargetPath))
+                    {
+                        throw new IOException($"事务回滚未能恢复目标缺失状态: {item.TargetPath}");
+                    }
                 }
             }
             catch (Exception exception)

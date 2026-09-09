@@ -6,7 +6,7 @@ namespace CodexModelManager.App.UI;
 
 internal sealed class LmStudioTemplateRepairDialog : Form
 {
-    public LmStudioTemplateRepairDialog(LmStudioTemplateRepairPlan plan, bool allowApply)
+    public LmStudioTemplateRepairDialog(LmStudioTemplateRepairPlan plan, bool allowApply, string? configurationPreview = null)
     {
         ArgumentNullException.ThrowIfNull(plan);
         Text = allowApply ? "确认 LM Studio Prompt Template 持久修复" : "LM Studio Prompt Template 持久修复预览";
@@ -30,6 +30,7 @@ internal sealed class LmStudioTemplateRepairDialog : Form
         var patched = TemplateText(plan.TemplatePreview.PatchedTemplate ?? string.Empty);
         var tabs = new TabControl { Dock = DockStyle.Fill };
         tabs.TabPages.Add(Page("事务与加载配置", summary));
+        if (configurationPreview is not null) tabs.TabPages.Add(Page("Codex 配置变更", TemplateText(configurationPreview)));
         tabs.TabPages.Add(Page("GGUF 原始模板（只读）", original));
         if (plan.OriginalRuntimeTemplate.Mode == LmStudioRuntimeTemplateMode.ManagerRule)
         {
@@ -47,7 +48,7 @@ internal sealed class LmStudioTemplateRepairDialog : Form
             Text = allowApply
                 ? plan.PersistentDefaults is null
                     ? "该兼容计划没有持久 defaults 身份，自动应用已被阻断；请关闭并重新刷新模型。"
-                    : $"GGUF 不会被修改。确认后会事务式修改该模型的 LM Studio 默认 Prompt Template（{plan.PersistentDefaults.Mutation}），然后执行一次 unload/reload；目标 /load 不发送 REST prompt_template。任何失败都会先恢复 defaults，再恢复原实例。"
+                    : $"确认包含模板修复与所预览的 Codex 切换。GGUF 只读；修改 defaults（{plan.PersistentDefaults.Mutation}）并重载，四阶段通过后提交配置。瞬态故障最多自动重试一次，先核对状态，不盲重载；最终失败恢复原状态。语义变化会停止并要求重新预览。"
                 : "这是非变更 Preview：不会修改 GGUF、LM Studio defaults 或 Codex 配置，也不会 unload/load 模型。",
         };
         var buttons = new FlowLayoutPanel

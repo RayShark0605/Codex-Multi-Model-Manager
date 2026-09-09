@@ -190,15 +190,12 @@ public sealed class BackupService : IBackupService
             string manifestPath = Path.Combine(directory, "manifest.json");
             try
             {
-                BackupManifest? manifest = JsonSerializer.Deserialize<BackupManifest>(
+                BackupManifest manifest = JsonSerializer.Deserialize<BackupManifest>(
                     await File.ReadAllBytesAsync(manifestPath, cancellationToken).ConfigureAwait(false),
-                    JsonOptions);
-                if (manifest is not null)
-                {
-                    result.Add(new BackupSnapshotInfo(directory, manifest, await ValidateHashesAsync(directory, manifest, cancellationToken).ConfigureAwait(false)));
-                }
+                    JsonOptions) ?? throw new InvalidDataException("备份 manifest 为空。");
+                result.Add(new BackupSnapshotInfo(directory, manifest, await ValidateHashesAsync(directory, manifest, cancellationToken).ConfigureAwait(false)));
             }
-            catch (Exception exception) when (exception is IOException or JsonException or UnauthorizedAccessException)
+            catch (Exception exception) when (exception is IOException or InvalidDataException or JsonException or UnauthorizedAccessException)
             {
                 result.Add(new BackupSnapshotInfo(directory, new BackupManifest { CreatedAt = "损坏或不兼容" }, false));
             }
@@ -238,6 +235,7 @@ public sealed class BackupService : IBackupService
                 BackupManifest supplemental = JsonSerializer.Deserialize<BackupManifest>(
                     await File.ReadAllBytesAsync(Path.Combine(directory, "manifest.json"), cancellationToken).ConfigureAwait(false),
                     JsonOptions) ?? throw new InvalidDataException("Supplemental baseline manifest 为空。");
+                ValidateManifestShape(supplemental, supplementalBaseline: true);
                 BackupFileManifest supplementalFile = supplemental.Files.Count == 1
                     ? supplemental.Files[0]
                     : throw new InvalidDataException("Supplemental baseline 文件清单无效。");
@@ -351,8 +349,9 @@ public sealed class BackupService : IBackupService
         await WriteManifestAsync(directory, manifest, cancellationToken).ConfigureAwait(false);
     }
 
-    private static async Task<bool> ValidateHashesAsync(string directory, BackupManifest manifest, CancellationToken cancellationToken)
+    private async Task<bool> ValidateHashesAsync(string directory, BackupManifest manifest, CancellationToken cancellationToken, bool supplementalBaseline = false)
     {
+        ValidateManifestShape(manifest, supplementalBaseline);
         foreach (BackupFileManifest file in manifest.Files)
         {
             string path;
@@ -360,7 +359,7 @@ public sealed class BackupService : IBackupService
             catch (InvalidDataException) { return false; }
             if (!file.Existed)
             {
-                if (File.Exists(path)) return false;
+                if (File.Exists(path) || Directory.Exists(path)) return false;
                 continue;
             }
 
@@ -372,6 +371,59 @@ public sealed class BackupService : IBackupService
         }
 
         return true;
+    }
+
+    private void ValidateManifestShape(BackupManifest manifest, bool supplementalBaseline = false)
+    {
+        if (manifest.SchemaVersion != 1 || !Enum.IsDefined(manifest.Operation) ||
+            !DateTimeOffset.TryParse(manifest.CreatedAt, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out _) ||
+            string.IsNullOrWhiteSpace(manifest.AppVersion) || manifest.ChangedKeys is null || manifest.ChangedKeys.Any(key => key is null) ||
+            manifest.Files is null || manifest.Files.Count == 0 || manifest.Files.Any(file => file is null))
+        {
+            throw new InvalidDataException("备份 manifest 结构或版本无效。");
+        }
+
+        if (supplementalBaseline)
+        {
+            if (manifest.Operation != BackupOperation.InitialSnapshot || manifest.Files.Count != 1 || manifest.Files[0].RelativeName != "content.toml")
+            {
+                throw new InvalidDataException("Supplemental baseline 文件清单无效。");
+            }
+        }
+        else if (PrimaryFileNames.Any(name => manifest.Files.Count(file => file.RelativeName == name) != 1))
+        {
+            throw new InvalidDataException("备份缺少唯一的主配置文件条目。");
+        }
+
+        HashSet<string> storageNames = new(StringComparer.OrdinalIgnoreCase);
+        HashSet<string> targetPaths = new(StringComparer.OrdinalIgnoreCase);
+        foreach (BackupFileManifest file in manifest.Files)
+        {
+            if (string.IsNullOrWhiteSpace(file.RelativeName) || string.IsNullOrWhiteSpace(file.OriginalPath) ||
+                !Path.IsPathFullyQualified(file.OriginalPath) || file.Length < 0 || file.Sha256 is null ||
+                (file.Existed ? file.Sha256.Length != 64 || !file.Sha256.All(Uri.IsHexDigit) : file.Length != 0 || file.Sha256.Length != 0) ||
+                file.NewLine is not ("LF" or "CRLF"))
+            {
+                throw new InvalidDataException("备份文件条目结构无效。");
+            }
+
+            try
+            {
+                _ = Path.GetFullPath(file.OriginalPath);
+                string storageName = file.RelativeName.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
+                bool isSupplemental = file.RelativeName is not ("config.toml" or "models.json");
+                if (!supplementalBaseline && file.RelativeName == "content.toml") throw new InvalidDataException("History 不允许 baseline 存储条目。");
+                string target = ResolveRestoreTarget(homeProvider.GetCodexHome(), file, isSupplemental);
+                if (!storageNames.Add(storageName) || !targetPaths.Add(Path.GetFullPath(target)))
+                {
+                    throw new InvalidDataException("备份文件清单包含重复存储路径或目标。");
+                }
+            }
+            catch (Exception exception) when (exception is ArgumentException or NotSupportedException or PathTooLongException)
+            {
+                throw new InvalidDataException("备份文件清单包含无效路径。");
+            }
+        }
     }
 
     private async Task ValidateInitialSnapshotAsync(string directory, CancellationToken cancellationToken)
@@ -388,6 +440,7 @@ public sealed class BackupService : IBackupService
             throw new InvalidDataException("Initial Snapshot manifest 无效；已拒绝覆盖或继续使用。", exception);
         }
 
+        ValidateManifestShape(manifest);
         string home = Path.GetFullPath(homeProvider.GetCodexHome());
         bool validShape = manifest.Operation == BackupOperation.InitialSnapshot &&
             manifest.Files.Count == PrimaryFileNames.Length &&
@@ -415,17 +468,18 @@ public sealed class BackupService : IBackupService
         await WriteManifestAsync(directory, manifest, cancellationToken).ConfigureAwait(false);
     }
 
-    private static async Task ValidateSupplementalBaselineAsync(string directory, string expectedSource, CancellationToken cancellationToken)
+    private async Task ValidateSupplementalBaselineAsync(string directory, string expectedSource, CancellationToken cancellationToken)
     {
         BackupManifest manifest = JsonSerializer.Deserialize<BackupManifest>(
             await File.ReadAllBytesAsync(Path.Combine(directory, "manifest.json"), cancellationToken).ConfigureAwait(false),
             JsonOptions) ?? throw new InvalidDataException("Supplemental baseline manifest 为空。");
+        ValidateManifestShape(manifest, supplementalBaseline: true);
         BackupFileManifest file = manifest.Files.Count == 1
             ? manifest.Files[0]
             : throw new InvalidDataException("Supplemental baseline 文件清单无效。");
         if (!Path.GetFileName(Path.GetFullPath(directory)).Equals(PathIdentifier(expectedSource), StringComparison.OrdinalIgnoreCase) ||
             !Path.GetFullPath(file.OriginalPath).Equals(Path.GetFullPath(expectedSource), StringComparison.OrdinalIgnoreCase) ||
-            !await ValidateHashesAsync(directory, manifest, cancellationToken).ConfigureAwait(false))
+            !await ValidateHashesAsync(directory, manifest, cancellationToken, supplementalBaseline: true).ConfigureAwait(false))
         {
             throw new InvalidDataException("Supplemental baseline 与目标路径或 SHA-256 不一致；已拒绝覆盖。 ");
         }

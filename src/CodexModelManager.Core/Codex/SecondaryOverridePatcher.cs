@@ -1,108 +1,58 @@
 using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Core.Codex;
 
 public sealed record SecondaryOverrideReplacement(string Value, string? RawTomlValue = null);
 
-public static partial class SecondaryOverridePatcher
+public static class SecondaryOverridePatcher
 {
     public static (string Text, IReadOnlyList<ConfigMutation> Mutations) Apply(
         string text,
         IReadOnlyDictionary<string, string> replacements) =>
-        Apply(text, replacements.ToDictionary(
-            pair => pair.Key,
-            pair => new SecondaryOverrideReplacement(pair.Value),
-            StringComparer.Ordinal));
+        Apply(text, replacements.ToDictionary(pair => pair.Key, pair => new SecondaryOverrideReplacement(pair.Value), StringComparer.Ordinal));
 
     public static (string Text, IReadOnlyList<ConfigMutation> Mutations) Apply(
         string text,
         IReadOnlyDictionary<string, SecondaryOverrideReplacement> replacements)
     {
         if (replacements.Count == 0) return (text, []);
-        IReadOnlyList<string> currentTableSegments = [];
-        List<Line> lines = SplitLines(text);
+        TomlSourceDocument document = TomlSourceDocument.Parse(text);
         List<ConfigMutation> mutations = [];
-        var lexicalState = new TomlLineLexicalState();
-        for (int index = 0; index < lines.Count; index++)
+        List<(int Start, int Length, string Value)> edits = [];
+        foreach (IGrouping<string, TomlSourceAssignment> group in document.Assignments.GroupBy(item => item.Path, StringComparer.Ordinal))
         {
-            Line line = lines[index];
-            if (!lexicalState.IsCodeLineAndAdvance(line.Content))
+            if (!replacements.TryGetValue(group.Key, out SecondaryOverrideReplacement? replacement)) continue;
+            TomlSourceAssignment assignment = group.First();
+            if (group.Count() != 1 || assignment.IsArrayMember)
             {
-                continue;
+                throw new InvalidDataException("Secondary Override 选择无法唯一定位 array-table 项，禁止自动修改。");
             }
 
-            Match header = TableHeaderRegex().Match(line.Content);
-            if (header.Success)
-            {
-                currentTableSegments = TomlDottedKey.ParseSegments(header.Groups["table"].Success ? header.Groups["table"].Value : header.Groups["array"].Value);
-                continue;
-            }
-
-            Match assignment = AssignmentRegex().Match(line.Content);
-            if (!assignment.Success) continue;
-            IReadOnlyList<string> keySegments = TomlDottedKey.ParseSegments(assignment.Groups["key"].Value);
-            string keyPath = TomlDottedKey.Canonical([.. currentTableSegments, .. keySegments]);
-            if (!replacements.TryGetValue(keyPath, out SecondaryOverrideReplacement? replacement)) continue;
-            string old = ReadString(assignment);
+            if (assignment.StringValue is not string old) continue;
             if (old == replacement.Value && replacement.RawTomlValue is null) continue;
             string encoded = replacement.RawTomlValue ?? JsonSerializer.Serialize(replacement.Value);
-            if (replacement.RawTomlValue is not null && !QuotedStringRegex().IsMatch(replacement.RawTomlValue))
+            TomlSourceDocument replacementDocument = TomlSourceDocument.Parse("value = " + encoded);
+            if (replacementDocument.Tables.Count != 0 || replacementDocument.Assignments.Count != 1 ||
+                replacementDocument.Assignments[0].RawValue != encoded || replacementDocument.Assignments[0].StringValue != replacement.Value)
             {
-                throw new InvalidDataException($"Secondary Override 的原始 TOML 字符串无效: {keyPath}");
+                throw new InvalidDataException("Secondary Override 的原始 TOML 字符串无效或与记录语义不一致。");
             }
 
-            if (assignment.Groups["quoted"].Value == encoded) continue;
-            string prefix = line.Content[..assignment.Groups["quoted"].Index];
-            string suffix = line.Content[(assignment.Groups["quoted"].Index + assignment.Groups["quoted"].Length)..];
-            lines[index] = line with { Content = prefix + encoded + suffix };
-            mutations.Add(new ConfigMutation(keyPath, ConfigMutationKind.Change, old, replacement.Value));
+            if (assignment.RawValue == encoded) continue;
+            edits.Add((assignment.ValueStart, assignment.ValueLength, encoded));
+            mutations.Add(new ConfigMutation(assignment.Path, ConfigMutationKind.Change, old, replacement.Value));
         }
 
-        var builder = new StringBuilder(text.Length + 64);
-        foreach (Line line in lines) builder.Append(line.Content).Append(line.Ending);
-        return (builder.ToString(), mutations);
-    }
-
-    private static List<Line> SplitLines(string text)
-    {
-        List<Line> lines = [];
-        int start = 0;
-        while (start < text.Length)
+        var builder = new StringBuilder(text);
+        foreach ((int start, int length, string value) in edits.OrderByDescending(edit => edit.Start))
         {
-            int newline = text.IndexOf('\n', start);
-            if (newline < 0)
-            {
-                lines.Add(new Line(text[start..], string.Empty));
-                return lines;
-            }
-
-            int end = newline > start && text[newline - 1] == '\r' ? newline - 1 : newline;
-            lines.Add(new Line(text[start..end], end < newline ? "\r\n" : "\n"));
-            start = newline + 1;
+            builder.Remove(start, length).Insert(start, value);
         }
 
-        return lines;
+        string candidate = builder.ToString();
+        TomlSourceDocument.ParseSyntax(candidate);
+        return (candidate, mutations);
     }
-
-    private static string ReadString(Match assignment)
-    {
-        if (assignment.Groups["literal"].Success) return assignment.Groups["literal"].Value;
-        string value = assignment.Groups["basic"].Value;
-        try { return JsonSerializer.Deserialize<string>('"' + value + '"') ?? value; }
-        catch (JsonException) { return value; }
-    }
-
-    private sealed record Line(string Content, string Ending);
-
-    [GeneratedRegex("^\\s*(?:\\[\\[(?<array>[^]]+)\\]\\]|\\[(?<table>[^]]+)\\])\\s*(?:#.*)?$", RegexOptions.CultureInvariant)]
-    private static partial Regex TableHeaderRegex();
-
-    [GeneratedRegex("""^\s*(?<key>(?:[A-Za-z0-9_-]+|"(?:\\.|[^"\\])*"|'[^']*')(?:\s*\.\s*(?:[A-Za-z0-9_-]+|"(?:\\.|[^"\\])*"|'[^']*'))*)\s*=\s*(?<quoted>"(?<basic>(?:\\.|[^"\\])*)"|'(?<literal>[^']*)')""", RegexOptions.CultureInvariant)]
-    private static partial Regex AssignmentRegex();
-
-    [GeneratedRegex("""^(?:"(?:\\.|[^"\\])*"|'[^']*')$""", RegexOptions.CultureInvariant)]
-    private static partial Regex QuotedStringRegex();
 }
