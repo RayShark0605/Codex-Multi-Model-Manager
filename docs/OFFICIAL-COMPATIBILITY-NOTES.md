@@ -2,6 +2,8 @@
 
 核对日期：2026-08-23。优先级为官方文档/当前源码 > 官方脚本 > 官方 issue。
 
+2026-09-08 本地实现说明修订：下文补充模板核验范围、合并确认和有限重试边界；没有因此重新核验外部文档、重跑历史现场实验或扩大既有 PASS 的适用范围。
+
 ## Codex Provider 与认证
 
 - 当前 Codex 源码将 `openai`、`ollama`、`lmstudio` 视为内置保留 Provider ID，custom provider 不能覆盖。默认 LM Studio 因此使用 `model_provider = "lmstudio"`；非默认 endpoint/认证使用 `lmstudio_local_cmm`。
@@ -63,13 +65,16 @@
 - fallback API 缺失的能力保持 `Unknown`，不会从模型名字推断。
 - LM Studio 可以要求认证，localhost 也不能假设永远无 Token。
 - LM Studio 官方文档支持 list/load/unload、per-model defaults 与模型级 Prompt Template。另经本机 0.4.21 实际运行包 schema 与 HTTP 行为确认，`/api/v1/models/load` 接受顶层 `{ prompt_template: { type: "jinja", template, stop_strings } }`；该字段尚未出现在公开 REST 参数页，因此旧 schema-v1–v3 runtime-only 事务仍把它作为严格验证、失败即回滚的版本相关能力，而不是稳定官方契约。当前 schema-v4 正式路径改为写入经验证的 per-model default，并用**不含** REST `prompt_template` 的重载证明持久设置生效。
-- 自动流程只在精确源模板与三个已知失败码匹配、用户预览确认后运行；它保存 `selected_variant` 和全部当前可观察 load config，使用响应返回的新 instance ID，重新列举并执行 Basic/Leading/Conversation/Continuation 四阶段 Responses 差分。GGUF 始终只读；LM Studio `0.4.21.x` 与 `0.4.23.x` 的 schema-v4 路径只新增或升级 concrete GGUF defaults 中唯一的 `llm.load.promptTemplate` 字段，保留其他字段与未知属性，且在失败时从 DPAPI 证据恢复。其他版本继续 fail closed，手工导出仍保留。
+- 自动流程只在源模板满足其对应核验规则、三个已知失败码匹配且用户预览确认后运行；它保存 `selected_variant` 和全部当前可观察 load config，使用响应返回的新 instance ID，重新列举并执行 Basic/Leading/Conversation/Continuation 四阶段 Responses 差分。GGUF 始终只读；LM Studio `0.4.21.x` 与 `0.4.23.x` 的 schema-v4 路径只新增或升级 concrete GGUF defaults 中唯一的 `llm.load.promptTemplate` 字段，保留其他字段与未知属性，且在可安全回滚的失败路径中从 DPAPI 证据恢复。配置是否已提交不能确认时，保留可能仍被引用的补丁实例并要求恢复检查，不冒险卸载。其他版本继续 fail closed，手工导出仍保留。
 - 0.4.21 的实测加载契约区分三种 ID：`/load.model` 使用 list 返回的源 `key`；`selected_variant` 只作预期量化/文件验证；`instance_id` 只用于 Responses 与 `/unload`。向 `/load` 发送 `qwen/qwen3.8-27b@q8_0` 会得到 `404 model_not_found`，而源 key 可进入加载流程，因此管理器不会再把三者互换。
 - 0.4.23.0 的 Qwen3.8 Flash Next 现场再次证明逻辑加载 key 与 concrete GGUF 身份必须分开：native `SourceModelKey=qwen3.8-flash-next@iq4_xs`，而 `lms ps` 的 sharded concrete identity 为 `unsloth/Qwen3.8-Flash-Next-GGUF/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf`；后者必须与最终物理 GGUF 路径的规范化尾部一致，但不得被错误要求等于前者。
 - LM Studio 0.4.23 的正式发布记录包含 Qwen 3.8 Flash Next 改进；本工具只据现场结构精确新增 `0.4.23.x` allowlist，不由此放行 `0.4.22.x`、`0.4.24.x` 或未来版本。大型模型生命周期请求与自动回滚使用独立 30 分钟预算，普通 Provider/Preview 仍为 3 分钟，四阶段探针仍逐阶段 45 秒。
 - `prompt_template` schema 能力在卸载前用随机不存在的 model key 做无副作用探测：只有对象形态通过 schema 并到达 `404/model_not_found` 才继续。HTTP 错误只保留 status 与截断脱敏后的 `error.type/code/param/message`，不保留原始响应、模板正文或 bearer token。
-- 本机实物说明不能把“Qwen 模板”当成单一格式：Qwen3.6 的已审计源模板 SHA 为 `E84F32A23FDDA27689F868AA4A1A5621F41133E51A48D7F3EFCBEA2839574259`，较早 Qwen3.8 Q6_K/Q8_0 为 `C3CF9E34ABF4F9E36C2D72165AA9C132D3E2A725B6C2586AAA3A8AF9D7A81041`，当前 Unsloth Q6_K_XL 184 行 prefix-merged-system 模板为 `12827F24B742EA4E80CDC12DBCF9622227056B9F797252A3149263D4F9AAADCE`。`qwen-interleaved-instructions-v3` 按每个模板族的宏、tools/system 区、反向扫描、主循环、vision/reasoning/tool-call/generation 与拒绝分支精确匹配，不按 SHA 或模型名放行；旧 v2 只用于精确升级与回滚。
+- 本机实物说明不能把“Qwen 模板”当成单一格式：Qwen3.6 的已审计源模板 SHA 为 `E84F32A23FDDA27689F868AA4A1A5621F41133E51A48D7F3EFCBEA2839574259`，较早 Qwen3.8 Q6_K/Q8_0 为 `C3CF9E34ABF4F9E36C2D72165AA9C132D3E2A725B6C2586AAA3A8AF9D7A81041`，当前 Unsloth Q6_K_XL 184 行 prefix-merged-system 模板为 `12827F24B742EA4E80CDC12DBCF9622227056B9F797252A3149263D4F9AAADCE`。`qwen-interleaved-instructions-v3` 按对应模板族实施受控片段核验或完整 canonical 核验（边界见下文），不按 SHA 或模型名放行；旧 v2 只用于受控升级与回滚。这些历史哈希不是旧两族已完成整模板语义验证的证据。
 - Responses 输入允许在多轮历史中出现新的 developer/system 指令。Codex 在 Plan→Default、权限或 turn-context 更新时会追加 developer；因此 `instructions + developer + user` 单轮通过并不充分。四阶段探测的步骤 3/4 仅相差最后一个 user 前的 developer，用于把普通多轮错误与 continuation 模板错误分开。
+- 核验强度必须按模板族区分：旧 simple/reasoning 两族检查受控 system/tool/content 片段及宏入口、主循环、错误标记等关键锚点的内容和数量，未完整比较宏正文、反向扫描及 vision/reasoning/tool-call/generation 区域；这些非目标区域原文保留，但不能声明已完整验证，区域内改动也可能仍被接受。prefix-merged-system 族则继续对源模板和派生 v3 做完整 canonical 比较。本轮不收紧旧族支持范围，只修正此前“各族均完整精确匹配”的过度承诺。
+- 四阶段全部 PASS 是本次消息结构预检证据，不是模型全部工具、MCP、Plan→执行、长任务和长上下文能力的证明。生成模板、写入 defaults、加载成功和本次四阶段检查应分别记录；没有专项端到端证据的能力仍是 Untested。
+- 合并确认和重试是本管理器的应用策略，不是 LM Studio 官方接口保证：修复场景一次展示并确认模板/defaults、unload/load 和 Codex 配置变更；同次已确认切换的各阶段共享最多一次瞬态恢复预算。重试前核对配置指纹和对应实例/defaults/GGUF 证据，含副作用请求响应不明确时先读取 native 状态再决定是否需要重发。认证、已知模板错误、状态漂移、取消及预算耗尽均不会通过重复请求绕过；不声称这一策略已有真实成功率提升数据。
 
 依据：
 
@@ -104,4 +109,4 @@
 2. `preferred_auth_method` 是官方脚本遗留字段，不应机械复制到新配置。
 3. LM Studio quantization 在当前 native API 是 object，parser 不能只按 string 读取。
 4. 当前 Qwen 的 L1/L2 成功不代表完整 Codex Agent 成功；真实 Level 3 已证明其 chat template 仍不兼容 Codex 消息序列。
-5. 因此新版管理器把四阶段差分作为 LM Studio 切换硬门槛，并同时提供不修改 GGUF 的手工 v3 导出与经确认的事务式运行时 Prompt Template 注入；两者都必须以重载后的真实差分结果为准。
+5. 因此管理器把四阶段差分作为 LM Studio 切换硬门槛；当前仍提供不修改 GGUF 的手工 v3 导出，正式 schema-v4 路径则经确认写 per-model defaults 并重载，而不是继续把旧 runtime-only 注入当作持久兼容证据。两者都必须以重载后的真实差分结果为准，且不取代工具/MCP/长任务专项验证。

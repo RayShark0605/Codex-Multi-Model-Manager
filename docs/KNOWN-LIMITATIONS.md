@@ -7,10 +7,11 @@
    - 旧 v2 可让 Basic、Leading Developer、无后置 developer 的多轮 Conversation Control 三项返回 200，但 Plan→Default 会在历史后追加 developer，随后精确返回 `System and developer messages must precede conversation messages.`。当前 Unsloth prefix-merged-system 内置模板同样只收集开头连续指令，现场四阶段形状为 200/200/200/500，但 Continuation 错误仍是 `System message must be at the beginning.`；planner 仅把这一完整形状识别为 BuiltIn provenance。
    - 失败发生在 Jinja 渲染、模型生成、shell、file editing 和 MCP 之前；因此普通 Responses 或单独 function-call PASS 不能升级 Codex Agent 状态。
    - 管理器分别分类为 `lmstudio-chat-template-system-order`、`lmstudio-chat-template-developer-role` 和 `lmstudio-chat-template-continuation-instruction-order`，并在 Preview/Commit、备份和任何真实配置写入之前硬阻止。
-   - 对三个已识别失败码且结构精确匹配的 GGUF，可由用户先预览当前运行时来源、原始/v2/v3 哈希、per-model defaults 路径/前后指纹、目标模板和完整加载配置，再明确确认事务式持久 defaults 写入与 unload/load；成功导出、成功写文件、成功 POST 或成功 load 都不等于兼容，无 REST `prompt_template` 的重载、重新列举的配置保持、持久字段复核及四阶段实时差分才是依据。手工导出/重载仍是回退路径。
+   - 对三个已识别失败码且满足相应模板族核验的 GGUF，可由用户先预览当前运行时来源、原始/v2/v3 哈希、per-model defaults 路径/前后指纹、目标模板和完整加载配置，再通过一次合并确认授权 defaults 写入、unload/load 及已展示的 Codex 配置变更；成功导出、成功写文件、成功 POST 或成功 load 都不等于兼容，无 REST `prompt_template` 的重载、重新列举的配置保持、持久字段复核及四阶段实时差分才是该修复路径的依据。手工导出/重载仍是回退路径。
    - 同模型不同量化可能共享同一错误模板，但仍按 loaded instance 单独检测；不会按名称或量化继承 PASS。
-   - 本机 Qwen3.6 的源/v3 SHA 为 `E84F32A23FDDA27689F868AA4A1A5621F41133E51A48D7F3EFCBEA2839574259` / `235C3E8D316D80E23827174F1A8CEF37B1E5018CF70ED8F52F2C6FB9C0E233CD`；较早 Qwen3.8 Q6_K/Q8_0 为 `C3CF9E34ABF4F9E36C2D72165AA9C132D3E2A725B6C2586AAA3A8AF9D7A81041` / `4AA5CC42C084FCC8235AAF0500835F4F9419A72280EA7E02D08EEE9A97807D8B`；当前 Unsloth Q6_K_XL prefix-merged-system 为 `12827F24B742EA4E80CDC12DBCF9622227056B9F797252A3149263D4F9AAADCE` / `9DC0DA000D1DF280BE9F6F64D314EB52879C0DF5C3C951F74105964136592F85`。v3 对三个结构族分别做完整精确复验，并在主循环渲染 content 前显式跳过已合并的 system/developer；这些 SHA 只是审计证据，不是按名称或哈希放行的 allowlist。
-   - 任何第三种模板、锚点缺失/重复、混合换行或未知人工修改都会被保守拒绝；管理器不会生成猜测模板。
+   - 本机 Qwen3.6 的源/v3 SHA 为 `E84F32A23FDDA27689F868AA4A1A5621F41133E51A48D7F3EFCBEA2839574259` / `235C3E8D316D80E23827174F1A8CEF37B1E5018CF70ED8F52F2C6FB9C0E233CD`；较早 Qwen3.8 Q6_K/Q8_0 为 `C3CF9E34ABF4F9E36C2D72165AA9C132D3E2A725B6C2586AAA3A8AF9D7A81041` / `4AA5CC42C084FCC8235AAF0500835F4F9419A72280EA7E02D08EEE9A97807D8B`；当前 Unsloth Q6_K_XL prefix-merged-system 为 `12827F24B742EA4E80CDC12DBCF9622227056B9F797252A3149263D4F9AAADCE` / `9DC0DA000D1DF280BE9F6F64D314EB52879C0DF5C3C951F74105964136592F85`。v3 对旧 simple/reasoning 两族复验受控片段，对 prefix-merged-system 族复验完整 canonical 模板，并在主循环渲染 content 前显式跳过已合并的 system/developer；这些 SHA 只是审计证据，不是按名称或哈希放行的 allowlist。
+   - 旧 simple/reasoning 两族仅精确核验受控 system/tool/content 片段与关键锚点，不是完整模板 canonical 核验；锚点外的宏正文、反向扫描、vision/reasoning/tool-call/generation 分支保留输入原文，修改这些位置仍可能通过片段检查。本轮保留旧族的这一既有支持范围，不宣称这些区域已完整验证。prefix-merged-system 族仍要求完整 canonical 匹配；受控片段/锚点不符、重复、混合换行或未知管理器标记会拒绝，不能把“拒绝未知修改”泛化为旧族的整模板保证。
+   - 四阶段 PASS 仅证明本次 Basic/Leading/Conversation/Continuation 消息结构请求通过；不自动证明工具执行、MCP、Plan→执行、长上下文或所有模型行为可用。这些能力必须有各自的端到端证据，未测仍为 Untested。
 
 2. **Qwen metadata 是 fallback。**
    - 当前官方 Codex catalog 未提供审计 model ID 的 metadata。本工具故意不伪造 apply_patch/tool/reasoning/Plan 能力。
@@ -18,7 +19,7 @@
 3. **Secondary 外部配置是显式 opt-in。**
    - 主配置和引用的 agent/profile/project TOML 都会扫描，但默认 Preserve 且默认不勾选。
    - 只有用户明确勾选的可编辑项才参与 FollowMain/RestoreOriginal；这些文件进入同一原子事务、History 和外部修改检测，首次修改前另建不可覆盖的 supplemental baseline。
-   - 只处理扫描到的 TOML 字符串型 model override；不自动改写任意 agent 行为配置，也不猜测未知格式。RestoreOriginal 会恢复记录的原始 TOML 字符串 token（包括单/双引号形式）。
+   - 只处理扫描到的 TOML 字符串型 model override；不自动改写任意 agent 行为配置，也不猜测未知格式。RestoreOriginal 会恢复记录的原始 TOML 字符串 token（包括单/双/多行引号形式）。Windows 路径不区分大小写，TOML key 区分大小写；array-table 无法用当前选择键唯一定位 occurrence 时显示为不可编辑，不隐式批改。旧版本已因 key 大小写碰撞而丢失的历史原值无法自动重建。
 
 4. **MCP 保持 Known Limitation/Untested。**
    - 只有真实 `cmm_ping` 临时 MCP 测试通过后，当前模型的本次报告才可升级；不会据此修改用户 MCP。
@@ -33,7 +34,9 @@
 ## 设计边界
 
 - 常规发现、刷新、测试与 Preview 不自动 load/unload。只有失败码为 `lmstudio-chat-template-system-order`、`lmstudio-chat-template-developer-role` 或 `lmstudio-chat-template-continuation-instruction-order`，精确变体与 GGUF 均可证明且用户确认后，Switch 才执行事务式 unload/load；它保留 native API 暴露的加载配置，而不是选择新的 context、量化、GPU/KV 或 speculative 参数。
-- 自动 v2→v3 升级还要求精确的四阶段 v2 行为、completed v2 journal、当前 instance/config/variant、GGUF 指纹和确定性 v2 SHA 共同匹配；缺一项就在 unload 前阻断。v3 应用失败、用户取消或 Codex Commit 失败时恢复相同 v2，而不是错误退回内置模板。
+- 自动 v2→v3 升级还要求精确的四阶段 v2 行为、completed v2 journal、当前 instance/config/variant、GGUF 指纹和确定性 v2 SHA 共同匹配；缺一项就在 unload 前阻断。v3 应用失败、用户取消或能够确认配置未提交的 Codex Commit 失败时，按事务证据恢复相同 v2，而不是错误退回内置模板；提交状态不明的处理见下文。
+- 同一次已确认 Switch 的各阶段共享最多一次瞬态恢复机会；普通刷新、Preview 和未确认的操作不自动取得此预算。重试前复核已确认文件和该阶段的实例/defaults/GGUF 状态；load/unload 响应不明确时先做 native 状态核对，不直接重发。认证、已知模板错误、状态漂移、用户取消或预算耗尽时停止，不通过重试放宽条件。减少瞬态失败是设计目的，不是已测得的成功率保证。
+- 修复确认会合并展示模板/defaults、生命周期与 Codex 配置变更；确认后只有已验证重载得到的新 instance ID 可进入对应请求，其他语义或文件变化要求重新预览。若 Commit 报错但磁盘配置可能已引用补丁实例，或权威配置无法确认，保留该实例并进入恢复检查，不能仅凭异常就卸载；这种状态不报告切换成功。
 - 自动持久化目前只对本机 loopback LM Studio `0.4.21.x` 与 `0.4.23.x` 已确认的 per-model defaults JSON 结构开放。`0.4.22.x`、`0.4.24.x`、prerelease、畸形或缺失版本证据，远程 endpoint，目标 defaults 文件缺失/过大/过深，根结构不符，路径包含 reparse point/junction，concrete identity 不唯一或 Prompt Template 为未知自定义内容时，自动 Switch 会在任何文件写入和 unload 前 fail closed；只读分析、导出和 LM Studio My Models 手工设置仍可用。
 - 自动路径不写 GGUF。它只在严格 concrete identity 对应的 per-model defaults 中新增精确 v3、把有 completed provenance 的精确 v2 升级为 v3，或对精确 v3 No-op；除 `llm.load.promptTemplate` 外的 preset、operation/load 参数与未知 JSON 属性保持语义不变。目标 `/load` 明确不发送 REST `prompt_template`，必须由无运行时覆盖的重载、配置复核和四阶段全 PASS 证明持久 default 生效。
 - schema-v4 在写 defaults 前创建并验证 CurrentUser DPAPI 精确备份。失败恢复优先处理持久字段：整个文件仍为候选时恢复原始字节，存在无关并发变化时只恢复管理器拥有的 Prompt Template，字段被外部替换为未知内容时进入 `RecoveryBlocked` 且不覆盖。手工撤销仍由用户在 LM Studio 中明确操作；不要删除其他 defaults 字段或修改 GGUF。

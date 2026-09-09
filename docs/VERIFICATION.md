@@ -1,6 +1,57 @@
 # Final Verification
 
-主验证日期：2026-08-22；最新增量验证：2026-08-31（Asia/Shanghai）。
+主验证日期：2026-08-22；最新增量验证：2026-09-08（Asia/Shanghai）。
+
+## 2026-09-08：成功率导向修复、隔离回归与可恢复发布
+
+### 本轮范围与结论
+
+按已确认计划完成源码修复、回归保护、文档收敛及重新发布。具体最小复现、根因、修复和测试映射见 [修复矩阵](REMEDIATION-2026-09-08.md)。基线为干净 `master @ c7cba1f4c55e6c85bb790270f091115e7111f106`；本轮**没有提交、暂存、推送或改写 Git 历史**，发布包含本次未提交的产品输入，不能仅用 HEAD 声称二进制源码身份。
+
+重点包括 TOML decoded key/source span 保留、Secondary 大小写与 no-op 读集、原子写清理/回滚、LM 取证与恢复分离、一次合并确认与跨阶段一个重试额度、多实例 UI 状态、关闭后的独立恢复、有界进程/SSE/L3 证据、manifest/脱敏及保留旧版的发布提升。保留四阶段硬门槛和旧模板支持范围，没有添加 SSE/function calling/L3 切换门槛。
+
+### 最终自动化结果
+
+| 检查 | 结果 | 本轮证据 |
+|---|---|---|
+| Core Release 全量 | **476 PASS / 0 FAIL / 8 opt-in SKIP** | `artifacts/test-results/repair-2026-09-08/final-core.trx` |
+| App Release 全量 | **26 PASS / 0 FAIL / 0 SKIP** | 同目录 `final-app.trx` |
+| Debug / Release build | **均 PASS，0 warning / 0 error** | `build-debug.log` / `build-release.log` |
+| 只读格式验证 | **PASS** | `format-verify.log`；`dotnet format --verify-no-changes --no-restore` |
+| Git diff 空白检查 | **PASS** | `diff-check.log` |
+| 发布故障隔离测试，PowerShell 7 | **11 PASS / 0 FAIL** | `publish-promotion-tests-final.log` |
+| 相同发布故障测试，Windows PowerShell 5.1 | **11 PASS / 0 FAIL** | `publish-promotion-ps51-final.log` |
+| self-contained win-x64 发布 | **PASS**；`publish.ps1 -SkipTests`，普通测试已单独执行 | `publish.log` |
+| 三个 EXE、源码 manifest、ProductVersion 与 SHA-256 交叉复核 | **PASS** | `publish-artifacts.json` / `test-summary.json` |
+
+普通回归合计 **502 PASS / 0 FAIL**，相对本轮基线 **增加 116 个通过用例**（Core +104、App +12）。8 项现场 opt-in 测试仍然跳过，没有放宽或删除现场测试。TRX 的 `Counters.notExecuted` 在当前 runner 中为 0，但 `UnitTestResult outcome="NotExecuted"` 有 8 项；汇总以实际 result 条目和控制台结果为准。
+
+初轮定向为 Core 321、App 19 全通过；后续全量曾发现两条旧测试依赖过时错误文本：一条要求 Tomlyn 原始错误，现按安全分类/行列/无明文验证；另一条“预览后发生变化”短语在读集重构时改变，最终保留原短语。中间失败 TRX 没有删除，**不是最终结果**。交叉复审又补了取消后回滚、提交状态先于日志标记、external no-op 文件漂移、reasoning 重绑定、同 ID 刷新及 NuGet.Config 源码身份遗漏。
+
+### 发布工件与来源
+
+三个 EXE 的 ProductVersion 均为：
+
+`1.0.0+c7cba1f4c55e6c85bb790270f091115e7111f106.content-935498aa15b8c294ebc954faff69719b75460042177668ffeb653a0af7732819`
+
+| 文件（相对仓库根目录） | Bytes | SHA-256 |
+|---|---:|---|
+| `artifacts/publish/win-x64/CodexModelManager.exe` | 72,057,964 | `B9E8A0F5C235BF7EE48359C07C9EF480F9325A1D85B5FA66E174F288ED1F9D7D` |
+| `artifacts/publish/win-x64/helpers/credential/CodexModelManager.CredentialHelper.exe` | 35,498,760 | `C80BC748D2F81F6FED9FF0C197956C0DB12B976F08A7BA783355374D193120FB` |
+| `artifacts/publish/win-x64/helpers/mcp/CodexModelManager.TestMcpServer.exe` | 35,093,921 | `422951A351365547396753E2A3E6E932F278166FA385DEB5BB227D523EBC797E` |
+
+逐文件源码/构建输入 SHA 和三个 EXE 的 SHA 记录在 `artifacts/publish/win-x64/source-manifest.json`；发布后重新计算当前工作树输入，内容身份一致。未启动任何一个发布 EXE。
+
+旧发布完整保留在 `artifacts/publish/win-x64.previous-a726c8b53cd04cde8f3474498ee5bd47`。本次成功发布的 staging 已清理；失败发布会保留候选及 manifest，恢复失败会同时保留原始与回滚异常。PowerShell 5.1 初轮测试暴露了 junction 清理兼容差异，测试现用非递归的 junction 删除并在两种 PowerShell 下全部通过；初轮的纯假工件目录 `artifacts/publish-audit-01e2fea7e87b4ac18c19737e71d77915` 保留作为失败证据，不含真实配置或凭据。
+
+### 提交记录
+
+- `088007a`：`fix: 修复切换成功率缺陷并保留旧版可恢复发布`，包含本轮全部源码、测试、`publish.ps1`、`scripts` 发布脚本与 `BUILD.md`；提交前在同一工作树重跑 Debug/Release build（均 0 warning/0 error）、`dotnet format --verify-no-changes`、`git diff --check`、Core Release 476 PASS / 0 FAIL / 8 opt-in SKIP 与 App Release 26 PASS / 0 FAIL，均通过。
+- 紧随其后的 docs 提交只更新 `README.md` 与 `docs/`，不再改动源码、测试或发布脚本。两次提交都只在本地 master（仓库未配置 remote，因此不存在推送），未改写 Git 历史。上表发布工件构建于提交前的工作树，其 ProductVersion 中的 content 哈希即已提交文件集的内容身份；此后重新发布将使用新 HEAD 的内容身份。
+
+### 严格验收边界
+
+本轮使用临时目录、fake HTTP、受控隐藏进程、内存输入及不显示窗口的 STA 测试。**没有写真实 Codex 配置、凭据或 LM Studio defaults；没有进行真实模型加载/卸载/推理、真实 Provider Commit、真实 Codex Agent smoke 或可见 GUI 操作。**最终状态是计划要求的隔离修复与发布验证通过；真实端到端切换、模板长期运行、工具/MCP、Plan→执行、长上下文效果和实际成功率仍为 **NOT_RUN / 未现场验收**。下方既有现场记录仅代表原日期证据，不在本轮重认证。
 
 ## 2026-08-31：LM Studio 0.4.23 / Qwen3.8 Flash Next 切换阻断修复
 

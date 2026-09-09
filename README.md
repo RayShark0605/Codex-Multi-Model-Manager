@@ -6,6 +6,7 @@
 
 ## 当前交付状态
 
+- 2026-09-08 成功率修复：已实现配置 source-span 保留、可靠恢复、一次合并确认与共享有界重试、双页面选择一致性、有界进程、真实协议证据、坏备份隔离和可回退发布；隔离回归 **Core 476 PASS / App 26 PASS / 0 FAIL / 8 现场 opt-in SKIP**。没有写真实配置或执行真实模型重载/推理；问题矩阵见 [`docs/REMEDIATION-2026-09-08.md`](docs/REMEDIATION-2026-09-08.md)，验证和工件记录见 [`docs/VERIFICATION.md`](docs/VERIFICATION.md)。
 - OpenAI：从 Codex App Server 动态获取账户可见模型；App Server 不可用时才读取并标记可能过期的 `models_cache.json`。
 - DeepSeek：识别官方 `models.json`；否则下载并只解析官方 PowerShell setup script，离线时使用随发行版附带、带来源哈希的官方 catalog 快照。
 - LM Studio：优先调用 `/api/v1/models`，回退 `/api/v0/models`、`/v1/models`；一条 loaded instance 对应一个可查看项。native `type` 会被保留，embedding 等已知非 LLM instance 不会进入 Codex 切换列表，核心层也会再次拒绝。GGUF 自动定位保留 Hub `lms ls --json --variants`，并新增 endpoint-aware `lms ps --json --host/--port` loaded-instance 证据；native loaded state 始终是权威面。
@@ -13,7 +14,7 @@
 - 可逆备份：不可覆盖的 Initial Snapshot、显式修改外部 override 文件前的 supplemental baseline、每次切换/恢复前的 History、SHA-256 manifest。
 - 凭据：新 Token 默认进入 Windows Credential Manager；Codex 通过 command-backed auth Helper 从 stdout 获取，不进入 TOML、日志或 manifest。
 - 本地兼容性硬门槛：切换 LM Studio 前实时执行 Basic、Leading Developer、Conversation Control、Continuation Developer 四阶段差分请求；四项未全部返回 HTTP 200 且含 `output` 数组时，在备份和写盘前阻止切换。
-- Prompt Template 修复：只读解析精确 loaded instance 的 GGUF，仅对结构精确匹配的 Qwen 指令层级失败提供可预览的 `qwen-interleaved-instructions-v3` Jinja 修补；现已覆盖当前 Unsloth 184 行 prefix-merged-system 模板族。在本机 loopback LM Studio `0.4.21.x` 与 `0.4.23.x` 上，确认后会事务式写入该 concrete GGUF 的 per-model Prompt Template default，再以**不含 REST `prompt_template`** 的请求 unload/load、复核全部可观察加载参数并执行四阶段探针。它不修改 GGUF；已验证的旧 v2 可安全升级，任何失败都会先恢复持久 defaults，再确定性恢复原运行时，手工导出仍作为回退路径。
+- Prompt Template 修复：只读解析精确 loaded instance 的 GGUF，对满足对应模板族检查的 Qwen 指令层级失败提供可预览的 `qwen-interleaved-instructions-v3` Jinja 定向修补；旧 simple/reasoning 两类采用受控片段和锚点检查，Unsloth 184 行 prefix-merged-system 采用完整 canonical 模板核验。在本机 loopback LM Studio `0.4.21.x` 与 `0.4.23.x` 上，确认后会事务式写入该 concrete GGUF 的 per-model Prompt Template default，再以**不含 REST `prompt_template`** 的请求 unload/load、复核全部可观察加载参数并执行四阶段探针。它不修改 GGUF；已验证的旧 v2 可升级，提交前失败按事务恢复持久 defaults 和原运行时；若配置是否已提交无法确认，则保留可能仍被引用的补丁实例并要求恢复检查，不冒险卸载。手工导出仍作为回退路径。
 - 测试：Codex-shaped Level 1/2 Responses/SSE/function calling；用户主动触发的 Level 3 真实 Codex CLI 临时工作区测试。
 - 2026-08-24 审阅修复：已完成配置补丁、崩溃可恢复跨进程门控、设置隔离恢复、Provider/JSON/进程边界与 WinForms 生命周期的一轮系统性加固；逐项判定、运行时证据与测试映射见 [`docs/REMEDIATION-2026-08-24.md`](docs/REMEDIATION-2026-08-24.md)。
 
@@ -28,7 +29,7 @@
 4. 若使用 DeepSeek，先在“设置与日志”页将 Token 保存到 Windows Credential Manager。LM Studio 返回 401 时同样保存 LM Token。
 5. 选择 Provider 与 Model；LM Studio 页确认 `Loaded Context` 与 `Codex Configured Context` 一致。
 6. 对 LM Studio 点击 **重新检测 Codex 指令层级**。只有 Basic、Leading、Conversation、Continuation 四项都 PASS 才能切换。
-7. 若显示 **Template Fix Required** 或 **Template Upgrade Required (v2 → v3)**，可先点击 **Preview Changes** 查看当前运行时来源、GGUF 定位证据（`lms ps --json` 或 `lms ls --json --variants`）、精确 per-model defaults 路径、原/候选文件 SHA、Prompt Template 的 Add/Upgrade/No-op 语义、原始/v2/v3 模板 SHA、目标模板和完整加载配置；Preview 全程只读。点击 **Switch Model** 后会再次明确说明将修改该模型的 LM Studio 默认 Prompt Template 并执行一次 unload/reload。若 concrete identity、v2 provenance、defaults 结构或 LM Studio 版本不满足门槛，稳定诊断会保留 **分析/导出兼容模板** 和 LM Studio My Models 手工设置流程。“对应 GGUF”为空或当前选择不是已加载 LLM 时，**分析 Prompt Template** 保持禁用；底层入口也会返回可操作的中文校验错误，不再暴露 `ArgumentException(filePath)`。
+7. 若显示 **Template Fix Required** 或 **Template Upgrade Required (v2 → v3)**，可先点击 **Preview Changes** 查看当前运行时来源、GGUF 定位证据（`lms ps --json` 或 `lms ls --json --variants`）、精确 per-model defaults 路径、原/候选文件 SHA、Prompt Template 的 Add/Upgrade/No-op 语义、原始/v2/v3 模板 SHA、目标模板和完整加载配置；Preview 全程只读。点击 **Switch Model** 后使用一次合并确认，同时展示模板/defaults、unload/reload、Codex 配置差异与有限重试边界；确认后不会再弹相同范围的第二次配置确认。重载产生的新 instance ID 必须经复核，其他已确认语义或源文件发生变化则停止并要求重新预览。若 concrete identity、v2 provenance、defaults 结构或 LM Studio 版本不满足门槛，稳定诊断会保留 **分析/导出兼容模板** 和 LM Studio My Models 手工设置流程。“对应 GGUF”为空或当前选择不是已加载 LLM 时，**分析 Prompt Template** 保持禁用；底层入口也会返回可操作的中文校验错误，不再暴露 `ArgumentException(filePath)`。
 8. 点击 **Preview Changes**，检查 semantic diff、Secondary Overrides 和警告。Secondary 列表默认全部不勾选；只有明确勾选的项才会在 `FollowMain`/`RestoreOriginal` 策略下修改。
 9. **先完全退出 Codex Desktop/CLI，再单独启动管理器**，随后点击 **Switch Model** 并确认。当前 Codex 仍在运行时不要尝试真实切换；提交前会再次实时验证进程状态与指令层级，完成后再重新启动 Codex Desktop。
 
@@ -79,9 +80,14 @@ Conversation:  instructions + developer + user + assistant + user
 Continuation:  与 Conversation 相同，仅在最后一个 user 前增加 developer
 ```
 
-任一正式 LM Studio Preview 与 Commit 都必须实时通过四种结构；步骤 3/4 只改变后置 developer，因此普通多轮失败不会被误归类成模板升级问题。每次还会先从 native Models API 重新确认同一 loaded instance 与相同实际 context。instance 缺失/context 改变时不会发送可能触发后端自动加载的推理请求。成功结果不会被长期缓存，也没有绕过按钮；所有失败都发生在 History backup 和 `config.toml` 写入之前（Initial Snapshot 仍只按首次启动规则管理）。
+可提交的 LM Studio Preview 与 Commit 都必须实时通过四种结构；步骤 3/4 只改变后置 developer，因此普通多轮失败不会被误归类成模板升级问题。修复场景可以展示带已识别失败证据的只读合并预览，但这不是可跳过预检的提交计划：修复后仍须重新生成计划并通过实时检查。每次还会先从 native Models API 重新确认同一 loaded instance 与相同实际 context。instance 缺失/context 改变时不会发送可能触发后端自动加载的推理请求。成功结果不会被长期缓存，也没有绕过按钮；预检失败阻止创建切换 History 和写入 `config.toml`（Initial Snapshot 仍只按首次启动规则管理）。
 
-如果错误被分类为 `lmstudio-chat-template-system-order`、`lmstudio-chat-template-developer-role` 或 `lmstudio-chat-template-continuation-instruction-order`，LM Studio 页可只读分析对应 GGUF。修补器不会套用通用 Qwen/GPT 模板，而是要求宏、system/tool 初始区、反向扫描、主 message 循环、vision/reasoning/tool-call/generation 分支和拒绝路径全部精确且唯一匹配。当前 Unsloth 模板族还必须逐字匹配 `sysns.count == loop.index0` 前缀聚合、`merged_system` 两个输出区和 `loop.index0 >= num_sys` 保护；任何 one-change near-match、重复锚点或混合换行都返回 Unsupported。v3 遍历完整 `messages`，按原始相对顺序收集任意位置的 system/developer，使用双换行合并为唯一初始 system block；`reasoning_instructions`、tools、反向扫描和其他非目标分支逐字保持，主 conversation 循环跳过所有已合并项。
+如果错误被分类为 `lmstudio-chat-template-system-order`、`lmstudio-chat-template-developer-role` 或 `lmstudio-chat-template-continuation-instruction-order`，LM Studio 页可只读分析对应 GGUF。修补器不会套用通用 Qwen/GPT 模板；各族的核验范围不同：
+
+- **旧 simple/reasoning 两类（已审计的 Qwen3.6、较早 Qwen3.8 模板）**：核验受控 system/tool 初始区、空消息检查、主循环 content/system 分支及关键宏/循环/错误锚点的精确内容与数量，再只替换这些受控片段；不是整份模板 canonical 等同性检查。未受控的宏正文、反向扫描、vision/reasoning/tool-call/generation 分支保持输入原文，但并未因此获得完整语义认证；这些位置的修改可能仍通过片段检查。本轮保留这一支持范围，不把旧族改成整模板白名单。
+- **Unsloth prefix-merged-system 族**：源模板及派生 v3 均进行完整 canonical 比较和锚点复核，包括 `sysns.count == loop.index0` 前缀聚合、`merged_system` 输出区、`loop.index0 >= num_sys` 保护以及非目标分支；超出允许换行规范化的 near-match、重复锚点或混合换行会被拒绝。
+
+v3 按原始相对顺序收集任意位置的 system/developer，并合并为唯一初始 system block；主 conversation 循环在渲染 content 前跳过已合并项。这一结构修补不保证全部模型行为可用。**四阶段 PASS 只证明本次四种消息结构的 Responses 请求通过，不能替代 SSE、function/tool-call、MCP、Plan→执行或长上下文任务的独立端到端证据。**
 
 导出目录：
 
@@ -97,7 +103,7 @@ Continuation:  与 Conversation 相同，仅在最后一个 user 前增加 devel
 
 `/load` 的 `model` 始终使用 native list 返回的源模型 `key`（例如 `qwen/qwen3.8-27b`）；`selected_variant`（例如 `...@q8_0`）只用于精确 GGUF 定位、并发指纹和加载后量化校验。旧实现曾把 variant 字符串当成 load ID，LM Studio 0.4.21 会返回 `404 model_not_found`；新版禁止混用 source key、selected variant 与 instance ID，也不预测 `:2` 之类的新实例后缀。
 
-正式持久修复在 `%LOCALAPPDATA%\CodexModelManager\transactions` 中先写不含模板正文、完整 defaults 正文和 Token 的 schema-v4 恢复记录；它额外保存 concrete identity、defaults 路径与前后 SHA、原字段状态、目标规则/SHA、CurrentUser DPAPI 加密备份路径和持久化稳定阶段。备份必须完成写盘、解密和 SHA 校验后才允许原子修改 defaults；写入后再次确认 native instance、GGUF、concrete identity 和 defaults 未漂移，才会 unload。load、配置回显、四阶段、持久字段复核、Codex Commit 或最终完成标记任一步失败/取消，都会先恢复 defaults，再卸载可唯一归因的补丁实例并恢复原运行时。若整个 defaults 仍等于管理器候选则精确恢复原始字节；若只有无关字段并发变化则只恢复管理器拥有的 Prompt Template 并保留其他变化；若该字段被外部改成未知内容则进入 `RecoveryBlocked`，绝不覆盖或继续生命周期操作。schema-v1–v3 继续按原语义读取，旧 schema-v3 `Completed` 只证明当时的 runtime-only patch，不再作为重启后的持久证明。崩溃恢复的只读评估会同时指纹化当前 instance 和 defaults；只有持久状态处理完毕、原运行时签名复现后才关闭 journal。
+正式持久修复在 `%LOCALAPPDATA%\CodexModelManager\transactions` 中先写不含模板正文、完整 defaults 正文和 Token 的 schema-v4 恢复记录；它额外保存 concrete identity、defaults 路径与前后 SHA、原字段状态、目标规则/SHA、CurrentUser DPAPI 加密备份路径和持久化稳定阶段。备份必须完成写盘、解密和 SHA 校验后才允许原子修改 defaults；写入后再次确认 native instance、GGUF、concrete identity 和 defaults 未漂移，才会 unload。load、配置回显、四阶段、持久字段复核或能够确认 Codex 尚未提交的失败/取消，会按事务证据先恢复 defaults，再卸载可唯一归因的补丁实例并恢复原运行时。若 Codex 已提交或提交结果不明、完成标记失败，则先保留可能仍被配置引用的补丁实例和恢复记录，停止新切换并要求检查，不能把异常等同于“配置未生效”而卸载。若整个 defaults 仍等于管理器候选则精确恢复原始字节；若只有无关字段并发变化则只恢复管理器拥有的 Prompt Template 并保留其他变化；若该字段被外部改成未知内容则进入 `RecoveryBlocked`，绝不覆盖或继续生命周期操作。schema-v1–v3 继续按原语义读取，旧 schema-v3 `Completed` 只证明当时的 runtime-only patch，不再作为重启后的持久证明。崩溃恢复的只读评估会同时指纹化当前 instance 和 defaults；只有持久状态处理完毕、原运行时签名复现后才关闭 journal。
 
 ## Local Context、Max Context、Auto Compact 与 Tool Output Limit
 
@@ -132,7 +138,7 @@ toolOutputLimit = clamp(floor(loadedContext / 50), 2048, 4096)
 
 2026-08-23 本轮只读审计时，native `/api/v1/models` 报告 `qwen3.8-27b@q6_k_xl` 已加载，实际 `context_length=120064`、Max `262144`；这些是现场快照，不是代码常量。管理器在预览、卸载前、补丁加载后和 Codex Commit 前重新读取 native 状态，始终使用当时真实的 `loaded_instances[].config.context_length`，不会把 `lms ps`、模型理论 Max、截图或缓存猜作 loaded context。
 
-本机只读 GGUF 检查确认了三个不同的源模板结构：Qwen3.6 的模板 SHA-256 为 `E84F32A23FDDA27689F868AA4A1A5621F41133E51A48D7F3EFCBEA2839574259`，对应 v3 为 `235C3E8D316D80E23827174F1A8CEF37B1E5018CF70ED8F52F2C6FB9C0E233CD`；两个较早检查的 Qwen3.8-27B Q6_K/Q8_0 文件共享源 SHA `C3CF9E34ABF4F9E36C2D72165AA9C132D3E2A725B6C2586AAA3A8AF9D7A81041`，对应 v3 为 `4AA5CC42C084FCC8235AAF0500835F4F9419A72280EA7E02D08EEE9A97807D8B`；当前 Unsloth `Qwen3.8-27B-UD-Q6_K_XL.gguf` 的 184 行 prefix-merged-system 源 SHA 为 `12827F24B742EA4E80CDC12DBCF9622227056B9F797252A3149263D4F9AAADCE`，确定性 v3 SHA 为 `9DC0DA000D1DF280BE9F6F64D314EB52879C0DF5C3C951F74105964136592F85`。v3 在主 conversation 循环中对已经合并的 system/developer 连 `render_content` 都不再调用，避免 vision 计数等隐藏副作用。所有 SHA 仅用于审计、重建与漂移检测；`qwen-interleaved-instructions-v3` 仍按各模板族完整精确结构放行，未知结构或 Marker 保守返回 `Unsupported Template`。旧 v2 只用于精确识别、升级和事务回滚。
+本机只读 GGUF 检查确认了三个不同的源模板结构：Qwen3.6 的模板 SHA-256 为 `E84F32A23FDDA27689F868AA4A1A5621F41133E51A48D7F3EFCBEA2839574259`，对应 v3 为 `235C3E8D316D80E23827174F1A8CEF37B1E5018CF70ED8F52F2C6FB9C0E233CD`；两个较早检查的 Qwen3.8-27B Q6_K/Q8_0 文件共享源 SHA `C3CF9E34ABF4F9E36C2D72165AA9C132D3E2A725B6C2586AAA3A8AF9D7A81041`，对应 v3 为 `4AA5CC42C084FCC8235AAF0500835F4F9419A72280EA7E02D08EEE9A97807D8B`；当前 Unsloth `Qwen3.8-27B-UD-Q6_K_XL.gguf` 的 184 行 prefix-merged-system 源 SHA 为 `12827F24B742EA4E80CDC12DBCF9622227056B9F797252A3149263D4F9AAADCE`，确定性 v3 SHA 为 `9DC0DA000D1DF280BE9F6F64D314EB52879C0DF5C3C951F74105964136592F85`。v3 在主 conversation 循环中对已经合并的 system/developer 连 `render_content` 都不再调用，避免 vision 计数等隐藏副作用。所有 SHA 仅用于审计、重建与漂移检测；`qwen-interleaved-instructions-v3` 对旧 simple/reasoning 两族只作受控片段核验，对 prefix-merged-system 族作完整 canonical 核验；不满足对应检查或包含未知管理器 Marker 时返回 `Unsupported Template`，不能由这些哈希或片段匹配推导整份旧模板已验证。旧 v2 只用于精确识别、升级和事务回滚。
 
 ## 管理器会修改什么
 
@@ -157,7 +163,7 @@ toolOutputLimit = clamp(floor(loadedContext / 50), 2048, 4096)
 
 外部工具或用户创建的 `[model_providers.lmstudio_local]` 不属于本工具，会原样保留。
 
-未登记键会被拒绝修改。引擎用 Tomlyn 严格验证，但不把整个 TOML 重新序列化；实际修改是倒序 source-span patch，从而保留编码、BOM、LF/CRLF、尾换行、注释、顺序和未知 section。
+未登记键会被拒绝修改。主补丁、Secondary 扫描与修改共用 Tomlyn 的语法节点和原始 source-span 索引，不把整个 TOML 重新序列化；实际修改只替换明确的源区间，保留编码、BOM、LF/CRLF、尾换行、注释、顺序和未知 section。quoted key 中的点或右方括号不作为路径分隔，TOML 多行值完整处理；语法错误只输出安全分类与行列，不把原始配置行或 parser inner exception 放进诊断。
 
 ## 管理器绝不会修改什么
 
@@ -180,7 +186,13 @@ Preview 只在内存中生成 semantic diff，不创建 History，也不写 Code
 6. 依赖文件与 appsettings 先提交，主 `CODEX_HOME\config.toml` 明确标记为最后提交；现有文件用 `File.Replace`，新文件用同卷 `File.Move`。
 7. 重读和再验证；失败时按相反顺序回滚。若极端情况下回滚也失败，会保留 rollback 文件并要求从 History 恢复。
 
-两个管理器实例通过命名 semaphore 串行化写入；正式替换期间还会对已存在目标文件持有允许原子 rename、但拒绝并发 writer 的短期锁。只读、锁定、磁盘空间不足或并发改动都不会覆盖原文件。
+两个管理器实例通过命名 Mutex 串行化写入；放弃的锁在重新取得所有权后仍执行全部指纹检查。正式替换期间还会对已存在目标文件持有允许原子 rename、但拒绝并发 writer 的短期锁。只读、锁定、磁盘空间不足或并发改动会阻止不安全写入；回滚若不能恢复全部目标，则同时保留主故障与回滚故障，不将部分恢复报为成功。
+
+### 一次确认与有限自动重试
+
+普通切换保留一次配置确认；涉及 Prompt Template/defaults 与生命周期修改时，将这些动作和 Codex 配置变化合并为一次确认。只有用户确认之后，同一次切换的预检、修复和提交前检查才共享**最多一次**瞬态恢复机会，不是每个阶段各重试一次。超时、连接中断及 `408/429/502/503/504` 等瞬态故障可以消耗该预算；认证失败、已知模板错误、身份/context/配置指纹变化和用户取消不会通过重复请求绕过。
+
+重试前重新检查已确认文件和当前阶段的实例/defaults/GGUF 证据；load/unload 响应不明确时先读取 native 权威状态，已完成且可唯一归因则继续验证，只有状态明确允许时才重新发送，不盲目创建重复实例。预算耗尽、状态漂移或归因不明即停止并按事务状态回滚或进入恢复检查。这个策略旨在减少一次性瞬态故障造成的失败，不承诺未经现场测量的成功率提升，也不通过放宽门槛、无限重试或重新播放失败任务来换取 PASS。
 
 ## Initial Snapshot、History 与 DeepSeek 官方备份
 
@@ -191,7 +203,7 @@ Preview 只在内存中生成 semantic diff，不创建 History，也不写 Code
 - `history\yyyyMMdd-HHmmssfff\`：每次真实切换以及每次恢复前的当前状态；若事务包含已勾选的外部 override 文件，它们也进入同一个快照。manifest 含操作、前后 provider/model、版本、编码、换行、长度和 SHA-256，不含 Token。
 - `backup-deepseek\`：DeepSeek 官方脚本自己的目录，与本工具完全独立。
 
-“恢复上一次”“恢复所选”“恢复 Initial Snapshot”都会先备份当前状态，因此恢复本身也可逆。恢复 Initial 时还会恢复全部 supplemental baseline；SHA、原始路径标识或 TOML 校验失败即拒绝恢复。`backup-deepseek` 永远不参与这些操作。
+“恢复上一次”“恢复所选”“恢复 Initial Snapshot”都会先备份当前状态，因此恢复本身也可逆。恢复 Initial 时还会恢复全部 supplemental baseline；manifest schema/条目结构、必要主文件、路径唯一性、SHA、原始路径标识或 TOML 校验失败即拒绝恢复。损坏历史按单条标记无效，不使整张历史列表读取失败，也不把空 manifest 当成有效快照。`backup-deepseek` 永远不参与这些操作。
 
 ## Secondary Model Overrides 与隐藏云调用
 
@@ -203,7 +215,7 @@ Preview 只在内存中生成 semantic diff，不创建 History，也不写 Code
 - memory extract/consolidation model
 - 未来疑似 `*_model` 键
 
-Local 主模型不代表这些覆盖一定跟随 Local。默认策略是 **Preserve** 并提示可能的云调用；Secondary 列表同样默认不勾选。选择 `FollowMain` 时，管理器只对用户明确勾选且扫描器确认可编辑的键做精确文本补丁，并把主配置或外部 agent/profile/project TOML 纳入同一事务、History 和外部修改检测；首次触及外部文件前先创建 supplemental baseline。`RestoreOriginal` 可逐项恢复精确原值及原始 TOML 引号形式；未勾选项始终保持原样。
+Local 主模型不代表这些覆盖一定跟随 Local。默认策略是 **Preserve** 并提示可能的云调用；Secondary 列表同样默认不勾选。选择 `FollowMain` 时，管理器只对用户明确勾选且扫描器确认可编辑的键做精确文本补丁，并把主配置或外部 agent/profile/project TOML 纳入同一事务、History 和外部修改检测；首次触及外部文件前先创建 supplemental baseline。`RestoreOriginal` 可逐项恢复精确原值及原始 TOML 引号形式；未勾选项始终保持原样。选择和历史原值匹配时，Windows 路径不区分大小写，TOML key 区分大小写；array-table 项若无法用当前 KeyPath 唯一定位，则明确不可编辑，不把一次勾选解释为批量修改。
 
 ## Agent、Plan、Goal、MCP 和高级能力边界
 
