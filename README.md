@@ -1,14 +1,16 @@
 # Codex Multi-Model Manager
 
-一个面向 Windows 的 .NET 8 / WinForms 小工具，用来**安全、可逆、可预览**地切换 Codex Desktop 实际使用的 OpenAI、DeepSeek 与 LM Studio 模型。
+一个面向 Windows 的 .NET 8 / WinForms 小工具，用来**安全、可逆、可预览**地切换 Codex Desktop 实际使用的 OpenAI、DeepSeek、LM Studio 与 GLM 模型。
 
 > 设计原则：真实 `config.toml` 始终是 Source of Truth；管理器只精确修改登记过的模型相关键，不接管整个 `.codex` 目录。
 
 ## 当前交付状态
 
+- 2026-09-09 新增 GLM Provider：官方 GLM Coding Plan Responses 链路（智谱国内 bigmodel.cn / 国际 Z.ai 双平台可选），provider 表 ID 沿用官方 `ZAI`，模型目录复用/下载/快照三级来源，Token 走 Windows Credential Manager + command-backed auth 并兼容官方明文 bearer 表；UI 显示名为 `GLM`，“GLM 平台”行仅在当前/目标 Provider 为 GLM 时显示。隔离回归 **Core 500 PASS / App 27 PASS / 0 FAIL / 8 现场 opt-in SKIP**。未执行真实 GLM API 调用。
 - 2026-09-08 成功率修复：已实现配置 source-span 保留、可靠恢复、一次合并确认与共享有界重试、双页面选择一致性、有界进程、真实协议证据、坏备份隔离和可回退发布；隔离回归 **Core 476 PASS / App 26 PASS / 0 FAIL / 8 现场 opt-in SKIP**。没有写真实配置或执行真实模型重载/推理；问题矩阵见 [`docs/REMEDIATION-2026-09-08.md`](docs/REMEDIATION-2026-09-08.md)，验证和工件记录见 [`docs/VERIFICATION.md`](docs/VERIFICATION.md)。
 - OpenAI：从 Codex App Server 动态获取账户可见模型；App Server 不可用时才读取并标记可能过期的 `models_cache.json`。
 - DeepSeek：识别官方 `models.json`；否则下载并只解析官方 PowerShell setup script，离线时使用随发行版附带、带来源哈希的官方 catalog 快照。
+- GLM：识别含官方 GLM 模型的 `models.json`；否则从官方 GLM Coding Plan Codex 指南 markdown 提取 models.json 并缓存，离线时使用随发行版附带、带来源哈希的官方快照（国内/国际各一份）。
 - LM Studio：优先调用 `/api/v1/models`，回退 `/api/v0/models`、`/v1/models`；一条 loaded instance 对应一个可查看项。native `type` 会被保留，embedding 等已知非 LLM instance 不会进入 Codex 切换列表，核心层也会再次拒绝。GGUF 自动定位保留 Hub `lms ls --json --variants`，并新增 endpoint-aware `lms ps --json --host/--port` loaded-instance 证据；native loaded state 始终是权威面。
 - 配置安全：TOML 精确文本补丁、语法/语义校验、预览指纹、命名同步锁、同目录临时文件、flush、原子替换、重读校验和自动回滚。
 - 可逆备份：不可覆盖的 Initial Snapshot、显式修改外部 override 文件前的 supplemental baseline、每次切换/恢复前的 History、SHA-256 manifest。
@@ -26,8 +28,8 @@
    `artifacts\publish\win-x64\CodexModelManager.exe`
 
 3. 首次启动会只创建一次 **Initial Snapshot**。
-4. 若使用 DeepSeek，先在“设置与日志”页将 Token 保存到 Windows Credential Manager。LM Studio 返回 401 时同样保存 LM Token。
-5. 选择 Provider 与 Model；LM Studio 页确认 `Loaded Context` 与 `Codex Configured Context` 一致。
+4. 若使用 DeepSeek，先在“设置与日志”页将 Token 保存到 Windows Credential Manager。LM Studio 返回 401 时同样保存 LM Token。使用 GLM 时保存 GLM Coding Plan API Key（国内 bigmodel.cn 与国际 Z.ai 均使用同一凭据位）。
+5. 选择 Provider 与 Model；GLM 需在“当前与切换”页选择平台（智谱国内 / 国际 Z.ai）；LM Studio 页确认 `Loaded Context` 与 `Codex Configured Context` 一致。
 6. 对 LM Studio 点击 **重新检测 Codex 指令层级**。只有 Basic、Leading、Conversation、Continuation 四项都 PASS 才能切换。
 7. 若显示 **Template Fix Required** 或 **Template Upgrade Required (v2 → v3)**，可先点击 **Preview Changes** 查看当前运行时来源、GGUF 定位证据（`lms ps --json` 或 `lms ls --json --variants`）、精确 per-model defaults 路径、原/候选文件 SHA、Prompt Template 的 Add/Upgrade/No-op 语义、原始/v2/v3 模板 SHA、目标模板和完整加载配置；Preview 全程只读。点击 **Switch Model** 后使用一次合并确认，同时展示模板/defaults、unload/reload、Codex 配置差异与有限重试边界；确认后不会再弹相同范围的第二次配置确认。重载产生的新 instance ID 必须经复核，其他已确认语义或源文件发生变化则停止并要求重新预览。若 concrete identity、v2 provenance、defaults 结构或 LM Studio 版本不满足门槛，稳定诊断会保留 **分析/导出兼容模板** 和 LM Studio My Models 手工设置流程。“对应 GGUF”为空或当前选择不是已加载 LLM 时，**分析 Prompt Template** 保持禁用；底层入口也会返回可操作的中文校验错误，不再暴露 `ArgumentException(filePath)`。
 8. 点击 **Preview Changes**，检查 semantic diff、Secondary Overrides 和警告。Secondary 列表默认全部不勾选；只有明确勾选的项才会在 `FollowMain`/`RestoreOriginal` 策略下修改。
@@ -37,14 +39,14 @@
 
 Codex 可能在运行期间缓存配置、更新模型 cache 或自行写回 `config.toml`。同时写入会造成“最后写入者覆盖”或让当前进程继续使用旧状态。管理器虽然有 SHA-256/长度/时间戳的外部修改门槛和原子替换，但关闭 Codex 能从源头消除竞争。因此首版不做热注入，也不自动杀进程。
 
-## 三类 Provider
+## 四类 Provider
 
 ### OpenAI / Codex 原生
 
 - 模型不是写死列表，优先通过 App Server `model/list` 与 provider capabilities 动态发现；因此以后新增可用模型通常不需要改 UI。
 - 切回 OpenAI 会恢复管理器先前捕获的 OpenAI provider-specific state；若从未捕获过，则采用保守最小配置并明确警告。
 - 不读取、不删除 `auth.json`，不登出 ChatGPT/Codex，不操作 Credential Manager 中的 OpenAI 登录项。
-- 会清理由本工具拥有的 DeepSeek/LM Studio custom provider、catalog/context/compaction 冲突项；不会定义或覆盖保留的 `[model_providers.openai]`。若 DeepSeek table 含官方脚本的 `experimental_bearer_token`，切回 OpenAI/Local 时会把整段原文留作 dormant provider 配置，当前路由仍由 `model_provider` 决定。
+- 会清理由本工具拥有的 DeepSeek/LM Studio/GLM custom provider、catalog/context/compaction 冲突项；不会定义或覆盖保留的 `[model_providers.openai]`。若 DeepSeek table 含官方脚本的 `experimental_bearer_token`，或 `[model_providers.ZAI]` 含官方指南的 `experimental_bearer_token`，切回 OpenAI/Local 时会把整段原文留作 dormant provider 配置，当前路由仍由 `model_provider` 决定。
 
 ### DeepSeek
 
@@ -53,6 +55,16 @@ Codex 可能在运行期间缓存配置、更新模型 cache 或自行写回 `co
 - `minimal_client_version`、reasoning levels、context 与工具 metadata 均从官方 catalog 解析；Codex CLI 版本不足时直接阻止切换。
 - 官方 `backup-deepseek` 仅显示路径、文件名、时间/大小与短哈希；本工具绝不删除、移动、重命名、覆盖，也不展示其可能含 Token 的文件内容。
 - 在线 Validate/Level 3 会产生少量 DeepSeek API 调用，UI 会先请求确认。
+
+### GLM（智谱 GLM Coding Plan）
+
+- 走 GLM Coding Plan 官方 Codex 链路：`wire_api = "responses"` + 官方模型元数据 `models.json`；provider 表 ID 使用官方写法 `ZAI`（[官方接入文档](https://docs.bigmodel.cn/cn/coding-plan/tool/codex)、[国际 Z.ai 文档](https://docs.z.ai/devpack/tool/codex)）。
+- 双平台支持：智谱国内 `https://open.bigmodel.cn/api/v1` 与国际 Z.ai `https://api.z.ai/api/v1`，在“当前与切换”页选择，选择持久化到应用设置；切换时 base_url 与平台 catalog 同步。
+- 模型目录优先复用已包含官方 GLM 模型的 `~/.codex/models.json`；否则从官方 Codex 指南 markdown 提取 models.json 并缓存到本工具目录，离线时回退到随发行版附带、带来源哈希的官方快照（国内含 `glm-5.3`（1M 上下文）与 `glm-5-turbo`；国际含 `glm-5.3`）。官方 GLM models.json 不携带 `minimal_client_version`，管理器仅在其声明时执行 Codex CLI 版本门禁。
+- reasoning effort 从官方 catalog 解析（glm-5.3 为 low/high/max，默认 max）；请求值不在官方支持列表时拒绝切换；`glm-5-turbo` 未声明档位时沿用其 catalog 默认值。
+- 新配置使用 `[model_providers.ZAI.auth]` command-backed auth，Token 存 Windows Credential Manager（`CodexModelManager/GLM`），不进入 TOML、日志或 manifest；若检测到官方指南/助手写入的 `experimental_bearer_token` 明文表，则原样复用，不迁移、不复制、不显示 Token，切换到其他 Provider 时整段保留为 dormant 配置。
+- 在线 Validate 会发送少量 GLM Coding Plan API 请求（消耗套餐额度），UI 会先请求确认；Level 3 smoke test 同样支持 GLM。
+- 按量付费标准 API（`…/api/paas/v4` Chat Completions 协议）不属于官方 Codex 链路，本工具不支持；两个平台的标准 API 参考均未提供 Responses 端点。
 
 ### LM Studio
 

@@ -1,6 +1,54 @@
 # Final Verification
 
-主验证日期：2026-08-22；最新增量验证：2026-09-08（Asia/Shanghai）。
+主验证日期：2026-08-22；最新增量验证：2026-09-09（Asia/Shanghai）。
+
+## 2026-09-09：新增 GLM Provider（智谱 GLM Coding Plan）
+
+### 本轮范围与结论
+
+按已确认的三项决策实现 GLM：仅官方 GLM Coding Plan Responses 链路（两个平台的标准按量付费 API 均只有 Chat Completions 协议、无 Responses 端点，已核实官方 API 参考与 FAQ）；国内 bigmodel.cn（`https://open.bigmodel.cn/api/v1`）与国际 Z.ai（`https://api.z.ai/api/v1`）双平台 UI 可选并持久化；provider 表 ID 使用官方写法 `ZAI`。本轮**没有提交、暂存或推送**，没有写入真实 `~/.codex/config.toml`，没有执行真实 GLM API 调用或真实 Codex Agent 请求。
+
+要点：`ProviderKind.GLM`（枚举成员全大写以匹配产品显示名）+ `model_providers.ZAI` 管理表；官方 bearer 表（`experimental_bearer_token`）复用/切走保留语义与 DeepSeek 对称（`RemoveOrPreserveOfficialBearerTables` 统一四个 Configure 路径）；GLM catalog 三级来源（复用含官方 GLM 模型的 `~/.codex/models.json` → 下载官方 Codex 指南 markdown 提取 models.json → 内嵌双平台官方快照，快照带 doc/catalog SHA-256 provenance）；GLM 官方 models.json 无 `minimal_client_version`，验证器按可选处理，仅在声明时执行 CLI 版本门禁；reasoning effort 以官方 catalog 为准（glm-5.3 low/high/max、默认 max；glm-5-turbo 无档位时沿用其 catalog 默认）；Token 存 Windows Credential Manager（`CodexModelManager/GLM`）并经 command-backed auth 使用；Level 1/2 兼容性测试与 Level 3 smoke test 支持 GLM 且 UI 先确认费用。
+
+### 自动化验证
+
+| 检查 | 结果 |
+|---|---|
+| Core Release 全量 | **500 PASS / 0 FAIL / 8 现场 opt-in SKIP**（相对 2026-09-08 基线 +24：GlmProviderTests 18 + SwitchMatrix GLM 转移矩阵 6 组） |
+| App Release 隔离 STA | **26 PASS / 0 FAIL / 0 SKIP** |
+| Debug / Release build | **均 PASS，0 warning / 0 error** |
+| `dotnet format --verify-no-changes --no-restore` | **PASS**（新文件已按仓库 CRLF 规范修正） |
+| `git diff --check` | **PASS** |
+
+新增 GLM 测试覆盖：切换写表（ZAI + auth command + base_url 双平台）、无凭据/无 catalog/无平台/未知模型拒绝、reasoning 校验与 turbo 默认值、官方 bearer 表逐字复用与切走保留、manager 表切走移除、provider state 往返（tool_output_token_limit）、`ParseProvider("ZAI"/"glm")`、双平台内嵌快照离线加载、catalog 验证差异（minimal_client_version 可选）、官方指南 markdown 下载提取与 provenance、DeepSeek-only models.json 不被复用、probe 凭据状态、兼容性客户端 POST 到 `{base_url}/responses` 且携带 Bearer。
+
+### 2026-09-09 UI 跟进修复（同日）
+
+- “GLM 平台”行默认隐藏；仅当当前 `config.toml` 的 Provider 或“目标 Provider”下拉选中为 GLM 时显示（`CurrentSwitchControl.SetGlmPlatformRowVisible` + `MainController.UpdateGlmPlatformVisibility`；TableLayoutPanel AutoSize 行在控件全部隐藏时折叠为零高度）。新增 `SelectionAuditTests.GlmPlatformRowIsHiddenUnlessProviderIsGlm` STA 回归。
+- Provider 显示名从 `Glm` 改为 `GLM`：`ProviderKind` 枚举成员重命名为 `GLM`（45 处引用机械更新），目标 Provider 下拉、“当前 Provider”标签（显示 `GLM (ZAI)`）与备份 History 网格一致；`ProviderStates`/manifest 的 ToString 键随枚举更新，GLM 为本轮新增、无历史持久化键。WinForms `Control.Visible` 在父链未显示时返回合成状态，因此控件另维护 `GlmPlatformRowVisible` 显式状态供断言。
+- 门禁复跑：Core Release **500 PASS / 0 FAIL / 8 SKIP**、App Release **27 PASS / 0 FAIL / 0 SKIP**、Debug/Release build 0 warning/0 error、`dotnet format --verify-no-changes` PASS、`git diff --check` PASS；重新发布工件如下（旧版保留为 `win-x64.previous-993bb4e6899b4c179af7e75b0837cb1b`）。
+
+### 发布工件（UI 跟进后最新）
+
+ProductVersion/SourceIdentity：`4e4ffc680752b5adf36a2b94414fe610dc7e5d1e.content-c168247b7d193411ed2197899f3e962…`（完整值见 `source-manifest.json`）。
+
+| 文件（相对仓库根目录） | Bytes | SHA-256 |
+|---|---:|---|
+| `artifacts/publish/win-x64/CodexModelManager.exe` | 72,072,347 | `DFDAD690A7FED2DDD0A45A23DFCF658056A8EE00BCDA11AB434B0EF058ADD13A` |
+| `artifacts/publish/win-x64/helpers/credential/CodexModelManager.CredentialHelper.exe` | 35,508,473 | `ED07FAA4CAB3869C5B124FDE7D3BCF5B9F988D1AB6B48922FFE39175AB0F425C` |
+| `artifacts/publish/win-x64/helpers/mcp/CodexModelManager.TestMcpServer.exe` | 35,096,755 | `DC34B9E0809C8FE102060D41AA2102B2E4711DE6942226588E4D958B26997798` |
+
+### 未验证边界
+
+- 真实 GLM API 的四阶段/SSE/工具调用/推理请求未执行（需要用户提供 GLM Coding Plan Key 并在 UI 主动触发现场验证）。
+- 真实 Codex Desktop 对 `[model_providers.ZAI]` + `model_catalog_json` 的端到端行为沿用官方文档链路，未在本机做 Level 3 实测。
+- 双平台切换后的套餐计费边界（国内 Key 是否被国际端点接受等）未实测；官方 FAQ 说明两平台套餐独立。
+- UI 跟进修复仅以未显示窗口的 STA 断言验证；真实字体/DPI 渲染下“GLM 平台”行的折叠/展开效果未人工目检。
+
+### 提交记录
+
+- `18dc3d8`：`feat: 新增 GLM Provider 支持智谱国内与国际 Coding Plan Responses 端点`，包含本轮全部源码、测试、内嵌官方快照与 csproj 资源登记；提交前在同一工作树重跑 Debug/Release build（均 0 warning/0 error）、`dotnet format --verify-no-changes`、`git diff --check`、Core Release 500 PASS / 0 FAIL / 8 opt-in SKIP 与 App Release 27 PASS / 0 FAIL，均通过。
+- 紧随其后的 docs 提交只更新 `README.md` 与 `docs/`，不再改动源码、测试或发布脚本。两次提交都只在本地 master（仓库未配置 remote，因此不存在推送），未改写 Git 历史。上文发布工件构建于提交前的工作树，ProductVersion 中的 content 哈希即当时文件集的内容身份；此后重新发布将使用新 HEAD 的内容身份。
 
 ## 2026-09-08：成功率导向修复、隔离回归与可恢复发布
 
