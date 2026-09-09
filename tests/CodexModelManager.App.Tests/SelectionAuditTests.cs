@@ -21,6 +21,22 @@ public sealed class SelectionAuditTests
     });
 
     [Fact]
+    public Task GlmPlatformRowIsHiddenUnlessProviderIsGlm() => StaTest.RunAsync(async () =>
+    {
+        using var fixture = new Fixture();
+        Assert.False(fixture.Form.Current.GlmPlatformRowVisible);
+        Assert.False(fixture.Form.Current.GlmPlatformCombo.Visible);
+
+        fixture.Form.Current.ProviderCombo.SelectedItem = ProviderKind.GLM;
+        Assert.True(fixture.Form.Current.GlmPlatformRowVisible);
+
+        fixture.Form.Current.ProviderCombo.SelectedItem = ProviderKind.OpenAI;
+        Assert.False(fixture.Form.Current.GlmPlatformRowVisible);
+
+        await fixture.Controller.RunUiActionForTestAsync(() => Task.CompletedTask);
+    });
+
+    [Fact]
     public Task ConfiguredSecondLoadedInstanceSynchronizesBothPages() => StaTest.RunAsync(async () =>
     {
         using var fixture = new Fixture();

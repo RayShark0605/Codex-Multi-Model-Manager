@@ -28,6 +28,12 @@ public sealed class SwitchMatrixTests
         { ProviderKind.LmStudio, ProviderKind.OpenAI },
         { ProviderKind.DeepSeek, ProviderKind.LmStudio },
         { ProviderKind.LmStudio, ProviderKind.DeepSeek },
+        { ProviderKind.OpenAI, ProviderKind.GLM },
+        { ProviderKind.GLM, ProviderKind.OpenAI },
+        { ProviderKind.DeepSeek, ProviderKind.GLM },
+        { ProviderKind.GLM, ProviderKind.DeepSeek },
+        { ProviderKind.GLM, ProviderKind.LmStudio },
+        { ProviderKind.LmStudio, ProviderKind.GLM },
     };
 
     [Theory]
@@ -525,6 +531,7 @@ public sealed class SwitchMatrixTests
             ProviderKind.OpenAI => root,
             ProviderKind.DeepSeek => root.Replace("model = \"gpt-old\"", "model = \"deepseek-v4-pro\"\nmodel_provider = \"deepseek\"", StringComparison.Ordinal) + "\n[model_providers.deepseek]\nname = \"deepseek\"\nbase_url = \"https://api.deepseek.com/\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"sk-fixture-secret\"\n",
             ProviderKind.LmStudio => root.Replace("model = \"gpt-old\"", "model = \"qwen/local@q6\"\nmodel_provider = \"lmstudio\"\nmodel_context_window = 65536\nmodel_auto_compact_token_limit = 57344", StringComparison.Ordinal),
+            ProviderKind.GLM => root.Replace("model = \"gpt-old\"", "model = \"glm-5.3\"\nmodel_provider = \"ZAI\"", StringComparison.Ordinal) + "\n[model_providers.ZAI]\nname = \"ZAI\"\nbase_url = \"https://open.bigmodel.cn/api/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"glm-fixture-secret\"\n",
             _ => root,
         };
     }
@@ -534,6 +541,7 @@ public sealed class SwitchMatrixTests
         ProviderKind.OpenAI => "openai",
         ProviderKind.DeepSeek => "deepseek",
         ProviderKind.LmStudio => "lmstudio",
+        ProviderKind.GLM => "ZAI",
         _ => "unknown",
     };
 }

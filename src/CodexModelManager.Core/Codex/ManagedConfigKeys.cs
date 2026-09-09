@@ -33,6 +33,7 @@ public static class ManagedConfigKeys
     {
         "model_providers.deepseek",
         "model_providers.lmstudio_local_cmm",
+        "model_providers.ZAI",
     };
 
     public static bool IsManagedTable(string tablePath) =>

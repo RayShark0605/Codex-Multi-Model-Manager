@@ -7,7 +7,18 @@ public enum ProviderKind
     Unknown,
     OpenAI,
     DeepSeek,
-    LmStudio
+    LmStudio,
+    // All-caps member: the enum name is user-facing (provider combo, current-provider
+    // display, backup history), and the product is always written "GLM".
+    GLM
+}
+
+// GLM Coding Plan is served from two independent official platforms that share
+// one provider table id but differ in base URL and official model catalog.
+public enum GlmPlatform
+{
+    BigModel,
+    Zai
 }
 
 public enum CompatibilityStatus
@@ -441,7 +452,9 @@ public sealed record SwitchRequest(
     string? SecondaryOverrideSelectionJson = null,
     string? TargetAllowedCodexReasoningEfforts = null,
     int? ToolOutputTokenLimit = null,
-    AutoCompactMode? AutoCompactMode = null);
+    AutoCompactMode? AutoCompactMode = null,
+    GlmPlatform? GlmPlatform = null,
+    string? GlmCatalogPath = null);
 
 public sealed record PlannedFileChange(
     string Path,
@@ -641,6 +654,8 @@ public sealed class AppSettings
     public string? CodexHomeOverride { get; set; }
 
     public string LmStudioEndpoint { get; set; } = "http://127.0.0.1:1234";
+
+    public string GlmPlatform { get; set; } = nameof(Models.GlmPlatform.BigModel);
 
     public Dictionary<string, ModelPreference> ModelPreferences { get; set; } = new(StringComparer.Ordinal);
 

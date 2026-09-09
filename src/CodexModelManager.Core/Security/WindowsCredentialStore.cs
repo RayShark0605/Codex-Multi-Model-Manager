@@ -138,4 +138,5 @@ public static class CredentialTargets
     public const string Prefix = "CodexModelManager/";
     public const string DeepSeek = Prefix + "DeepSeek";
     public const string LmStudio = Prefix + "LMStudio";
+    public const string Glm = Prefix + "GLM";
 }

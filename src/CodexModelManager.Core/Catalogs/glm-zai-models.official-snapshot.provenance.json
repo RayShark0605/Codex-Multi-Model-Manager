@@ -1,0 +1,7 @@
+{
+  "source": "https://docs.z.ai/devpack/tool/codex",
+  "downloadedAt": "2026-09-09T12:00:00+08:00",
+  "docSha256": "04340CF175C9779ACB6011893658A8AD4001B61F5254562CBE10532B0BEE5C39",
+  "catalogSha256": "9F2CFB91BA1C66DB0553449311693C7F7785F828D846FC7EDDBC00DAD6093ABB",
+  "note": "Extracted verbatim from the official GLM Coding Plan Codex guide markdown without executing anything."
+}

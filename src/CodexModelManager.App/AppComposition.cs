@@ -38,6 +38,7 @@ internal sealed class AppComposition : IDisposable
         OverrideScanner = new SecondaryModelOverrideScanner(PatchEngine);
         Backups = new BackupService(HomeProvider, AtomicWriter, PatchEngine);
         Catalog = new DeepSeekCatalogService(HomeProvider, Paths, catalogHttpClient);
+        GlmCatalog = new GlmCatalogService(HomeProvider, Paths, catalogHttpClient);
         LmStudioPreflight = new LmStudioSwitchPreflight(providerHttpClient, ReadLmStudioSecretSafely);
         GgufReader = new GgufChatTemplateReader();
         TemplateRepair = new PromptTemplateRepairService(GgufReader);
@@ -59,6 +60,7 @@ internal sealed class AppComposition : IDisposable
     public SecondaryModelOverrideScanner OverrideScanner { get; }
     public BackupService Backups { get; }
     public DeepSeekCatalogService Catalog { get; }
+    public GlmCatalogService GlmCatalog { get; }
     public LmStudioSwitchPreflight LmStudioPreflight { get; }
     public GgufChatTemplateReader GgufReader { get; }
     public PromptTemplateRepairService TemplateRepair { get; }

@@ -142,6 +142,9 @@ public sealed class ConfigurationSwitchService
             case ProviderKind.DeepSeek:
                 await ConfigureDeepSeekAsync(roots, tables, removeTables, read, settings, request, warnings, cancellationToken).ConfigureAwait(false);
                 break;
+            case ProviderKind.GLM:
+                await ConfigureGlmAsync(roots, tables, removeTables, read, settings, request, warnings, cancellationToken).ConfigureAwait(false);
+                break;
             case ProviderKind.LmStudio:
                 ConfigureLmStudio(roots, tables, removeTables, read, request, warnings);
                 break;
@@ -273,7 +276,7 @@ public sealed class ConfigurationSwitchService
         TextFileSnapshot before = await TextFileCodec.ReadAsync(configChange.Path, cancellationToken).ConfigureAwait(false);
         ConfigReadResult beforeRead = patchEngine.Read(before.Text);
         AppSettings settings = await settingsRepository.LoadAsync(cancellationToken).ConfigureAwait(false);
-        if (regenerated.SourceProvider is ProviderKind.OpenAI or ProviderKind.DeepSeek)
+        if (regenerated.SourceProvider is ProviderKind.OpenAI or ProviderKind.DeepSeek or ProviderKind.GLM)
         {
             settings.ProviderStates[regenerated.SourceProvider.ToString()] = CaptureProviderState(regenerated.SourceProvider, beforeRead, before.Fingerprint.Sha256);
         }
@@ -375,20 +378,7 @@ public sealed class ConfigurationSwitchService
         roots["model"] = Quote(request.TargetModel);
         if (!settings.ProviderStates.ContainsKey(ProviderKind.OpenAI.ToString())) roots["model_provider"] = Quote("openai");
         if (!string.IsNullOrWhiteSpace(request.ReasoningEffort)) roots["model_reasoning_effort"] = Quote(request.ReasoningEffort);
-        string? deepSeekTree = ComposeTableTree(read, "model_providers.deepseek");
-        bool preserveOfficialBearer = deepSeekTree?.Contains("experimental_bearer_token", StringComparison.Ordinal) == true;
-        foreach (string table in ManagedConfigKeys.ProviderTables)
-        {
-            if (table == "model_providers.deepseek" && preserveOfficialBearer)
-            {
-                removeTables.RemoveAll(item => item == table);
-                warnings.Add("检测到 DeepSeek 官方脚本拥有的明文 bearer provider table；切回 OpenAI 时保留其原始文本，当前请求仍由 model_provider=openai 路由。");
-            }
-            else
-            {
-                tables[table] = null;
-            }
-        }
+        RemoveOrPreserveOfficialBearerTables(read, tables, removeTables, [], warnings, "切回 OpenAI 时");
     }
 
     private async Task ConfigureDeepSeekAsync(
@@ -454,7 +444,82 @@ public sealed class ConfigurationSwitchService
             removeTables.RemoveAll(table => table == "model_providers.deepseek");
         }
 
-        foreach (string table in ManagedConfigKeys.ProviderTables.Where(table => table != "model_providers.deepseek")) tables[table] = null;
+        RemoveOrPreserveOfficialBearerTables(read, tables, removeTables, ["model_providers.deepseek"], warnings, "切换到 DeepSeek 时");
+    }
+
+    private async Task ConfigureGlmAsync(
+        Dictionary<string, string?> roots,
+        Dictionary<string, string?> tables,
+        List<string> removeTables,
+        ConfigReadResult read,
+        AppSettings settings,
+        SwitchRequest request,
+        List<string> warnings,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(request.GlmCatalogPath) || !File.Exists(request.GlmCatalogPath))
+        {
+            throw new InvalidOperationException("GLM 官方 catalog 尚未准备好。");
+        }
+
+        byte[] catalogBytes = await File.ReadAllBytesAsync(request.GlmCatalogPath, cancellationToken).ConfigureAwait(false);
+        using JsonDocument catalog = GlmCatalogService.ValidateCatalog(catalogBytes);
+        JsonElement? selected = catalog.RootElement.GetProperty("models").EnumerateArray().FirstOrDefault(model => model.GetProperty("slug").GetString() == request.TargetModel);
+        if (selected is null || selected.Value.ValueKind == JsonValueKind.Undefined)
+        {
+            throw new InvalidOperationException("GLM catalog 中不存在所选模型。");
+        }
+
+        // Official GLM models.json carries no minimal_client_version; gate only when it declares one.
+        if (selected.Value.TryGetProperty("minimal_client_version", out JsonElement minimum) &&
+            minimum.ValueKind == JsonValueKind.String && minimum.GetString() is string required && !string.IsNullOrWhiteSpace(required))
+        {
+            CodexEnvironmentInfo environment = await runtimeProbe.DetectAsync(cancellationToken).ConfigureAwait(false);
+            if (!SemanticVersion.IsAtLeast(environment.CliVersion, required))
+            {
+                throw new InvalidOperationException($"当前 Codex 版本过低，{request.TargetModel} metadata 要求至少 {required}。");
+            }
+        }
+
+        GlmPlatform platform = request.GlmPlatform ?? throw new InvalidOperationException("GLM 平台未选择；请先选择智谱国内或国际 Z.ai。");
+        roots["model"] = Quote(request.TargetModel);
+        roots["model_provider"] = Quote(GlmPlatforms.ProviderId);
+        roots["model_catalog_json"] = Quote(Path.GetFullPath(request.GlmCatalogPath));
+        roots["forced_login_method"] = null;
+        roots["preferred_auth_method"] = null;
+        roots["model_context_window"] = null;
+        roots["model_auto_compact_token_limit"] = null;
+        roots["tool_output_token_limit"] = GetSavedProviderRoot(settings, ProviderKind.GLM, "tool_output_token_limit");
+        string? effort = request.ReasoningEffort ?? GetDefaultReasoning(selected.Value);
+        HashSet<string> allowed = GetReasoningLevels(selected.Value);
+        if (effort is not null && allowed.Count > 0 && !allowed.Contains(effort))
+        {
+            throw new InvalidOperationException($"GLM catalog 不支持 reasoning effort: {effort}");
+        }
+
+        roots["model_reasoning_effort"] = effort is null ? null : Quote(effort);
+
+        if (HasExperimentalBearerTable(read, GlmPlatforms.ProviderTableName))
+        {
+            // The official GLM guide/helper owns this table. Leave its exact bytes/comments/order
+            // in place instead of removing and re-appending a token-bearing table.
+            removeTables.RemoveAll(table => table == GlmPlatforms.ProviderTableName);
+            warnings.Add("检测到 GLM 官方明文 bearer 配置：本次继续兼容，不迁移、不复制、不显示 Token。");
+        }
+        else
+        {
+            if (string.IsNullOrWhiteSpace(request.CredentialHelperPath) || !File.Exists(request.CredentialHelperPath))
+            {
+                throw new InvalidOperationException("Credential Helper 尚未安装到稳定路径。");
+            }
+
+            if (!secretStore.Exists(CredentialNames.Glm)) throw new InvalidOperationException("尚未在 Windows Credential Manager 配置 GLM Token。");
+            tables[GlmPlatforms.ProviderTableName] = BuildCommandProviderBody(GlmPlatforms.ProviderTableName, GlmPlatforms.ProviderId, GlmPlatforms.BaseUrl(platform), request.CredentialHelperPath, CredentialNames.Glm);
+            removeTables.RemoveAll(table => table == GlmPlatforms.ProviderTableName);
+        }
+
+        RemoveOrPreserveOfficialBearerTables(read, tables, removeTables, [GlmPlatforms.ProviderTableName], warnings, "切换到 GLM 时");
+        warnings.Add("GLM 能力以官方 catalog metadata 为准；Plan/Goal/MCP 等未实测能力保持 Untested。");
     }
 
     private void ConfigureLmStudio(
@@ -501,19 +566,8 @@ public sealed class ConfigurationSwitchService
         roots["forced_login_method"] = null;
         roots["preferred_auth_method"] = null;
         roots["openai_base_url"] = null;
-        bool preserveOfficialBearer = ComposeTableTree(read, "model_providers.deepseek")?.Contains("experimental_bearer_token", StringComparison.Ordinal) == true;
-        foreach (string table in ManagedConfigKeys.ProviderTables)
-        {
-            if (table == "model_providers.deepseek" && preserveOfficialBearer)
-            {
-                removeTables.RemoveAll(item => item == table);
-                warnings.Add("检测到 DeepSeek 官方脚本拥有的明文 bearer provider table；切换到 LM Studio 时保留其原始文本，当前请求仍由 LM Studio provider 路由。");
-            }
-            else
-            {
-                tables[table] = null;
-            }
-        }
+        string? lmStudioTablePath = providerId != "lmstudio" ? "model_providers." + providerId : null;
+        RemoveOrPreserveOfficialBearerTables(read, tables, removeTables, lmStudioTablePath is null ? [] : [lmStudioTablePath], warnings, "切换到 LM Studio 时");
 
         if (providerId != "lmstudio")
         {
@@ -539,6 +593,36 @@ public sealed class ConfigurationSwitchService
         else if (request.TargetSupportsToolUse is null) warnings.Add("fallback Models API 未提供 Tool Use 能力，状态保持 Unknown；建议先运行 Level 2。");
         if (request.TargetSupportsReasoning is null) warnings.Add("未发现可依据的 reasoning capability；未写入 reasoning effort。");
         else if (request.TargetSupportsReasoning == true && allowedReasoningEfforts.Count == 0) warnings.Add("LM Studio 仅报告 on/off reasoning capability，未猜测为 Codex effort；model_reasoning_effort 将不写入。");
+    }
+
+    private static bool HasExperimentalBearerTable(ConfigReadResult read, string tablePath) =>
+        ComposeTableTree(read, tablePath)?.Contains("experimental_bearer_token", StringComparison.Ordinal) == true;
+
+    // Clears every managed provider table except the ones the caller just configured.
+    // Tables carrying an official plaintext bearer token keep their exact original text
+    // (dormant) because the current route is decided by model_provider, never by these tables.
+    private static void RemoveOrPreserveOfficialBearerTables(
+        ConfigReadResult read,
+        Dictionary<string, string?> tables,
+        List<string> removeTables,
+        IReadOnlyCollection<string> activeTables,
+        List<string> warnings,
+        string routeDescription)
+    {
+        foreach (string table in ManagedConfigKeys.ProviderTables)
+        {
+            if (activeTables.Contains(table)) continue;
+            if (HasExperimentalBearerTable(read, table))
+            {
+                string owner = table == GlmPlatforms.ProviderTableName ? "GLM 官方指南" : "DeepSeek 官方脚本";
+                removeTables.RemoveAll(item => item == table);
+                warnings.Add($"检测到 {owner}拥有的明文 bearer provider table（{table}）；{routeDescription}保留其原始文本，当前请求仍由激活的 model_provider 路由。");
+            }
+            else
+            {
+                tables[table] = null;
+            }
+        }
     }
 
     private async Task<CodexInstructionHierarchyProbeResult?> EnsureLmStudioPreflightAsync(
@@ -738,6 +822,7 @@ public sealed class ConfigurationSwitchService
             ProviderKind.OpenAI => "openai",
             ProviderKind.DeepSeek => "deepseek",
             ProviderKind.LmStudio => request.LmStudioProviderId ?? "lmstudio",
+            ProviderKind.GLM => GlmPlatforms.ProviderId,
             _ => throw new InvalidOperationException("unknown provider"),
         };
         if (!string.Equals(actualProvider, expectedProvider, StringComparison.Ordinal))
@@ -757,12 +842,13 @@ public sealed class ConfigurationSwitchService
             }
         }
 
-        if (request.TargetProvider == ProviderKind.DeepSeek)
+        if (request.TargetProvider is ProviderKind.DeepSeek or ProviderKind.GLM)
         {
+            string? expectedCatalogPath = request.TargetProvider == ProviderKind.DeepSeek ? request.DeepSeekCatalogPath : request.GlmCatalogPath;
             string? catalog = CodexRuntimeProbe.Unquote(read.RootValues.GetValueOrDefault("model_catalog_json"));
-            if (string.IsNullOrWhiteSpace(catalog) || !Path.GetFullPath(catalog).Equals(Path.GetFullPath(request.DeepSeekCatalogPath!), StringComparison.OrdinalIgnoreCase))
+            if (string.IsNullOrWhiteSpace(catalog) || !Path.GetFullPath(catalog).Equals(Path.GetFullPath(expectedCatalogPath!), StringComparison.OrdinalIgnoreCase))
             {
-                throw new InvalidDataException("候选配置语义检查失败：DeepSeek catalog 路径不一致。");
+                throw new InvalidDataException($"候选配置语义检查失败：{request.TargetProvider} catalog 路径不一致。");
             }
         }
     }
@@ -774,9 +860,9 @@ public sealed class ConfigurationSwitchService
 
     private static ProviderState CaptureProviderState(ProviderKind provider, ConfigReadResult read, string sha)
     {
-        if (provider is not (ProviderKind.OpenAI or ProviderKind.DeepSeek))
+        if (provider is not (ProviderKind.OpenAI or ProviderKind.DeepSeek or ProviderKind.GLM))
         {
-            throw new ArgumentOutOfRangeException(nameof(provider), provider, "只允许持久化 OpenAI 或 DeepSeek provider state。");
+            throw new ArgumentOutOfRangeException(nameof(provider), provider, "只允许持久化 OpenAI、DeepSeek 或 GLM provider state。");
         }
 
         Dictionary<string, string?> roots = ManagedConfigKeys.Root.ToDictionary(key => key, key => read.RootValues.TryGetValue(key, out string? value) ? value : null, StringComparer.Ordinal);

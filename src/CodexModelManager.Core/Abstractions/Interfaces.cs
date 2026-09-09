@@ -86,6 +86,13 @@ public interface IModelCatalogService
     Task<string> EnsureDeepSeekCatalogAsync(CancellationToken cancellationToken = default);
 }
 
+public interface IGlmModelCatalogService
+{
+    Task<IReadOnlyList<ModelProfile>> GetGlmModelsAsync(GlmPlatform platform, CancellationToken cancellationToken = default);
+
+    Task<string> EnsureGlmCatalogAsync(GlmPlatform platform, CancellationToken cancellationToken = default);
+}
+
 public interface ICodexRuntimeProbe
 {
     Task<CodexEnvironmentInfo> DetectAsync(CancellationToken cancellationToken = default);

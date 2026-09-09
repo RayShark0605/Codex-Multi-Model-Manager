@@ -81,6 +81,8 @@ public sealed partial class CodexRuntimeProbe : ICodexRuntimeProbe
         null or "" or "openai" => ProviderKind.OpenAI,
         "deepseek" => ProviderKind.DeepSeek,
         "lmstudio" or "lmstudio_local" or "lmstudio_local_cmm" => ProviderKind.LmStudio,
+        // Official GLM guide writes "ZAI"; community guides sometimes use "glm".
+        "zai" or "glm" => ProviderKind.GLM,
         _ => ProviderKind.Unknown,
     };
 

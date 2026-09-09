@@ -161,6 +161,7 @@ internal sealed class SwitchHarness : IDisposable
         Secrets = new FakeSecretStore();
         Secrets.Save(CredentialNames.DeepSeek, "sk-test".AsSpan());
         Secrets.Save(CredentialNames.LmStudio, "lm-test".AsSpan());
+        Secrets.Save(CredentialNames.Glm, "glm-test".AsSpan());
         Scanner = new SecondaryModelOverrideScanner(Patch);
         Backups = new BackupService(Home, Writer, Patch, "1.0.0-test", cliVersion);
         Preflight = new FakeLmStudioSwitchPreflight();
@@ -169,6 +170,8 @@ internal sealed class SwitchHarness : IDisposable
         File.WriteAllText(HelperPath, "test");
         CatalogPath = System.IO.Path.Combine(root.Path, "deepseek-models.json");
         File.WriteAllText(CatalogPath, TestCatalog, new UTF8Encoding(false));
+        GlmCatalogPath = System.IO.Path.Combine(root.Path, "glm-models.json");
+        File.WriteAllText(GlmCatalogPath, TestGlmCatalog, new UTF8Encoding(false));
     }
 
     public TestCodexHomeProvider Home { get; }
@@ -184,11 +187,13 @@ internal sealed class SwitchHarness : IDisposable
     public ConfigurationSwitchService Service { get; }
     public string HelperPath { get; }
     public string CatalogPath { get; }
+    public string GlmCatalogPath { get; }
 
     public SwitchRequest Request(ProviderKind provider) => provider switch
     {
         ProviderKind.OpenAI => new SwitchRequest(provider, "gpt-5.6-sol", "max"),
         ProviderKind.DeepSeek => new SwitchRequest(provider, "deepseek-v4-pro", "high", CredentialHelperPath: HelperPath, DeepSeekCatalogPath: CatalogPath),
+        ProviderKind.GLM => new SwitchRequest(provider, "glm-5.3", null, CredentialHelperPath: HelperPath, GlmPlatform: GlmPlatform.BigModel, GlmCatalogPath: GlmCatalogPath),
         ProviderKind.LmStudio => new SwitchRequest(provider, "qwen/local@q6", null, 65_536, ConfigurationSwitchService.SuggestAutoCompact(65_536), LmStudioProviderId: "lmstudio", LmStudioEndpoint: new Uri("http://127.0.0.1:1234"), CredentialHelperPath: HelperPath, ToolOutputTokenLimit: ConfigurationSwitchService.SuggestToolOutputLimit(65_536), AutoCompactMode: AutoCompactMode.Automatic),
         _ => throw new ArgumentOutOfRangeException(nameof(provider)),
     };
@@ -234,6 +239,39 @@ internal sealed class SwitchHarness : IDisposable
                 { "effort": "high", "description": "high" },
                 { "effort": "max", "description": "max" }
               ]
+            }
+          ]
+        }
+        """;
+
+    internal const string TestGlmCatalog = """
+        {
+          "models": [
+            {
+              "slug": "glm-5.3",
+              "display_name": "glm-5.3",
+              "description": "official-test-shape",
+              "context_window": 1048576,
+              "default_reasoning_level": "max",
+              "supported_reasoning_levels": [
+                { "effort": "low", "description": "Light reasoning" },
+                { "effort": "high", "description": "Enhanced reasoning" },
+                { "effort": "max", "description": "Deep reasoning" }
+              ],
+              "apply_patch_tool_type": "freeform",
+              "shell_type": "shell_command",
+              "input_modalities": ["text"]
+            },
+            {
+              "slug": "glm-5-turbo",
+              "display_name": "glm-5-turbo",
+              "description": "agent-optimized",
+              "context_window": 204800,
+              "default_reasoning_level": "max",
+              "supported_reasoning_levels": [],
+              "apply_patch_tool_type": "freeform",
+              "shell_type": "shell_command",
+              "input_modalities": ["text"]
             }
           ]
         }

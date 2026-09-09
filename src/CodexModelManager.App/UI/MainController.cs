@@ -39,6 +39,7 @@ internal sealed class MainController : IDisposable
     private string? credentialHelperPath;
     private string? mcpServerPath;
     private string? currentReasoningEffort;
+    private ProviderKind currentProviderKind = ProviderKind.Unknown;
     private SwitchPlan? lastPlan;
     private GgufChatTemplateAnalysis? templateAnalysis;
     private PromptTemplateRepairPreview? templateRepairPreview;
@@ -85,6 +86,7 @@ internal sealed class MainController : IDisposable
             LmStudioEndpointDetection detectedEndpoint = await LmStudioEndpointDetector.DetectAsync(configuredEndpoint, lifetime.Token);
             form.LmStudio.EndpointText.Text = detectedEndpoint.Endpoint.AbsoluteUri.TrimEnd('/');
             logger.Info($"LM Studio endpoint discovery: {detectedEndpoint.Endpoint.GetLeftPart(UriPartial.Authority)} via {detectedEndpoint.Source}");
+            SelectGlmPlatform(LoadSavedGlmPlatform());
             await RefreshEnvironmentAsync();
             await services.Backups.EnsureInitialSnapshotAsync(lifetime.Token);
             logger.Info("Initial Snapshot 已检查（已有快照不会覆盖）。");
@@ -157,7 +159,26 @@ internal sealed class MainController : IDisposable
             if (updating) return;
             selection.Request();
             InvalidatePreview();
+            UpdateGlmPlatformVisibility();
             await RunUiActionAsync(LoadModelsForSelectedProviderAsync);
+        };
+        form.Current.GlmPlatformCombo.SelectedIndexChanged += async (_, _) =>
+        {
+            if (updating) return;
+            selection.Request();
+            InvalidatePreview();
+            await RunUiActionAsync(async () =>
+            {
+                GlmPlatform platform = SelectedGlmPlatform();
+                if (appSettings.GlmPlatform != platform.ToString())
+                {
+                    appSettings.GlmPlatform = platform.ToString();
+                    await services.SettingsRepository.SaveAsync(appSettings, lifetime.Token);
+                    logger.Info($"GLM platform selection persisted: {platform}");
+                }
+
+                if (form.Current.ProviderCombo.SelectedItem is ProviderKind.GLM) await LoadModelsForSelectedProviderAsync();
+            });
         };
         form.Current.ModelCombo.SelectedIndexChanged += (_, _) =>
         {
@@ -237,6 +258,7 @@ internal sealed class MainController : IDisposable
         form.Backups.InspectDeepSeekButton.Click += async (_, _) => await RunUiActionAsync(InspectDeepSeekBackupAsync);
         form.SettingsLog.SaveDeepSeekButton.Click += async (_, _) => await RunUiActionAsync(() => SaveCredentialAsync(CredentialNames.DeepSeek, form.SettingsLog.DeepSeekToken));
         form.SettingsLog.SaveLmStudioButton.Click += async (_, _) => await RunUiActionAsync(() => SaveCredentialAsync(CredentialNames.LmStudio, form.SettingsLog.LmStudioToken));
+        form.SettingsLog.SaveGlmButton.Click += async (_, _) => await RunUiActionAsync(() => SaveCredentialAsync(CredentialNames.Glm, form.SettingsLog.GlmToken));
     }
 
     private async Task RefreshEnvironmentAsync()
@@ -253,6 +275,7 @@ internal sealed class MainController : IDisposable
             form.Current.CurrentProviderValue.Text = $"{environment.CurrentProvider} ({environment.CurrentProviderId ?? "unknown"})";
             form.Current.CurrentModelValue.Text = environment.CurrentModel ?? "未显式配置";
             currentReasoningEffort = environment.ReasoningEffort;
+            currentProviderKind = environment.CurrentProvider;
             form.Current.SwitchButton.Enabled = !environment.IsRunning && environment.Warning is null;
             form.Current.PreviewButton.Enabled = environment.Warning is null;
             form.Current.ProviderCombo.SelectedItem = environment.CurrentProvider is ProviderKind.Unknown ? ProviderKind.OpenAI : environment.CurrentProvider;
@@ -266,6 +289,9 @@ internal sealed class MainController : IDisposable
             updating = false;
         }
 
+        // The combo selection is set under the updating gate, so the change handler
+        // does not run; re-evaluate the GLM platform row visibility here instead.
+        UpdateGlmPlatformVisibility();
         if (environment.Warning is null) await RefreshSecondaryOverridesAsync(environment.ConfigPath);
         else form.Current.SecondaryOverridesList.Items.Clear();
         ApplyLmStudioRecoveryGate();
@@ -404,6 +430,9 @@ internal sealed class MainController : IDisposable
                 case ProviderKind.DeepSeek:
                     models = await services.Catalog.GetDeepSeekModelsAsync(lifetime.Token);
                     break;
+                case ProviderKind.GLM:
+                    models = await services.GlmCatalog.GetGlmModelsAsync(SelectedGlmPlatform(), lifetime.Token);
+                    break;
                 case ProviderKind.LmStudio:
                     models = lmModels.Where(model => model.ModelType is null || model.ModelType.Equals("llm", StringComparison.OrdinalIgnoreCase)).ToArray();
                     break;
@@ -457,6 +486,35 @@ internal sealed class MainController : IDisposable
     }
 
     private bool CanUpdateControls => Volatile.Read(ref closing) == 0 && Volatile.Read(ref disposed) == 0 && !form.IsDisposed && !form.Disposing;
+
+    internal GlmPlatform SelectedGlmPlatform() =>
+        (form.Current.GlmPlatformCombo.SelectedItem as CurrentSwitchControl.GlmPlatformOption)?.Platform ?? GlmPlatform.BigModel;
+
+    private void UpdateGlmPlatformVisibility()
+    {
+        bool currentIsGlm = currentProviderKind == ProviderKind.GLM;
+        bool targetIsGlm = form.Current.ProviderCombo.SelectedItem is ProviderKind.GLM;
+        form.Current.SetGlmPlatformRowVisible(currentIsGlm || targetIsGlm);
+    }
+
+    private GlmPlatform LoadSavedGlmPlatform() =>
+        Enum.TryParse(appSettings.GlmPlatform, out GlmPlatform saved) && Enum.IsDefined(saved) ? saved : GlmPlatform.BigModel;
+
+    private void SelectGlmPlatform(GlmPlatform platform)
+    {
+        updating = true;
+        try
+        {
+            form.Current.GlmPlatformCombo.SelectedItem = form.Current.GlmPlatformCombo.Items
+                .OfType<CurrentSwitchControl.GlmPlatformOption>()
+                .FirstOrDefault(option => option.Platform == platform);
+            if (form.Current.GlmPlatformCombo.SelectedItem is null) form.Current.GlmPlatformCombo.SelectedIndex = 0;
+        }
+        finally
+        {
+            updating = false;
+        }
+    }
 
     private bool IsSelectedEndpoint(Uri endpoint) => Uri.TryCreate(form.LmStudio.EndpointText.Text.Trim(), UriKind.Absolute, out Uri? current) && current == endpoint;
 
@@ -2010,7 +2068,13 @@ internal sealed class MainController : IDisposable
             overrideSelection = JsonSerializer.Serialize(selectedOverrides);
         }
 
-        string? catalog = provider == ProviderKind.DeepSeek ? await services.Catalog.EnsureDeepSeekCatalogAsync(lifetime.Token) : null;
+        string? catalog = provider switch
+        {
+            ProviderKind.DeepSeek => await services.Catalog.EnsureDeepSeekCatalogAsync(lifetime.Token),
+            ProviderKind.GLM => await services.GlmCatalog.EnsureGlmCatalogAsync(SelectedGlmPlatform(), lifetime.Token),
+            _ => null,
+        };
+        GlmPlatform? glmPlatform = provider == ProviderKind.GLM ? SelectedGlmPlatform() : null;
         Uri? endpoint = null;
         string? lmProvider = null;
         int? context = null;
@@ -2075,18 +2139,29 @@ internal sealed class MainController : IDisposable
                 throw new InvalidOperationException("所选 reasoning effort 已不被当前模型支持，请刷新模型列表。");
             }
         }
+        else if (provider == ProviderKind.GLM)
+        {
+            IReadOnlyList<ModelProfile> currentModels = await services.GlmCatalog.GetGlmModelsAsync(glmPlatform!.Value, lifetime.Token);
+            model = currentModels.FirstOrDefault(item => item.Id == model.Id) ?? throw new InvalidOperationException("所选 GLM 模型已不在当前官方 catalog，请刷新模型列表。");
+            if (reasoning is not null && !(model.ReasoningOptions ?? []).Contains(reasoning, StringComparer.Ordinal))
+            {
+                throw new InvalidOperationException("所选 reasoning effort 不在 GLM 官方 catalog 支持列表中，请刷新模型列表。");
+            }
+        }
 
-        return new SwitchRequest(provider, model.Id, reasoning, context, compact, policy, lmProvider, endpoint, requestRequiresAuthentication, credentialHelperPath, catalog, model.TrainedForToolUse, model.SupportsReasoning, model.ModelType, overrideSelection, allowedCodexReasoningEfforts, toolOutput, requestedCompactMode);
+        return new SwitchRequest(provider, model.Id, reasoning, context, compact, policy, lmProvider, endpoint, requestRequiresAuthentication, credentialHelperPath, catalog, model.TrainedForToolUse, model.SupportsReasoning, model.ModelType, overrideSelection, allowedCodexReasoningEfforts, toolOutput, requestedCompactMode, glmPlatform, provider == ProviderKind.GLM ? catalog : null);
     }
 
     private async Task ValidateCompatibilityAsync()
     {
         SwitchRequest request = await CreateRequestAsync();
-        if (request.TargetProvider == ProviderKind.DeepSeek && ShowMessage(form, "DeepSeek 在线兼容性测试会发送少量 API 请求，可能产生费用。继续吗？", "确认测试", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+        if (request.TargetProvider is ProviderKind.DeepSeek or ProviderKind.GLM &&
+            ShowMessage(form, $"{request.TargetProvider} 在线兼容性测试会发送少量 API 请求，可能产生费用。继续吗？", "确认测试", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
         IModelProvider provider = request.TargetProvider switch
         {
             ProviderKind.OpenAI => new OpenAiProvider(new CodexAppServerClient(services.HomeProvider.GetCodexHome())),
             ProviderKind.DeepSeek => new DeepSeekProvider(services.Catalog, () => GetSecret(CredentialNames.DeepSeek), httpClient),
+            ProviderKind.GLM => new GlmProvider(services.GlmCatalog, request.GlmPlatform ?? GlmPlatform.BigModel, () => GetSecret(CredentialNames.Glm), httpClient),
             ProviderKind.LmStudio => new LmStudioClient(
                 request.LmStudioEndpoint!,
                 request.LmStudioRequiresAuthentication ? () => GetSecret(CredentialNames.LmStudio) : null,
@@ -2115,7 +2190,12 @@ internal sealed class MainController : IDisposable
             }
         }
 
-        string cost = request.TargetProvider == ProviderKind.DeepSeek ? "这会调用 DeepSeek API，可能产生费用。" : "本地 LM Studio 不产生云 API 费用。";
+        string cost = request.TargetProvider switch
+        {
+            ProviderKind.DeepSeek => "这会调用 DeepSeek API，可能产生费用。",
+            ProviderKind.GLM => "这会调用 GLM Coding Plan API，消耗套餐额度。",
+            _ => "本地 LM Studio 不产生云 API 费用。",
+        };
         if (ShowMessage(form, $"将在独立 %TEMP% 目录启动真实 Codex Agent。\n{cost}\n不会复制 auth.json，不会修改真实工程。继续吗？", "Full Smoke Test", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
         if (credentialHelperPath is null || mcpServerPath is null) throw new InvalidOperationException("测试 Helper 尚未安装。");
         var smoke = new CodexSmokeTestService(credentialHelperPath, mcpServerPath);
@@ -2247,13 +2327,14 @@ internal sealed class MainController : IDisposable
 
     private void RefreshCredentialStatus()
     {
-        form.SettingsLog.CredentialStatus.Text = $"凭据状态：DeepSeek {(services.SecretStore.Exists(CredentialNames.DeepSeek) ? "已配置" : "未配置")}；LM Studio {(services.SecretStore.Exists(CredentialNames.LmStudio) ? "已配置" : "未配置")}";
+        form.SettingsLog.CredentialStatus.Text = $"凭据状态：DeepSeek {(services.SecretStore.Exists(CredentialNames.DeepSeek) ? "已配置" : "未配置")}；LM Studio {(services.SecretStore.Exists(CredentialNames.LmStudio) ? "已配置" : "未配置")}；GLM {(services.SecretStore.Exists(CredentialNames.Glm) ? "已配置" : "未配置")}";
     }
 
     private void RegisterExistingSecrets()
     {
         services.Redactor.Register(GetSecret(CredentialNames.DeepSeek));
         services.Redactor.Register(GetSecret(CredentialNames.LmStudio));
+        services.Redactor.Register(GetSecret(CredentialNames.Glm));
     }
 
     private string? GetSecret(string name)

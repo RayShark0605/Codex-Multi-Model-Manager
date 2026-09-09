@@ -4,4 +4,5 @@ public static class CredentialNames
 {
     public const string DeepSeek = CredentialTargets.DeepSeek;
     public const string LmStudio = CredentialTargets.LmStudio;
+    public const string Glm = CredentialTargets.Glm;
 }

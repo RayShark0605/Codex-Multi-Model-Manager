@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using CodexModelManager.Core.Infrastructure;
 using CodexModelManager.Core.Models;
+using CodexModelManager.Core.Providers;
 using CodexModelManager.Core.Security;
 
 namespace CodexModelManager.Core.Codex;
@@ -107,6 +108,15 @@ public sealed class CodexSmokeTestService
             if (!string.IsNullOrWhiteSpace(request.ReasoningEffort)) builder.Append("model_reasoning_effort = ").AppendLine(JsonSerializer.Serialize(request.ReasoningEffort));
             builder.AppendLine().AppendLine("[model_providers.deepseek]").AppendLine("name = \"deepseek\"").AppendLine("base_url = \"https://api.deepseek.com/\"").AppendLine("wire_api = \"responses\"");
             builder.AppendLine().AppendLine("[model_providers.deepseek.auth]").Append("command = ").AppendLine(JsonSerializer.Serialize(Path.GetFullPath(credentialHelperPath))).Append("args = [").Append(JsonSerializer.Serialize(CredentialNames.DeepSeek)).AppendLine("]");
+        }
+        else if (request.TargetProvider == ProviderKind.GLM)
+        {
+            GlmPlatform platform = request.GlmPlatform ?? throw new InvalidOperationException("GLM Level 3 测试缺少平台选择。");
+            builder.Append("model_provider = ").AppendLine(JsonSerializer.Serialize(GlmPlatforms.ProviderId));
+            if (!string.IsNullOrWhiteSpace(request.GlmCatalogPath)) builder.Append("model_catalog_json = ").AppendLine(JsonSerializer.Serialize(Path.GetFullPath(request.GlmCatalogPath)));
+            if (!string.IsNullOrWhiteSpace(request.ReasoningEffort)) builder.Append("model_reasoning_effort = ").AppendLine(JsonSerializer.Serialize(request.ReasoningEffort));
+            builder.AppendLine().Append('[').Append(GlmPlatforms.ProviderTableName).AppendLine("]").Append("name = ").AppendLine(JsonSerializer.Serialize(GlmPlatforms.ProviderId)).Append("base_url = ").AppendLine(JsonSerializer.Serialize(GlmPlatforms.BaseUrl(platform))).AppendLine("wire_api = \"responses\"");
+            builder.AppendLine().Append('[').Append(GlmPlatforms.ProviderTableName).AppendLine(".auth]").Append("command = ").AppendLine(JsonSerializer.Serialize(Path.GetFullPath(credentialHelperPath))).Append("args = [").Append(JsonSerializer.Serialize(CredentialNames.Glm)).AppendLine("]");
         }
         else
         {
