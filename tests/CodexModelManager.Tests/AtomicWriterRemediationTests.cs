@@ -4,6 +4,7 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>AtomicWriterRemediation 相关测试集。</summary>
 public sealed class AtomicWriterRemediationTests
 {
     [Fact]
@@ -24,18 +25,13 @@ public sealed class AtomicWriterRemediationTests
         var owner = new Thread(() =>
         {
             acquired = abandoned.WaitOne(TimeSpan.FromSeconds(5));
-            // Deliberately exit without ReleaseMutex to simulate a killed owner.
+            // 刻意不调用 ReleaseMutex 直接退出，模拟属主进程被杀死。
         });
         owner.Start();
         Assert.True(owner.Join(TimeSpan.FromSeconds(10)));
         Assert.True(acquired);
         int validations = 0;
-        var change = new PlannedFileChange(
-            path,
-            fingerprint,
-            Encoding.UTF8.GetBytes("model = \"new\"\n"),
-            [],
-            _ =>
+        var change = new PlannedFileChange(path, fingerprint, Encoding.UTF8.GetBytes("model = \"new\"\n"), [], _ =>
             {
                 validations++;
                 return ValueTask.CompletedTask;
@@ -88,17 +84,9 @@ public sealed class AtomicWriterRemediationTests
         string mutexName = "Local\\CodexModelManager.Tests." + Guid.NewGuid().ToString("N");
         var firstWriter = new AtomicBatchWriter(new FixedDiskSpaceProvider(), mutexName);
         var secondWriter = new AtomicBatchWriter(new FixedDiskSpaceProvider(), mutexName);
-        var first = new PlannedFileChange(
-            firstPath,
-            await FileFingerprintService.CaptureAsync(firstPath),
-            Encoding.UTF8.GetBytes("value = 10\n"),
-            [],
+        var first = new PlannedFileChange(firstPath, await FileFingerprintService.CaptureAsync(firstPath), Encoding.UTF8.GetBytes("value = 10\n"), [],
             Validate);
-        var second = new PlannedFileChange(
-            secondPath,
-            await FileFingerprintService.CaptureAsync(secondPath),
-            Encoding.UTF8.GetBytes("value = 20\n"),
-            [],
+        var second = new PlannedFileChange(secondPath, await FileFingerprintService.CaptureAsync(secondPath), Encoding.UTF8.GetBytes("value = 20\n"), [],
             Validate);
 
         await Task.WhenAll(firstWriter.WriteAsync([first]), secondWriter.WriteAsync([second]));
@@ -118,12 +106,7 @@ public sealed class AtomicWriterRemediationTests
         string? rollbackPath = null;
         int validations = 0;
         var primary = new InvalidDataException("injected primary validation failure");
-        var change = new PlannedFileChange(
-            path,
-            await FileFingerprintService.CaptureAsync(path),
-            Encoding.UTF8.GetBytes("model = \"candidate\"\n"),
-            [],
-            _ =>
+        var change = new PlannedFileChange(path, await FileFingerprintService.CaptureAsync(path), Encoding.UTF8.GetBytes("model = \"candidate\"\n"), [], _ =>
             {
                 validations++;
                 if (validations == 2)
@@ -165,10 +148,7 @@ public sealed class AtomicWriterRemediationTests
 
         const string target = @"\\server\share\codex\config.toml";
         var provider = new RecordingDiskSpaceProvider();
-        var change = new PlannedFileChange(
-            target,
-            FileFingerprint.Missing,
-            Encoding.UTF8.GetBytes("model = \"safe\"\n"),
+        var change = new PlannedFileChange(target, FileFingerprint.Missing, Encoding.UTF8.GetBytes("model = \"safe\"\n"),
             []);
 
         AtomicBatchWriter.VerifyAvailableSpace([change], provider);

@@ -4,8 +4,13 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.App.UI;
 
+/// <summary>
+/// LM Studio Prompt Template 修复确认/预览对话框：以页签展示事务摘要、
+/// Codex 配置变更与各模板文本；应用模式下提供确认/取消按钮并给出醒目警示。
+/// </summary>
 internal sealed class LmStudioTemplateRepairDialog : Form
 {
+    /// <summary>构造对话框；allowApply 为 false 时是纯预览（无确认按钮）。</summary>
     public LmStudioTemplateRepairDialog(LmStudioTemplateRepairPlan plan, bool allowApply, string? configurationPreview = null)
     {
         ArgumentNullException.ThrowIfNull(plan);
@@ -30,7 +35,11 @@ internal sealed class LmStudioTemplateRepairDialog : Form
         var patched = TemplateText(plan.TemplatePreview.PatchedTemplate ?? string.Empty);
         var tabs = new TabControl { Dock = DockStyle.Fill };
         tabs.TabPages.Add(Page("事务与加载配置", summary));
-        if (configurationPreview is not null) tabs.TabPages.Add(Page("Codex 配置变更", TemplateText(configurationPreview)));
+        if (configurationPreview is not null)
+        {
+            tabs.TabPages.Add(Page("Codex 配置变更", TemplateText(configurationPreview)));
+        }
+
         tabs.TabPages.Add(Page("GGUF 原始模板（只读）", original));
         if (plan.OriginalRuntimeTemplate.Mode == LmStudioRuntimeTemplateMode.ManagerRule)
         {
@@ -81,6 +90,7 @@ internal sealed class LmStudioTemplateRepairDialog : Form
         Controls.Add(buttons);
     }
 
+    /// <summary>创建承载内容控件的页签。</summary>
     private static TabPage Page(string title, Control content)
     {
         var page = new TabPage(title) { Padding = new Padding(8) };
@@ -88,6 +98,7 @@ internal sealed class LmStudioTemplateRepairDialog : Form
         return page;
     }
 
+    /// <summary>创建只读等宽字体的模板文本框。</summary>
     private static TextBox TemplateText(string text) => new()
     {
         Dock = DockStyle.Fill,
@@ -99,6 +110,7 @@ internal sealed class LmStudioTemplateRepairDialog : Form
         Text = text,
     };
 
+    /// <summary>组装事务摘要文本：运行时补丁事务、持久 defaults 计划、保留的加载配置与回滚策略。</summary>
     private static string BuildSummary(LmStudioTemplateRepairPlan plan)
     {
         LmStudioLoadedInstanceSnapshot instance = plan.OriginalInstance;
@@ -171,7 +183,9 @@ internal sealed class LmStudioTemplateRepairDialog : Form
         return builder.ToString();
     }
 
+    /// <summary>JSON 序列化字符串（含引号与转义）。</summary>
     private static string JsonString(string value) => System.Text.Json.JsonSerializer.Serialize(value);
 
+    /// <summary>可空值展示（缺失显示 &lt;omitted&gt;）。</summary>
     private static string Value<T>(T? value) where T : struct => value?.ToString() ?? "<omitted>";
 }

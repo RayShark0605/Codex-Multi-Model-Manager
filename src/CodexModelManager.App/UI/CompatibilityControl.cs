@@ -1,7 +1,9 @@
 namespace CodexModelManager.App.UI;
 
+/// <summary>兼容性测试页控件：L1/L2 校验与 L3 冒烟测试按钮 + 结果表格。</summary>
 public sealed class CompatibilityControl : UserControl
 {
+    /// <summary>构造控件并布置按钮与结果表格。</summary>
     public CompatibilityControl()
     {
         Dock = DockStyle.Fill;
@@ -26,7 +28,12 @@ public sealed class CompatibilityControl : UserControl
         Controls.Add(header);
     }
 
+    /// <summary>L1/L2 校验按钮。</summary>
     public Button ValidateButton { get; }
+
+    /// <summary>L3 冒烟测试按钮。</summary>
     public Button SmokeButton { get; }
+
+    /// <summary>结果表格。</summary>
     public DataGridView Results { get; }
 }

@@ -2,13 +2,20 @@ using System.Text;
 
 namespace CodexModelManager.Core.LmStudio;
 
+/// <summary>
+/// Qwen「前缀合并 system」模板修复规则（v3）：
+/// 以固定锚点把“仅开头合并 system/developer”的源模板改写为“全量交错指令合并”的目标模板，
+/// 源与目标都必须与内置基线逐字节一致，任何未识别变化都会拒绝修补（绝不生成猜测模板）。
+/// </summary>
 internal static class QwenPrefixMergedSystemTemplateRule
 {
+    /// <summary>目标模板里的管理器标记（规则版本 qwen-interleaved-instructions-v3）。</summary>
     public const string Marker = "{# CMM-CODEX-INSTRUCTION-HIERARCHY qwen-interleaved-instructions-v3 #}";
 
     private const string ResourceName = "CodexModelManager.Core.LmStudio.Templates.qwen-prefix-merged-system-source.jinja";
     private const string SourceCandidateAnchor = "{%- set sysns = namespace(count=0, text='') %}";
 
+    // 源模板：只在消息列表开头聚合连续的 system/developer（sysns 前缀计数）
     private const string SourceInstructionMerge = """
         {%- if not messages %}
             {{- raise_exception('No messages provided.') }}
@@ -27,6 +34,7 @@ internal static class QwenPrefixMergedSystemTemplateRule
         {%- set merged_system = sysns.text %}
         """;
 
+    // 目标模板：聚合全部 system/developer 指令（允许交错），带 v3 标记
     private const string TargetInstructionMerge = """
         {%- if not messages %}
             {{- raise_exception('No messages provided.') }}
@@ -44,6 +52,7 @@ internal static class QwenPrefixMergedSystemTemplateRule
         {%- set merged_system = cmm_instruction_state.text %}
         """;
 
+    // 源模板：num_sys 之后出现 system/developer 即抛错（旧顺序约束）
     private const string SourceConversationStart = """
         {%- for message in messages %}
             {%- if loop.index0 >= num_sys %}
@@ -52,6 +61,7 @@ internal static class QwenPrefixMergedSystemTemplateRule
                 {{- raise_exception('System message must be at the beginning.') }}
         """;
 
+    // 目标模板：交错的 system/developer 输出空内容（已并入 merged_system）
     private const string TargetConversationStart = """
         {%- for message in messages %}
             {%- if message.role == "system" or message.role == "developer" %}
@@ -63,6 +73,7 @@ internal static class QwenPrefixMergedSystemTemplateRule
                 {{- '' }}
         """;
 
+    // 源模板主循环尾部（比目标多一层 endif）
     private const string SourceConversationEnd = """
             {%- endif %}
             {%- endif %}
@@ -70,6 +81,7 @@ internal static class QwenPrefixMergedSystemTemplateRule
         {%- if add_generation_prompt %}
         """;
 
+    // 目标模板主循环尾部
     private const string TargetConversationEnd = """
             {%- endif %}
         {%- endfor %}
@@ -79,16 +91,22 @@ internal static class QwenPrefixMergedSystemTemplateRule
     private static readonly Lazy<string> CanonicalSource = new(LoadCanonicalSource);
     private static readonly Lazy<string> CanonicalTarget = new(CreateCanonicalTarget);
 
+    /// <summary>判断模板是否为本规则的“可修补源”（识别 sysns 前缀聚合特征）。</summary>
     public static bool IsSourceCandidate(string template) =>
         !string.IsNullOrWhiteSpace(template) &&
         (template.Contains(SourceCandidateAnchor, StringComparison.Ordinal) ||
          template.Contains("{%- set num_sys = sysns.count %}", StringComparison.Ordinal));
 
+    /// <summary>判断模板是否已是本规则的 v3 修补结果。</summary>
     public static bool IsPatchedCandidate(string template) =>
         !string.IsNullOrWhiteSpace(template) &&
         template.Contains(Marker, StringComparison.Ordinal) &&
         template.Contains("{%- set cmm_instruction_state = namespace(text='') %}", StringComparison.Ordinal);
 
+    /// <summary>
+    /// 修补模板：统一换行后在归一化文本上做三段精确替换（指令合并区、会话分支、循环尾部），
+    /// 校验通过后还原原换行风格返回。
+    /// </summary>
     public static string Patch(string template)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(template);
@@ -108,6 +126,7 @@ internal static class QwenPrefixMergedSystemTemplateRule
         return RestoreNewLine(patched, newLine);
     }
 
+    /// <summary>校验模板已是合法的 v3 修补结果（不修改内容）。</summary>
     public static void ValidatePatched(string template)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(template);
@@ -115,6 +134,7 @@ internal static class QwenPrefixMergedSystemTemplateRule
         ValidatePatchedNormalized(Normalize(template, newLine));
     }
 
+    /// <summary>校验源模板：共享锚点、三段源片段各出现一次、无 v3 标记，且与内置基线完全一致。</summary>
     private static void ValidateSourceNormalized(string normalized)
     {
         ValidateSharedAnchors(normalized);
@@ -128,6 +148,7 @@ internal static class QwenPrefixMergedSystemTemplateRule
         }
     }
 
+    /// <summary>校验修补结果：共享锚点、三段目标片段各一次、v3 标记一次、旧结构清零，且与基线目标一致。</summary>
     private static void ValidatePatchedNormalized(string normalized)
     {
         ValidateSharedAnchors(normalized);
@@ -144,6 +165,7 @@ internal static class QwenPrefixMergedSystemTemplateRule
         }
     }
 
+    /// <summary>校验源/目标共有的结构性锚点各自出现指定次数，确保模板族正确。</summary>
     private static void ValidateSharedAnchors(string normalized)
     {
         RequireCount(normalized, "{%- macro render_content(content, do_vision_count, is_system_content=false) %}", 1, "render_content 宏");
@@ -162,6 +184,7 @@ internal static class QwenPrefixMergedSystemTemplateRule
         RequireCount(normalized, "{#- Unsloth fixes - developer role, merged system messages, tool calling #}", 1, "模板尾部结构标记");
     }
 
+    /// <summary>由基线源模板推导基线目标模板（同样三段替换）。</summary>
     private static string CreateCanonicalTarget()
     {
         string source = CanonicalSource.Value;
@@ -176,6 +199,7 @@ internal static class QwenPrefixMergedSystemTemplateRule
             "canonical conversation loop 尾部");
     }
 
+    /// <summary>从程序集内嵌资源加载基线源模板并归一化换行。</summary>
     private static string LoadCanonicalSource()
     {
         using Stream stream = typeof(QwenPrefixMergedSystemTemplateRule).Assembly.GetManifestResourceStream(ResourceName)
@@ -186,12 +210,14 @@ internal static class QwenPrefixMergedSystemTemplateRule
         return Normalize(source, newLine);
     }
 
+    /// <summary>精确替换：源片段必须恰好出现一次，替换后返回新文本。</summary>
     private static string ReplaceExact(string text, string source, string target, string description)
     {
         RequireCount(text, source, 1, description);
         return text.Replace(source, target, StringComparison.Ordinal);
     }
 
+    /// <summary>断言子串出现次数恰为期望值，否则抛出带说明的校验异常。</summary>
     private static void RequireCount(string text, string value, int expected, string description)
     {
         int actual = CountOccurrences(text, value);
@@ -201,6 +227,7 @@ internal static class QwenPrefixMergedSystemTemplateRule
         }
     }
 
+    /// <summary>统计子串出现次数（允许重叠定位但不重叠计数）。</summary>
     private static int CountOccurrences(string text, string value)
     {
         int count = 0;
@@ -214,6 +241,7 @@ internal static class QwenPrefixMergedSystemTemplateRule
         return count;
     }
 
+    /// <summary>探测模板换行风格；CRLF 与孤立 LF 混用时拒绝修补以保持原文。</summary>
     private static string DetectNewLine(string template)
     {
         bool hasCrLf = template.Contains("\r\n", StringComparison.Ordinal);
@@ -226,11 +254,14 @@ internal static class QwenPrefixMergedSystemTemplateRule
         return hasCrLf ? "\r\n" : "\n";
     }
 
+    /// <summary>把模板换行归一为 LF（已是 LF 则原样返回）。</summary>
     private static string Normalize(string template, string newLine) =>
         newLine == "\n" ? template : template.Replace("\r\n", "\n", StringComparison.Ordinal);
 
+    /// <summary>把 LF 换行还原为原风格（原为 LF 则原样返回）。</summary>
     private static string RestoreNewLine(string template, string newLine) =>
         newLine == "\n" ? template : template.Replace("\n", "\r\n", StringComparison.Ordinal);
 
+    /// <summary>内嵌字面量统一按 LF 处理（与归一化后的模板可比）。</summary>
     private static string NormalizeLiteral(string value) => value.Replace("\r\n", "\n", StringComparison.Ordinal);
 }

@@ -1,5 +1,8 @@
 using System.Text.Json;
 
+// 临时 MCP 测试服务器：Level 3 冒烟测试里由 Codex 通过 cmm_test 服务器调用 cmm_ping，
+// 返回 CMM_PONG 应答。另带一组 --process-fixture-* 参数供进程边界测试使用。
+
 if (args.Contains("--process-fixture-hold-pipes", StringComparer.Ordinal))
 {
     await Task.Delay(TimeSpan.FromSeconds(4));
@@ -18,6 +21,7 @@ if (args.Contains("--process-fixture-inherited-pipes", StringComparer.Ordinal))
     {
         start.ArgumentList.Add(typeof(Program).Assembly.Location);
     }
+
     start.ArgumentList.Add("--process-fixture-hold-pipes");
     using System.Diagnostics.Process child = System.Diagnostics.Process.Start(start) ?? throw new InvalidOperationException("无法启动有界 pipe fixture。");
     child.StandardInput.Close();
@@ -49,6 +53,7 @@ if (args.Contains("--emit-utf8-fixture", StringComparer.Ordinal))
     return;
 }
 
+// JSON-RPC 主循环：按行读取请求，处理 initialize / tools/list / tools/call
 while (await Console.In.ReadLineAsync() is { } line)
 {
     JsonDocument request;

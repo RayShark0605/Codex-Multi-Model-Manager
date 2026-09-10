@@ -5,6 +5,7 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.App.Tests;
 
+/// <summary>SelectionAudit 相关测试集。</summary>
 public sealed class SelectionAuditTests
 {
     [Fact]
@@ -136,8 +137,7 @@ public sealed class SelectionAuditTests
     {
         IReadOnlyList<ModelProfile> currentModels =
         [
-            LocalModels[0],
-            LocalModels[1] with { ReasoningOptions = ["high"], SupportsReasoning = true },
+            LocalModels[0], LocalModels[1] with { ReasoningOptions = ["high"], SupportsReasoning = true },
         ];
         using var fixture = new Fixture((_, _) => Task.FromResult(currentModels));
         fixture.Form.Current.ProviderCombo.SelectedItem = ProviderKind.LmStudio;
@@ -147,8 +147,7 @@ public sealed class SelectionAuditTests
         string confirmedReasoning = Assert.IsType<string>(fixture.Form.Current.ReasoningCombo.SelectedItem);
         currentModels =
         [
-            LocalModels[0],
-            LocalModels[1] with { Id = "reloaded-B", LoadedInstanceId = "reloaded-B", ReasoningOptions = remainsSupported ? ["high"] : [] },
+            LocalModels[0], LocalModels[1] with { Id = "reloaded-B", LoadedInstanceId = "reloaded-B", ReasoningOptions = remainsSupported ? ["high"] : [] },
         ];
         await fixture.Controller.LoadModelsForSelectedProviderAsync();
         Assert.Equal("loaded-A", ((ModelProfile)fixture.Form.Current.ModelCombo.SelectedItem!).Id);
@@ -164,8 +163,7 @@ public sealed class SelectionAuditTests
     {
         using var fixture = new Fixture();
         await fixture.Controller.PrepareForCloseAsync();
-        int result = await MainController.RunIndependentRollbackAsync(
-            async token =>
+        int result = await MainController.RunIndependentRollbackAsync(async token =>
             {
                 Assert.True(token.CanBeCanceled);
                 Assert.False(token.IsCancellationRequested);
@@ -227,7 +225,10 @@ public sealed class SelectionAuditTests
             Form.Dispose();
             composition.Dispose();
             http.Dispose();
-            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
         }
     }
 

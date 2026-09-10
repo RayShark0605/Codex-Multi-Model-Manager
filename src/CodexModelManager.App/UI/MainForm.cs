@@ -1,11 +1,16 @@
 namespace CodexModelManager.App.UI;
 
+/// <summary>
+/// 主窗体：五个功能页（切换、LM Studio、兼容性、备份、设置日志）；
+/// 关闭流程先经控制器做异步收尾（拒绝直接关闭），收尾通过后再真正关窗。
+/// </summary>
 public sealed class MainForm : Form
 {
     private MainController? controller;
     private bool controlledCloseApproved;
     private bool controlledCloseInProgress;
 
+    /// <summary>构造窗体并布置全部页签。</summary>
     public MainForm()
     {
         Text = "Codex Multi-Model Manager";
@@ -26,12 +31,22 @@ public sealed class MainForm : Form
         Controls.Add(tabs);
     }
 
+    /// <summary>当前状态与切换页。</summary>
     public CurrentSwitchControl Current { get; }
+
+    /// <summary>LM Studio 页。</summary>
     public LmStudioControl LmStudio { get; }
+
+    /// <summary>兼容性测试页。</summary>
     public CompatibilityControl Compatibility { get; }
+
+    /// <summary>备份历史页。</summary>
     public BackupHistoryControl Backups { get; }
+
+    /// <summary>设置与日志页。</summary>
     public SettingsLogControl SettingsLog { get; }
 
+    /// <summary>装配主控制器并挂接初始化/关闭事件。</summary>
     internal void AttachController(MainController value)
     {
         controller = value;
@@ -40,6 +55,7 @@ public sealed class MainForm : Form
         FormClosed += (_, _) => controller.Dispose();
     }
 
+    /// <summary>受控关闭：先取消本次关闭并异步收尾，收尾完成后重新触发真正的关闭。</summary>
     private async void OnFormClosing(object? sender, FormClosingEventArgs eventArgs)
     {
         if (controlledCloseApproved || controller is null)
@@ -62,6 +78,7 @@ public sealed class MainForm : Form
         }
     }
 
+    /// <summary>创建承载指定内容控件的页签。</summary>
     private static TabPage CreateTab(string title, Control content)
     {
         var page = new TabPage(title);

@@ -5,6 +5,11 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Core.LmStudio;
 
+/// <summary>
+/// GGUF 聊天模板读取器：直接解析模型文件的 metadata，提取 tokenizer.chat_template、
+/// general.name 与 general.architecture。全程施加安全上限（条目数、数组元素数、字符串长度、
+/// 嵌套深度），读取前后核对文件长度与修改时间，防止文件在读取期间被替换。
+/// </summary>
 public sealed class GgufChatTemplateReader : IGgufChatTemplateReader
 {
     private const ulong MaximumMetadataCount = 1_000_000;
@@ -13,15 +18,15 @@ public sealed class GgufChatTemplateReader : IGgufChatTemplateReader
     private const ulong MaximumCapturedStringBytes = 2 * 1024 * 1024;
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
 
-    public Task<GgufChatTemplateAnalysis> ReadAsync(
-        string filePath,
-        CancellationToken cancellationToken = default)
+    /// <summary>在后台线程读取并分析 GGUF 文件（详见类说明）。</summary>
+    public Task<GgufChatTemplateAnalysis> ReadAsync(string filePath, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
         string fullPath = Path.GetFullPath(filePath);
         return Task.Run(() => ReadCore(fullPath, cancellationToken), cancellationToken);
     }
 
+    /// <summary>读取核心：校验 magic 与版本（仅 v2/v3），遍历 metadata 抓取三项目标键，最后复核文件未变。</summary>
     private static GgufChatTemplateAnalysis ReadCore(string filePath, CancellationToken cancellationToken)
     {
         var before = new FileInfo(filePath);
@@ -52,7 +57,7 @@ public sealed class GgufChatTemplateReader : IGgufChatTemplateReader
                 throw new InvalidDataException($"不支持的 GGUF 版本 {version}；当前只读取 v2/v3 metadata。");
             }
 
-            _ = reader.ReadUInt64(); // tensor count; model tensors are never read.
+            _ = reader.ReadUInt64(); // tensor 数量：模型张量从不读取，仅跳过
             ulong metadataCount = reader.ReadUInt64();
             if (metadataCount > MaximumMetadataCount)
             {
@@ -81,9 +86,18 @@ public sealed class GgufChatTemplateReader : IGgufChatTemplateReader
                 }
 
                 string? value = ReadOrSkipValue(reader, type, capture, depth: 0, cancellationToken);
-                if (key == "tokenizer.chat_template") template = value;
-                else if (key == "general.name") modelName = value;
-                else if (key == "general.architecture") architecture = value;
+                if (key == "tokenizer.chat_template")
+                {
+                    template = value;
+                }
+                else if (key == "general.name")
+                {
+                    modelName = value;
+                }
+                else if (key == "general.architecture")
+                {
+                    architecture = value;
+                }
             }
         }
 
@@ -92,6 +106,7 @@ public sealed class GgufChatTemplateReader : IGgufChatTemplateReader
             throw new InvalidDataException("GGUF 未包含可用的 tokenizer.chat_template string。");
         }
 
+        // 复核文件在读取期间未被修改（长度 + 修改时间）
         var after = new FileInfo(filePath);
         if (!after.Exists || after.Length != expectedLength || after.LastWriteTimeUtc != expectedLastWriteUtc)
         {
@@ -111,12 +126,11 @@ public sealed class GgufChatTemplateReader : IGgufChatTemplateReader
             sha256);
     }
 
-    private static string? ReadOrSkipValue(
-        BinaryReader reader,
-        uint type,
-        bool capture,
-        int depth,
-        CancellationToken cancellationToken)
+    /// <summary>
+    /// 按类型读取或跳过一个 metadata 值：标量定长跳过；字符串按需捕获；
+    /// 数组按元素大小整体跳过，字符串数组逐元素跳过（嵌套最多 4 层）。
+    /// </summary>
+    private static string? ReadOrSkipValue(BinaryReader reader, uint type, bool capture, int depth, CancellationToken cancellationToken)
     {
         if (depth > 4)
         {
@@ -169,6 +183,7 @@ public sealed class GgufChatTemplateReader : IGgufChatTemplateReader
             return null;
         }
 
+        // 字符串/嵌套数组：逐元素递归跳过，每 4096 个元素响应一次取消
         for (ulong index = 0; index < count; index++)
         {
             if ((index & 4095) == 0)
@@ -182,6 +197,7 @@ public sealed class GgufChatTemplateReader : IGgufChatTemplateReader
         return null;
     }
 
+    /// <summary>读取长度前缀字符串：不捕获时仅跳过字节（返回空串）；捕获时校验上限并严格 UTF-8 解码。</summary>
     private static string ReadString(BinaryReader reader, ulong maximumCapturedBytes, bool capture)
     {
         ulong byteCount = reader.ReadUInt64();
@@ -217,6 +233,7 @@ public sealed class GgufChatTemplateReader : IGgufChatTemplateReader
         }
     }
 
+    /// <summary>跳过指定字节数；越界（超出流末尾）视为文件被截断。</summary>
     private static void SkipBytes(BinaryReader reader, ulong byteCount)
     {
         Stream stream = reader.BaseStream;
@@ -228,6 +245,7 @@ public sealed class GgufChatTemplateReader : IGgufChatTemplateReader
         stream.Seek(checked((long)byteCount), SeekOrigin.Current);
     }
 
+    /// <summary>把缓冲区填满；提前 EOF 视为头部被截断。</summary>
     private static void ReadExactly(BinaryReader reader, Span<byte> destination)
     {
         int total = 0;

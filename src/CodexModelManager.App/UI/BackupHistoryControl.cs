@@ -1,7 +1,9 @@
 namespace CodexModelManager.App.UI;
 
+/// <summary>备份历史页控件：刷新/恢复按钮组与历史快照列表。</summary>
 public sealed class BackupHistoryControl : UserControl
 {
+    /// <summary>构造控件并布置按钮与历史列表。</summary>
     public BackupHistoryControl()
     {
         Dock = DockStyle.Fill;
@@ -22,10 +24,21 @@ public sealed class BackupHistoryControl : UserControl
         Controls.Add(header);
     }
 
+    /// <summary>刷新历史按钮。</summary>
     public Button RefreshButton { get; }
+
+    /// <summary>恢复上一次快照按钮。</summary>
     public Button RestorePreviousButton { get; }
+
+    /// <summary>恢复所选快照按钮。</summary>
     public Button RestoreSelectedButton { get; }
+
+    /// <summary>恢复初始快照按钮。</summary>
     public Button RestoreInitialButton { get; }
+
+    /// <summary>查看 backup-deepseek 目录按钮。</summary>
     public Button InspectDeepSeekButton { get; }
+
+    /// <summary>历史快照列表。</summary>
     public ListView History { get; }
 }

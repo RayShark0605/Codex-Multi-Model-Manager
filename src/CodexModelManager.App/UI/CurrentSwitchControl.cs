@@ -2,8 +2,10 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.App.UI;
 
+/// <summary>主切换页控件：环境信息、目标 Provider/模型选择、Secondary Override 管理与操作按钮。</summary>
 public sealed class CurrentSwitchControl : UserControl
 {
+    /// <summary>构造控件并布置全部行与按钮。</summary>
     public CurrentSwitchControl()
     {
         Dock = DockStyle.Fill;
@@ -39,8 +41,8 @@ public sealed class CurrentSwitchControl : UserControl
         UiFactory.AddRow(table, "目标 Provider", ProviderCombo);
         UiFactory.AddRow(table, "目标 Model", ModelCombo);
         UiFactory.AddRow(table, "Reasoning", ReasoningCombo);
-        // Manual row so the label+combo pair can be hidden as a whole; an AutoSize
-        // TableLayoutPanel row with only invisible controls collapses to zero height.
+        // GLM 平台行手工布局，便于把“标签+下拉框”整行隐藏；
+        // AutoSize 表格行内只剩不可见控件时会塌缩成零高度。
         int glmRow = table.RowCount++;
         table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         table.Controls.Add(GlmPlatformLabel, 0, glmRow);
@@ -61,36 +63,72 @@ public sealed class CurrentSwitchControl : UserControl
         Controls.Add(buttons);
     }
 
+    /// <summary>Codex 版本标签。</summary>
     public Label CodexVersionValue { get; }
+
+    /// <summary>Codex 状态标签（加粗）。</summary>
     public Label CodexStatusValue { get; }
+
+    /// <summary>CODEX_HOME 标签。</summary>
     public Label CodexHomeValue { get; }
+
+    /// <summary>当前 Provider 标签。</summary>
     public Label CurrentProviderValue { get; }
+
+    /// <summary>当前 Model 标签。</summary>
     public Label CurrentModelValue { get; }
+
+    /// <summary>目标 Provider 下拉框。</summary>
     public ComboBox ProviderCombo { get; }
+
+    /// <summary>目标模型下拉框。</summary>
     public ComboBox ModelCombo { get; }
+
+    /// <summary>Reasoning 下拉框。</summary>
     public ComboBox ReasoningCombo { get; }
+
+    /// <summary>GLM 平台行标签。</summary>
     public Label GlmPlatformLabel { get; }
+
+    /// <summary>GLM 平台下拉框。</summary>
     public ComboBox GlmPlatformCombo { get; }
 
-    // Control.Visible reports the composite state with the (possibly unshown) parent
-    // chain, so the requested state is tracked separately for callers and tests.
+    /// <summary>
+    /// GLM 平台行的请求可见状态。Control.Visible 反映的是与（可能尚未显示的）
+    /// 父级链的复合状态，因此这里单独记录，供调用方与测试判断。
+    /// </summary>
     public bool GlmPlatformRowVisible { get; private set; }
 
+    /// <summary>设置 GLM 平台行（标签+下拉框）整体的可见性。</summary>
     public void SetGlmPlatformRowVisible(bool visible)
     {
         GlmPlatformRowVisible = visible;
         GlmPlatformLabel.Visible = visible;
         GlmPlatformCombo.Visible = visible;
     }
+
+    /// <summary>Secondary Override 策略下拉框。</summary>
     public ComboBox SecondaryPolicyCombo { get; }
+
+    /// <summary>Secondary Override 逐项选择列表。</summary>
     public CheckedListBox SecondaryOverridesList { get; }
+
+    /// <summary>云调用提示标签。</summary>
     public Label OverrideWarningValue { get; }
+
+    /// <summary>重新检测按钮。</summary>
     public Button RefreshButton { get; }
+
+    /// <summary>预览变更按钮。</summary>
     public Button PreviewButton { get; }
+
+    /// <summary>切换模型按钮。</summary>
     public Button SwitchButton { get; }
 
+    /// <summary>GLM 平台选项（携带平台枚举的展示项）。</summary>
     internal sealed record GlmPlatformOption(GlmPlatform Platform)
     {
+        /// <summary>下拉框展示文本。</summary>
         public override string ToString() => Platform switch
         {
             GlmPlatform.BigModel => "智谱国内 (bigmodel.cn)",

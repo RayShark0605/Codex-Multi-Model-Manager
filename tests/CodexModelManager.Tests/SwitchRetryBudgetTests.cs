@@ -5,6 +5,7 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>SwitchRetryBudget 相关测试集。</summary>
 public sealed class SwitchRetryBudgetTests
 {
     [Fact]

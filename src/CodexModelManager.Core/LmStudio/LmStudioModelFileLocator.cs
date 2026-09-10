@@ -8,6 +8,12 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Core.LmStudio;
 
+/// <summary>
+/// LM Studio 模型文件定位器：以 native loaded instance 快照为权威身份，
+/// 通过 lms ls --variants 与 lms ps 两条独立证据链交叉定位唯一的 GGUF 文件。
+/// 全程保守：身份字段不全、端点非 loopback、路径越出 models 根目录、
+/// 双证据冲突或多候选一律失败，绝不猜测。
+/// </summary>
 public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
 {
     private static readonly Uri DefaultEndpoint = new("http://127.0.0.1:1234");
@@ -15,32 +21,28 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
     private readonly ILmsCliCommandRunner commandRunner;
     private readonly Func<string> userProfileProvider;
 
+    /// <summary>默认构造：真实进程方式运行 lms CLI。</summary>
     public LmStudioModelFileLocator()
         : this(new ProcessLmsCliCommandRunner(), ResolveUserProfile)
     {
     }
 
-    internal LmStudioModelFileLocator(
-        ILmsCliCommandRunner commandRunner,
-        Func<string> userProfileProvider)
+    /// <summary>测试用构造：注入 CLI 运行器与用户目录提供者。</summary>
+    internal LmStudioModelFileLocator(ILmsCliCommandRunner commandRunner, Func<string> userProfileProvider)
     {
         this.commandRunner = commandRunner ?? throw new ArgumentNullException(nameof(commandRunner));
         this.userProfileProvider = userProfileProvider ?? throw new ArgumentNullException(nameof(userProfileProvider));
     }
 
-    public async Task<LmStudioModelFileResolutionAttempt> ResolveAsync(
-        ModelProfile model,
-        Uri endpoint,
-        CancellationToken cancellationToken = default)
+    /// <summary>解析模型对应的 GGUF 文件（详见类说明），成功/失败都以尝试结果返回。</summary>
+    public async Task<LmStudioModelFileResolutionAttempt> ResolveAsync(ModelProfile model, Uri endpoint, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(model);
         ArgumentNullException.ThrowIfNull(endpoint);
         string[] missingIdentityFields = GetMissingAuthoritativeLoadedIdentityFields(model);
         if (missingIdentityFields.Length > 0)
         {
-            return Failure(
-                LmStudioModelFileResolutionStatus.InvalidModelSnapshot,
-                $"native loaded instance 快照缺少或不满足以下权威字段：{string.Join("、", missingIdentityFields)}；拒绝猜测 GGUF。");
+            return Failure(LmStudioModelFileResolutionStatus.InvalidModelSnapshot, $"native loaded instance 快照缺少或不满足以下权威字段：{string.Join("、", missingIdentityFields)}；拒绝猜测 GGUF。");
         }
 
         try
@@ -49,16 +51,12 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         }
         catch (InvalidOperationException)
         {
-            return Failure(
-                LmStudioModelFileResolutionStatus.UnsupportedEndpoint,
-                "LM Studio endpoint 不满足安全 URI 约束；自动 GGUF 定位已阻断。");
+            return Failure(LmStudioModelFileResolutionStatus.UnsupportedEndpoint, "LM Studio endpoint 不满足安全 URI 约束；自动 GGUF 定位已阻断。");
         }
 
         if (!endpoint.IsLoopback)
         {
-            return Failure(
-                LmStudioModelFileResolutionStatus.UnsupportedEndpoint,
-                "lms ps 返回的是服务端文件路径；仅本机 loopback endpoint 允许自动定位 GGUF。");
+            return Failure(LmStudioModelFileResolutionStatus.UnsupportedEndpoint, "lms ps 返回的是服务端文件路径；仅本机 loopback endpoint 允许自动定位 GGUF。");
         }
 
         string userProfile;
@@ -67,33 +65,22 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         {
             userProfile = Path.GetFullPath(userProfileProvider());
             string settingsPath = Path.Combine(userProfile, ".lmstudio", "settings.json");
-            string? settingsJson = File.Exists(settingsPath)
-                ? await File.ReadAllTextAsync(settingsPath, cancellationToken).ConfigureAwait(false)
-                : null;
+            string? settingsJson = File.Exists(settingsPath) ? await File.ReadAllTextAsync(settingsPath, cancellationToken).ConfigureAwait(false) : null;
             modelRoots = ReadModelRoots(settingsJson, userProfile);
         }
         catch (JsonException)
         {
-            return Failure(
-                LmStudioModelFileResolutionStatus.InvalidSettings,
-                "LM Studio settings.json 不是有效 JSON；拒绝推断 models 根目录。");
+            return Failure(LmStudioModelFileResolutionStatus.InvalidSettings, "LM Studio settings.json 不是有效 JSON；拒绝推断 models 根目录。");
         }
         catch (Exception exception) when (exception is ArgumentException or InvalidDataException or IOException or NotSupportedException or UnauthorizedAccessException)
         {
-            return Failure(
-                LmStudioModelFileResolutionStatus.InvalidSettings,
-                "无法安全读取或规范化 LM Studio models 根目录；自动定位已阻断。");
+            return Failure(LmStudioModelFileResolutionStatus.InvalidSettings, "无法安全读取或规范化 LM Studio models 根目录；自动定位已阻断。");
         }
 
-        LmsCliCommandResult variantsCommand = await commandRunner.RunAsync(
-            ["ls", "--json", "--variants"],
-            CommandTimeout,
-            cancellationToken).ConfigureAwait(false);
+        LmsCliCommandResult variantsCommand = await commandRunner.RunAsync(["ls", "--json", "--variants"], CommandTimeout, cancellationToken).ConfigureAwait(false);
         if (variantsCommand.Status == LmsCliCommandStatus.Unavailable)
         {
-            return Failure(
-                LmStudioModelFileResolutionStatus.CliUnavailable,
-                "未找到或无法启动 lms CLI；请检查 LM Studio CLI 安装，或手工选择 GGUF。");
+            return Failure(LmStudioModelFileResolutionStatus.CliUnavailable, "未找到或无法启动 lms CLI；请检查 LM Studio CLI 安装，或手工选择 GGUF。");
         }
 
         LmsCliCommandResult processesCommand = await commandRunner.RunAsync(
@@ -106,12 +93,8 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
             return commandFailure;
         }
 
-        EvidenceResult variants = ParseCommand(
-            variantsCommand,
-            json => ResolveLsEvidence(model, json, modelRoots));
-        EvidenceResult processes = ParseCommand(
-            processesCommand,
-            json => ResolvePsEvidence(model, json, modelRoots));
+        EvidenceResult variants = ParseCommand(variantsCommand, json => ResolveLsEvidence(model, json, modelRoots));
+        EvidenceResult processes = ParseCommand(processesCommand, json => ResolvePsEvidence(model, json, modelRoots));
 
         LmStudioModelFileResolutionAttempt? blocking = ResolveBlockingFailure(variants, processes);
         if (blocking is not null)
@@ -119,13 +102,12 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
             return blocking;
         }
 
+        // 双证据都有效时要求路径一致；只有一侧有效时采纳该侧
         if (variants.Resolution is not null && processes.Resolution is not null)
         {
             if (!variants.Resolution.FilePath.Equals(processes.Resolution.FilePath, StringComparison.OrdinalIgnoreCase))
             {
-                return Failure(
-                    LmStudioModelFileResolutionStatus.Conflict,
-                    "lms ls 与 lms ps 分别解析到不同的有效 GGUF 路径；拒绝自动选择，请手工核对。");
+                return Failure(LmStudioModelFileResolutionStatus.Conflict, "lms ls 与 lms ps 分别解析到不同的有效 GGUF 路径；拒绝自动选择，请手工核对。");
             }
 
             return Success(processes.Resolution);
@@ -144,26 +126,19 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         return ResolveNoMatchFailure(variantsCommand, processesCommand, variants, processes);
     }
 
-    public static async Task<string?> TryResolveAsync(
-        ModelProfile model,
-        CancellationToken cancellationToken = default) =>
+    /// <summary>便捷入口：解析成功返回文件路径，否则 null。</summary>
+    public static async Task<string?> TryResolveAsync(ModelProfile model, CancellationToken cancellationToken = default) =>
         (await TryResolveDetailedAsync(model, cancellationToken).ConfigureAwait(false))?.FilePath;
 
-    public static async Task<LmStudioModelFileResolution?> TryResolveDetailedAsync(
-        ModelProfile model,
-        CancellationToken cancellationToken = default)
+    /// <summary>便捷入口：以默认端点解析，返回完整定位结果或 null。</summary>
+    public static async Task<LmStudioModelFileResolution?> TryResolveDetailedAsync(ModelProfile model, CancellationToken cancellationToken = default)
     {
-        LmStudioModelFileResolutionAttempt attempt = await new LmStudioModelFileLocator()
-            .ResolveAsync(model, DefaultEndpoint, cancellationToken)
-            .ConfigureAwait(false);
+        LmStudioModelFileResolutionAttempt attempt = await new LmStudioModelFileLocator().ResolveAsync(model, DefaultEndpoint, cancellationToken).ConfigureAwait(false);
         return attempt.Resolution;
     }
 
-    public static LmStudioModelFileResolution? ResolveFromJson(
-        ModelProfile model,
-        string variantsJson,
-        string? settingsJson,
-        string userProfile)
+    /// <summary>离线入口：用已有的 lms ls 变体 JSON 与 settings JSON 直接解析（不启动 CLI）。</summary>
+    public static LmStudioModelFileResolution? ResolveFromJson(ModelProfile model, string variantsJson, string? settingsJson, string userProfile)
     {
         ArgumentNullException.ThrowIfNull(model);
         ArgumentException.ThrowIfNullOrWhiteSpace(variantsJson);
@@ -172,11 +147,8 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         return result.Resolution;
     }
 
-    internal static LmStudioModelFileResolutionAttempt ResolvePsFromJson(
-        ModelProfile model,
-        string processesJson,
-        string? settingsJson,
-        string userProfile)
+    /// <summary>离线入口：用已有的 lms ps JSON 解析为尝试结果（成功/失败带诊断）。</summary>
+    internal static LmStudioModelFileResolutionAttempt ResolvePsFromJson(ModelProfile model, string processesJson, string? settingsJson, string userProfile)
     {
         ArgumentNullException.ThrowIfNull(model);
         ArgumentException.ThrowIfNullOrWhiteSpace(processesJson);
@@ -184,9 +156,7 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         try
         {
             EvidenceResult result = ResolvePsEvidence(model, processesJson, ReadModelRoots(settingsJson, userProfile));
-            return result.Resolution is not null
-                ? Success(result.Resolution)
-                : Failure(MapEvidenceStatus(result.Status), DiagnosticForEvidence(result));
+            return result.Resolution is not null ? Success(result.Resolution) : Failure(MapEvidenceStatus(result.Status), DiagnosticForEvidence(result));
         }
         catch (JsonException)
         {
@@ -198,22 +168,50 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         }
     }
 
+    /// <summary>列出模型快照缺失的权威身份字段（provider、加载状态、ID、source、type、架构、实际 context）。</summary>
     private static string[] GetMissingAuthoritativeLoadedIdentityFields(ModelProfile model)
     {
         List<string> missing = [];
-        if (model.Provider != ProviderKind.LmStudio) missing.Add("provider=lmstudio");
-        if (model.IsLoaded != true) missing.Add("loaded=true");
-        if (string.IsNullOrWhiteSpace(model.LoadedInstanceId ?? model.Id)) missing.Add("loaded ID");
-        if (string.IsNullOrWhiteSpace(model.SourceModelKey)) missing.Add("source");
-        if (string.IsNullOrWhiteSpace(model.ModelType)) missing.Add("type");
-        if (string.IsNullOrWhiteSpace(model.Architecture)) missing.Add("architecture");
-        if (model.LoadedContextLength is not > 0) missing.Add("实际 context");
+        if (model.Provider != ProviderKind.LmStudio)
+        {
+            missing.Add("provider=lmstudio");
+        }
+
+        if (model.IsLoaded != true)
+        {
+            missing.Add("loaded=true");
+        }
+
+        if (string.IsNullOrWhiteSpace(model.LoadedInstanceId ?? model.Id))
+        {
+            missing.Add("loaded ID");
+        }
+
+        if (string.IsNullOrWhiteSpace(model.SourceModelKey))
+        {
+            missing.Add("source");
+        }
+
+        if (string.IsNullOrWhiteSpace(model.ModelType))
+        {
+            missing.Add("type");
+        }
+
+        if (string.IsNullOrWhiteSpace(model.Architecture))
+        {
+            missing.Add("architecture");
+        }
+
+        if (model.LoadedContextLength is not > 0)
+        {
+            missing.Add("实际 context");
+        }
+
         return [.. missing];
     }
 
-    private static EvidenceResult ParseCommand(
-        LmsCliCommandResult command,
-        Func<string, EvidenceResult> parser)
+    /// <summary>执行一条 CLI 命令的解析：命令未成功 → CommandFailed；解析抛 JsonException → InvalidJson。</summary>
+    private static EvidenceResult ParseCommand(LmsCliCommandResult command, Func<string, EvidenceResult> parser)
     {
         if (command.Status != LmsCliCommandStatus.Success || string.IsNullOrWhiteSpace(command.StandardOutput))
         {
@@ -230,9 +228,8 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         }
     }
 
-    private static LmStudioModelFileResolutionAttempt? ResolveCommandFailure(
-        LmsCliCommandResult variantsCommand,
-        LmsCliCommandResult processesCommand)
+    /// <summary>两条命令任一未成功时，按优先级归并为统一的 CLI 失败结果；全部成功返回 null。</summary>
+    private static LmStudioModelFileResolutionAttempt? ResolveCommandFailure(LmsCliCommandResult variantsCommand, LmsCliCommandResult processesCommand)
     {
         if (variantsCommand.Status == LmsCliCommandStatus.Success &&
             processesCommand.Status == LmsCliCommandStatus.Success)
@@ -249,22 +246,17 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         };
     }
 
-    private static LmStudioModelFileResolutionAttempt? ResolveBlockingFailure(
-        EvidenceResult variants,
-        EvidenceResult processes)
+    /// <summary>阻断性失败归并：任一证据链出现非法 JSON、歧义候选或被拒路径即整体失败。</summary>
+    private static LmStudioModelFileResolutionAttempt? ResolveBlockingFailure(EvidenceResult variants, EvidenceResult processes)
     {
         if (variants.Status == EvidenceStatus.InvalidJson || processes.Status == EvidenceStatus.InvalidJson)
         {
-            return Failure(
-                LmStudioModelFileResolutionStatus.InvalidJson,
-                "lms CLI 返回了非法 JSON；为避免忽略冲突证据，自动定位已阻断。");
+            return Failure(LmStudioModelFileResolutionStatus.InvalidJson, "lms CLI 返回了非法 JSON；为避免忽略冲突证据，自动定位已阻断。");
         }
 
         if (variants.Status == EvidenceStatus.Ambiguous || processes.Status == EvidenceStatus.Ambiguous)
         {
-            return Failure(
-                LmStudioModelFileResolutionStatus.Ambiguous,
-                "lms CLI 对同一 native loaded instance 给出多个有效 GGUF 候选；拒绝自动选择。");
+            return Failure(LmStudioModelFileResolutionStatus.Ambiguous, "lms CLI 对同一 native loaded instance 给出多个有效 GGUF 候选；拒绝自动选择。");
         }
 
         EvidenceStatus[] rejectedEvidence =
@@ -288,11 +280,8 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         return null;
     }
 
-    private static LmStudioModelFileResolutionAttempt ResolveNoMatchFailure(
-        LmsCliCommandResult variantsCommand,
-        LmsCliCommandResult processesCommand,
-        EvidenceResult variants,
-        EvidenceResult processes)
+    /// <summary>双证据均无有效结果时的兜底归并：优先报告证据层失败，其次命令层失败，最后 NoMatch。</summary>
+    private static LmStudioModelFileResolutionAttempt ResolveNoMatchFailure(LmsCliCommandResult variantsCommand, LmsCliCommandResult processesCommand, EvidenceResult variants, EvidenceResult processes)
     {
         EvidenceStatus evidenceStatus = HighestPriorityEvidenceStatus(variants.Status, processes.Status);
         if (evidenceStatus is not (EvidenceStatus.NoMatch or EvidenceStatus.CommandFailed))
@@ -311,6 +300,7 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         };
     }
 
+    /// <summary>证据状态的报告优先级：不安全路径 &gt; 类型不支持 &gt; 文件缺失 &gt; 身份不符 &gt; 无匹配 &gt; 命令失败。</summary>
     private static EvidenceStatus HighestPriorityEvidenceStatus(EvidenceStatus left, EvidenceStatus right)
     {
         EvidenceStatus[] priority =
@@ -325,6 +315,7 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         return priority.First(status => left == status || right == status);
     }
 
+    /// <summary>命令状态的报告优先级：不可用 &gt; 超时 &gt; 输出超限 &gt; 失败 &gt; 成功。</summary>
     private static LmsCliCommandStatus HighestPriorityCommandStatus(LmsCliCommandStatus left, LmsCliCommandStatus right)
     {
         LmsCliCommandStatus[] priority =
@@ -338,6 +329,7 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         return priority.First(status => left == status || right == status);
     }
 
+    /// <summary>证据状态 → 对外解析状态的映射。</summary>
     private static LmStudioModelFileResolutionStatus MapEvidenceStatus(EvidenceStatus status) => status switch
     {
         EvidenceStatus.IdentityMismatch => LmStudioModelFileResolutionStatus.IdentityMismatch,
@@ -349,6 +341,7 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         _ => LmStudioModelFileResolutionStatus.NoMatch,
     };
 
+    /// <summary>各证据状态对应的默认诊断文案。</summary>
     private static string DiagnosticForEvidence(EvidenceStatus status) => status switch
     {
         EvidenceStatus.IdentityMismatch => "lms ps 的 instance/source/type/architecture/quantization/context 与 native 快照不完全一致；拒绝自动定位。",
@@ -360,12 +353,12 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         _ => "lms CLI 未唯一定位当前 native loaded instance 的 GGUF；请手工选择并核对。",
     };
 
+    /// <summary>取证据自带的诊断，缺省回落到状态默认文案。</summary>
     private static string DiagnosticForEvidence(EvidenceResult evidence) =>
         string.IsNullOrWhiteSpace(evidence.Diagnostic) ? DiagnosticForEvidence(evidence.Status) : evidence.Diagnostic;
-    private static EvidenceResult ResolveLsEvidence(
-        ModelProfile model,
-        string variantsJson,
-        IReadOnlyList<string> modelRoots)
+
+    /// <summary>解析 lms ls --json --variants 证据：按 source key（及可选选中变体）筛出候选并解析路径。</summary>
+    private static EvidenceResult ResolveLsEvidence(ModelProfile model, string variantsJson, IReadOnlyList<string> modelRoots)
     {
         string? sourceKey = model.SourceModelKey;
         if (string.IsNullOrWhiteSpace(sourceKey))
@@ -417,10 +410,11 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         return ResolveCandidates(candidates, modelRoots);
     }
 
-    private static EvidenceResult ResolvePsEvidence(
-        ModelProfile model,
-        string processesJson,
-        IReadOnlyList<string> modelRoots)
+    /// <summary>
+    /// 解析 lms ps --json 证据：逐条核对 modelKey/identifier/publisher/source/type/architecture/
+    /// quantization/context/format 九项权威字段，全部一致才生成候选，不一致字段计入诊断。
+    /// </summary>
+    private static EvidenceResult ResolvePsEvidence(ModelProfile model, string processesJson, IReadOnlyList<string> modelRoots)
     {
         using JsonDocument document = JsonDocument.Parse(processesJson);
         if (document.RootElement.ValueKind != JsonValueKind.Array)
@@ -464,27 +458,57 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
             if (!modelKeyMatches || !identifierMatches || !publisherPresent || !sourceMatches || !typeMatches ||
                 !architectureMatches || !quantizationMatches || !contextMatches || !formatMatches)
             {
+                // 记录不一致的字段名，便于诊断输出
                 sawIdentityMismatch = true;
-                if (!modelKeyMatches) mismatchFields.Add("modelKey（必须等于 loaded ID 或 source/load key）");
-                if (!identifierMatches) mismatchFields.Add("loaded identifier");
-                if (!publisherPresent) mismatchFields.Add("publisher");
-                if (!sourceMatches) mismatchFields.Add(IsGgufSourcePath(sourceKey) ? "source/path/indexedModelIdentifier" : "source/publisher/modelKey");
-                if (!typeMatches) mismatchFields.Add("type");
-                if (!architectureMatches) mismatchFields.Add("architecture");
-                if (!quantizationMatches) mismatchFields.Add("quantization");
-                if (!contextMatches) mismatchFields.Add("实际 context");
-                if (!formatMatches) mismatchFields.Add("format=gguf");
+                if (!modelKeyMatches)
+                {
+                    mismatchFields.Add("modelKey（必须等于 loaded ID 或 source/load key）");
+                }
+
+                if (!identifierMatches)
+                {
+                    mismatchFields.Add("loaded identifier");
+                }
+
+                if (!publisherPresent)
+                {
+                    mismatchFields.Add("publisher");
+                }
+
+                if (!sourceMatches)
+                {
+                    mismatchFields.Add(IsGgufSourcePath(sourceKey) ? "source/path/indexedModelIdentifier" : "source/publisher/modelKey");
+                }
+
+                if (!typeMatches)
+                {
+                    mismatchFields.Add("type");
+                }
+
+                if (!architectureMatches)
+                {
+                    mismatchFields.Add("architecture");
+                }
+
+                if (!quantizationMatches)
+                {
+                    mismatchFields.Add("quantization");
+                }
+
+                if (!contextMatches)
+                {
+                    mismatchFields.Add("实际 context");
+                }
+
+                if (!formatMatches)
+                {
+                    mismatchFields.Add("format=gguf");
+                }
+
                 continue;
             }
 
-            candidates.Add(new CliCandidate(
-                sourceKey,
-                model.SelectedVariant,
-                architecture,
-                quantization,
-                [ExtractIndexedRelativePath(indexedModelIdentifier), path],
-                "lms ps --json",
-                publisher));
+            candidates.Add(new CliCandidate(sourceKey, model.SelectedVariant, architecture, quantization, [ExtractIndexedRelativePath(indexedModelIdentifier), path], "lms ps --json", publisher));
         }
 
         if (candidates.Count == 0)
@@ -500,12 +524,11 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         return ResolveCandidates(candidates, modelRoots);
     }
 
-    private static bool SourceMatches(
-        string sourceKey,
-        string? publisher,
-        string? modelKey,
-        string? path,
-        string? indexedModelIdentifier)
+    /// <summary>
+    /// source 一致性判定：source key 为 .gguf 路径时要求 publisher 一致且全部证据路径与 source 归一化相等；
+    /// 否则按“publisher/modelKey 的限定形态”与 source key 比较。
+    /// </summary>
+    private static bool SourceMatches(string sourceKey, string? publisher, string? modelKey, string? path, string? indexedModelIdentifier)
     {
         if (string.IsNullOrWhiteSpace(publisher) || string.IsNullOrWhiteSpace(modelKey))
         {
@@ -528,8 +551,7 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
             }
 
             string[] evidencePaths = [.. new[] { path, indexedPath }.Where(value => !string.IsNullOrWhiteSpace(value)).Cast<string>()];
-            return evidencePaths.Length > 0 && evidencePaths.All(value =>
-                normalizedSource.Equals(NormalizeModelIdentifierPath(value), StringComparison.OrdinalIgnoreCase));
+            return evidencePaths.Length > 0 && evidencePaths.All(value => normalizedSource.Equals(NormalizeModelIdentifierPath(value), StringComparison.OrdinalIgnoreCase));
         }
 
         string normalizedSourceId = NormalizeModelIdentifierPath(sourceKey);
@@ -543,6 +565,7 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
             : normalizedSourceId.Equals(normalizedModelKey, StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>modelKey 一致性判定：等于 loaded ID，或归一化后等于 source key。</summary>
     private static bool ModelKeyMatches(string? modelKey, string loadedId, string sourceKey)
     {
         if (string.IsNullOrWhiteSpace(modelKey))
@@ -554,9 +577,11 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
             NormalizeModelIdentifierPath(modelKey).Equals(NormalizeModelIdentifierPath(sourceKey), StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>判断 source key 是否为 .gguf 路径形态。</summary>
     private static bool IsGgufSourcePath(string sourceKey) =>
         sourceKey.Trim().EndsWith(".gguf", StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>归一化模型标识路径：反斜杠统一为正斜杠，去掉前导 “./”。</summary>
     private static string NormalizeModelIdentifierPath(string value)
     {
         string normalized = value.Trim().Replace('\\', '/');
@@ -568,13 +593,8 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         return normalized;
     }
 
-    private static void AddLsCandidate(
-        List<CliCandidate> candidates,
-        JsonElement item,
-        string sourceKey,
-        string? selectedVariant,
-        ModelProfile model,
-        string source)
+    /// <summary>从 lms ls 条目提取候选：按选中变体（或 source key）过滤，量化/架构宽松匹配。</summary>
+    private static void AddLsCandidate(List<CliCandidate> candidates, JsonElement item, string sourceKey, string? selectedVariant, ModelProfile model, string source)
     {
         if (item.ValueKind != JsonValueKind.Object)
         {
@@ -607,19 +627,11 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         }
 
         string? indexedPath = ExtractIndexedRelativePath(GetString(item, "indexedModelIdentifier"));
-        candidates.Add(new CliCandidate(
-            sourceKey,
-            selectedVariant ?? (StringEquals(modelKey, sourceKey) ? null : modelKey),
-            architecture,
-            quantization,
-            [indexedPath, GetString(item, "path")],
-            source,
-            null));
+        candidates.Add(new CliCandidate(sourceKey, selectedVariant ?? (StringEquals(modelKey, sourceKey) ? null : modelKey), architecture, quantization, [indexedPath, GetString(item, "path")], source, null));
     }
 
-    private static EvidenceResult ResolveCandidates(
-        IReadOnlyList<CliCandidate> candidates,
-        IReadOnlyList<string> modelRoots)
+    /// <summary>候选归并：逐个解析路径，按文件路径去重后唯一 → Unique，多个 → Ambiguous，零个按拒绝原因归类。</summary>
+    private static EvidenceResult ResolveCandidates(IReadOnlyList<CliCandidate> candidates, IReadOnlyList<string> modelRoots)
     {
         if (candidates.Count == 0)
         {
@@ -639,14 +651,7 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
             foreach (string path in paths.Paths)
             {
                 string? concreteModelIdentifier = ResolveConcreteModelIdentifier(path, modelRoots);
-                resolved.Add(new LmStudioModelFileResolution(
-                    path,
-                    candidate.SourceModelKey,
-                    candidate.SelectedVariant,
-                    candidate.Architecture,
-                    candidate.Quantization,
-                    candidate.Source,
-                    concreteModelIdentifier));
+                resolved.Add(new LmStudioModelFileResolution(path, candidate.SourceModelKey, candidate.SelectedVariant, candidate.Architecture, candidate.Quantization, candidate.Source, concreteModelIdentifier));
             }
         }
 
@@ -673,9 +678,11 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         return new EvidenceResult(status, null);
     }
 
-    private static PathResolution ResolveCandidatePaths(
-        CliCandidate candidate,
-        IReadOnlyList<string> modelRoots)
+    /// <summary>
+    /// 解析单个候选的路径：绝对路径直接核验（在根内 + publisher 匹配 + 存在）；
+    /// 相对路径在每个 models 根下拼接后同样核验，同时收集各类拒绝原因。
+    /// </summary>
+    private static PathResolution ResolveCandidatePaths(CliCandidate candidate, IReadOnlyList<string> modelRoots)
     {
         List<string> paths = [];
         var rejections = new HashSet<PathEvidenceStatus>();
@@ -731,6 +738,7 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         return new PathResolution(paths.Distinct(StringComparer.OrdinalIgnoreCase).ToArray(), rejections);
     }
 
+    /// <summary>从绝对路径反推 concrete model identifier（相对 models 根的归一化相对路径）；越出根或逃逸则返回 null。</summary>
     private static string? ResolveConcreteModelIdentifier(string path, IReadOnlyList<string> modelRoots)
     {
         string fullPath = Path.GetFullPath(path);
@@ -748,12 +756,9 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
 
         return NormalizeModelIdentifierPath(relative);
     }
-    private static void TryAddAbsolutePath(
-        List<string> paths,
-        HashSet<PathEvidenceStatus> rejections,
-        string rawPath,
-        IReadOnlyList<string> modelRoots,
-        string? requiredPublisher)
+
+    /// <summary>核验并登记一个绝对路径候选：必须在某个 models 根内且 publisher 匹配，文件须存在。</summary>
+    private static void TryAddAbsolutePath(List<string> paths, HashSet<PathEvidenceStatus> rejections, string rawPath, IReadOnlyList<string> modelRoots, string? requiredPublisher)
     {
         string fullPath;
         try
@@ -782,6 +787,7 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         }
     }
 
+    /// <summary>校验路径相对根的首段目录是否为要求的 publisher（未要求时恒通过）。</summary>
     private static bool PublisherPathMatches(string path, string root, string? requiredPublisher)
     {
         if (string.IsNullOrWhiteSpace(requiredPublisher))
@@ -796,6 +802,7 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         return string.Equals(firstSegment, requiredPublisher, StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>判断路径是否位于根目录之下（忽略大小写）。</summary>
     private static bool IsUnderRoot(string path, string root)
     {
         string fullRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
@@ -803,6 +810,7 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         return path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>读取 models 根目录：settings.json 的 downloadsFolder（必须绝对路径）优先，默认 ~/.lmstudio/models 兜底。</summary>
     private static string[] ReadModelRoots(string? settingsJson, string userProfile)
     {
         string fullProfile = Path.GetFullPath(userProfile);
@@ -837,6 +845,7 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         return roots.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
     }
 
+    /// <summary>解析用户目录：优先 USERPROFILE 环境变量（须为绝对路径），否则已知文件夹 API。</summary>
     private static string ResolveUserProfile()
     {
         string? environmentProfile = Environment.GetEnvironmentVariable("USERPROFILE");
@@ -848,6 +857,7 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         return Path.GetFullPath(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
     }
 
+    /// <summary>从 indexedModelIdentifier 提取“@”之后的 .gguf 相对路径；形态不符返回 null。</summary>
     private static string? ExtractIndexedRelativePath(string? identifier)
     {
         if (string.IsNullOrWhiteSpace(identifier))
@@ -860,24 +870,27 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         return relative.EndsWith(".gguf", StringComparison.OrdinalIgnoreCase) ? relative : null;
     }
 
+    /// <summary>组装成功结果（附证据来源说明）。</summary>
     private static LmStudioModelFileResolutionAttempt Success(LmStudioModelFileResolution resolution) => new(
         LmStudioModelFileResolutionStatus.Success,
         resolution,
         $"已通过 {resolution.Source} 唯一解析 GGUF，并保持 native loaded instance 为权威状态来源。");
 
-    private static LmStudioModelFileResolutionAttempt Failure(
-        LmStudioModelFileResolutionStatus status,
-        string diagnostic) => new(status, null, diagnostic);
+    /// <summary>组装失败结果（附诊断说明）。</summary>
+    private static LmStudioModelFileResolutionAttempt Failure(LmStudioModelFileResolutionStatus status, string diagnostic) => new(status, null, diagnostic);
 
+    /// <summary>宽松匹配：期望缺失视为匹配；两侧都有值时忽略大小写相等。</summary>
     private static bool Compatible(string? expected, string? actual) =>
         string.IsNullOrWhiteSpace(expected) ||
         !string.IsNullOrWhiteSpace(actual) && expected.Equals(actual, StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>精确匹配：两侧都必须有值且忽略大小写相等。</summary>
     private static bool Exact(string? expected, string? actual) =>
         !string.IsNullOrWhiteSpace(expected) &&
         !string.IsNullOrWhiteSpace(actual) &&
         expected.Equals(actual, StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>可选精确匹配：一侧缺失则要求另一侧也缺失；两侧都有值时忽略大小写相等。</summary>
     private static bool OptionalExact(string? expected, string? actual)
     {
         bool expectedMissing = string.IsNullOrWhiteSpace(expected);
@@ -887,15 +900,15 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
             : expected!.Equals(actual, StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>忽略大小写的字符串相等。</summary>
     private static bool StringEquals(string? left, string? right) =>
         string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>读取字符串属性；不存在或类型不符返回 null。</summary>
     private static string? GetString(JsonElement element, string name) =>
-        element.ValueKind == JsonValueKind.Object &&
-        element.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.String
-            ? value.GetString()
-            : null;
+        element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
 
+    /// <summary>读取 int 属性；不存在或无法转换返回 null。</summary>
     private static int? GetInt32(JsonElement element, string name) =>
         element.ValueKind == JsonValueKind.Object &&
         element.TryGetProperty(name, out JsonElement value) &&
@@ -904,6 +917,7 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
             ? number
             : null;
 
+    /// <summary>读取 quantization 字段：兼容字符串与 { name: ... } 对象两种形态。</summary>
     private static string? GetQuantization(JsonElement element)
     {
         if (element.ValueKind != JsonValueKind.Object ||
@@ -920,6 +934,7 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         };
     }
 
+    /// <summary>单条证据链的解析状态。</summary>
     private enum EvidenceStatus
     {
         Unique,
@@ -933,6 +948,7 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         CommandFailed
     }
 
+    /// <summary>路径级拒绝原因。</summary>
     private enum PathEvidenceStatus
     {
         Unsafe,
@@ -940,15 +956,18 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         UnsupportedFileType
     }
 
+    /// <summary>证据链解析结果：状态、定位结果（成功时）与诊断。</summary>
     private sealed record EvidenceResult(
         EvidenceStatus Status,
         LmStudioModelFileResolution? Resolution,
         string? Diagnostic = null);
 
+    /// <summary>单个候选的路径解析结果。</summary>
     private sealed record PathResolution(
         IReadOnlyList<string> Paths,
         IReadOnlySet<PathEvidenceStatus> Rejections);
 
+    /// <summary>CLI 候选条目：source key、变体、架构/量化、候选路径、证据来源与要求的 publisher。</summary>
     private sealed record CliCandidate(
         string SourceModelKey,
         string? SelectedVariant,
@@ -958,9 +977,8 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         string Source,
         string? RequiredPublisher);
 
-    internal static ProcessStartInfo CreateLmsProcessStartInfo(
-        string executable,
-        IReadOnlyList<string> arguments)
+    /// <summary>构造 lms CLI 子进程启动信息（隐藏窗口、UTF-8 重定向、逐参数传递）。</summary>
+    internal static ProcessStartInfo CreateLmsProcessStartInfo(string executable, IReadOnlyList<string> arguments)
     {
         var startInfo = new ProcessStartInfo
         {
@@ -982,24 +1000,22 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
         return startInfo;
     }
 
+    /// <summary>真实进程版 lms CLI 运行器：固定查 ~/.lmstudio/bin 下的 lms，找不到退回 PATH 查找。</summary>
     private sealed class ProcessLmsCliCommandRunner : ILmsCliCommandRunner
     {
-        public async Task<LmsCliCommandResult> RunAsync(
-            IReadOnlyList<string> arguments,
-            TimeSpan timeout,
-            CancellationToken cancellationToken)
+        /// <summary>运行 lms 命令并归并结果状态；退出码非 0 或无输出视为失败。</summary>
+        public async Task<LmsCliCommandResult> RunAsync(IReadOnlyList<string> arguments, TimeSpan timeout, CancellationToken cancellationToken)
         {
             string executable = FindLmsExecutable() ?? (OperatingSystem.IsWindows() ? "lms.exe" : "lms");
             ProcessStartInfo startInfo = CreateLmsProcessStartInfo(executable, arguments);
             try
             {
-                BoundedProcessResult result = await BoundedProcessRunner.RunAsync(
-                    startInfo, timeout, BoundedProcessRunner.CatalogOutputLimit, BoundedProcessRunner.CatalogOutputLimit,
-                    cancellationToken, combineOutputBudget: true).ConfigureAwait(false);
+                BoundedProcessResult result = await BoundedProcessRunner.RunAsync(startInfo, timeout, BoundedProcessRunner.CatalogOutputLimit, BoundedProcessRunner.CatalogOutputLimit, cancellationToken, combineOutputBudget: true).ConfigureAwait(false);
                 if (result.ExitCode != 0 || string.IsNullOrWhiteSpace(result.StandardOutput))
                 {
                     return new LmsCliCommandResult(LmsCliCommandStatus.Failed, null);
                 }
+
                 return new LmsCliCommandResult(LmsCliCommandStatus.Success, result.StandardOutput);
             }
             catch (Win32Exception)
@@ -1020,6 +1036,7 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
             }
         }
 
+        /// <summary>定位 ~/.lmstudio/bin 下的 lms 可执行文件。</summary>
         private static string? FindLmsExecutable()
         {
             string? profile = Environment.GetEnvironmentVariable("USERPROFILE");
@@ -1034,10 +1051,10 @@ public sealed class LmStudioModelFileLocator : ILmStudioModelFileLocator
 
             return null;
         }
-
     }
 }
 
+/// <summary>lms CLI 命令的执行状态。</summary>
 internal enum LmsCliCommandStatus
 {
     Success,
@@ -1047,14 +1064,14 @@ internal enum LmsCliCommandStatus
     OutputTooLarge
 }
 
+/// <summary>lms CLI 命令结果：状态与标准输出（失败时为 null）。</summary>
 internal sealed record LmsCliCommandResult(
     LmsCliCommandStatus Status,
     string? StandardOutput);
 
+/// <summary>lms CLI 运行器抽象（便于测试注入）。</summary>
 internal interface ILmsCliCommandRunner
 {
-    Task<LmsCliCommandResult> RunAsync(
-        IReadOnlyList<string> arguments,
-        TimeSpan timeout,
-        CancellationToken cancellationToken);
+    /// <summary>运行一次 lms 命令并返回归并后的结果。</summary>
+    Task<LmsCliCommandResult> RunAsync(IReadOnlyList<string> arguments, TimeSpan timeout, CancellationToken cancellationToken);
 }

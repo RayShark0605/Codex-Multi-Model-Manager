@@ -1,7 +1,9 @@
 namespace CodexModelManager.App.UI;
 
+/// <summary>设置/日志页控件：三个 Provider 的 Token 录入区与只读日志视图。</summary>
 public sealed class SettingsLogControl : UserControl
 {
+    /// <summary>构造控件并布置凭据表与日志框。</summary>
     public SettingsLogControl()
     {
         Dock = DockStyle.Fill;
@@ -41,12 +43,27 @@ public sealed class SettingsLogControl : UserControl
         Controls.Add(credentials);
     }
 
+    /// <summary>DeepSeek Token 输入框。</summary>
     public TextBox DeepSeekToken { get; }
+
+    /// <summary>LM Studio Token 输入框。</summary>
     public TextBox LmStudioToken { get; }
+
+    /// <summary>GLM Token 输入框。</summary>
     public TextBox GlmToken { get; }
+
+    /// <summary>保存 DeepSeek Token 按钮。</summary>
     public Button SaveDeepSeekButton { get; }
+
+    /// <summary>保存 LM Studio Token 按钮。</summary>
     public Button SaveLmStudioButton { get; }
+
+    /// <summary>保存 GLM Token 按钮。</summary>
     public Button SaveGlmButton { get; }
+
+    /// <summary>凭据状态标签。</summary>
     public Label CredentialStatus { get; }
+
+    /// <summary>只读日志文本框。</summary>
     public TextBox Log { get; }
 }

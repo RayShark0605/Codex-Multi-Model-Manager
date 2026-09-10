@@ -7,6 +7,7 @@ using CodexModelManager.Core.Providers;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>ProviderRemediation 相关测试集。</summary>
 public sealed class ProviderRemediationTests
 {
     [Fact]
@@ -124,10 +125,7 @@ public sealed class ProviderRemediationTests
     public void ResponsesClientRejectsPathThatCanOverrideAuthority(string responsesPath)
     {
         using var http = new HttpClient(new StubHttpHandler(_ => throw new InvalidOperationException()));
-        Assert.Throws<ArgumentException>(() => new ResponsesCompatibilityClient(
-            http,
-            new Uri("http://127.0.0.1:1234/base"),
-            responsesPath: responsesPath));
+        Assert.Throws<ArgumentException>(() => new ResponsesCompatibilityClient(http, new Uri("http://127.0.0.1:1234/base"), responsesPath: responsesPath));
     }
 
     [Fact]
@@ -139,10 +137,7 @@ public sealed class ProviderRemediationTests
             requested = request.RequestUri;
             return StubHttpHandler.Json("{\"output\":null}");
         }));
-        var client = new ResponsesCompatibilityClient(
-            http,
-            new Uri("http://127.0.0.1:1234/base"),
-            responsesPath: "v1/responses");
+        var client = new ResponsesCompatibilityClient(http, new Uri("http://127.0.0.1:1234/base"), responsesPath: "v1/responses");
 
         await client.TestAsync(ProviderKind.LmStudio, "fixture", false);
 

@@ -6,6 +6,7 @@ using CodexModelManager.Core.Security;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>SecurityAndScanner 相关测试集。</summary>
 public sealed class SecurityAndScannerTests
 {
     [Fact]
@@ -86,9 +87,7 @@ public sealed class SecurityAndScannerTests
         Assert.Equal("'gpt-cloud'", found.RawTomlValue);
         Assert.True(found.IsPotentialCloudRequest);
 
-        (string patched, IReadOnlyList<ConfigMutation> mutations) = SecondaryOverridePatcher.Apply(
-            text,
-            new Dictionary<string, string> { ["agents.default_subagent_model"] = "qwen-local" });
+        (string patched, IReadOnlyList<ConfigMutation> mutations) = SecondaryOverridePatcher.Apply(text, new Dictionary<string, string> { ["agents.default_subagent_model"] = "qwen-local" });
         Assert.Single(mutations);
         Assert.Contains("agents.default_subagent_model = \"qwen-local\" # keep literal comment", patched, StringComparison.Ordinal);
         Assert.Contains("model = \"main\"", patched, StringComparison.Ordinal);
@@ -126,9 +125,7 @@ public sealed class SecurityAndScannerTests
         SecondaryModelOverride nested = Assert.Single(overrides, item => item.Model == "gpt-nested");
         Assert.Equal("agents.review.blue.model", nested.KeyPath);
 
-        (string changed, IReadOnlyList<ConfigMutation> mutations) = SecondaryOverridePatcher.Apply(
-            config,
-            new Dictionary<string, string> { [quoted.KeyPath] = "local-only" });
+        (string changed, IReadOnlyList<ConfigMutation> mutations) = SecondaryOverridePatcher.Apply(config, new Dictionary<string, string> { [quoted.KeyPath] = "local-only" });
 
         Assert.Single(mutations);
         Assert.Contains("model = \"local-only\"", changed, StringComparison.Ordinal);

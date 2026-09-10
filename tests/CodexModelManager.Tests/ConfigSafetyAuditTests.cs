@@ -9,6 +9,7 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>ConfigSafetyAudit 相关测试集。</summary>
 public sealed class ConfigSafetyAuditTests
 {
     [Fact]
@@ -143,7 +144,10 @@ public sealed class ConfigSafetyAuditTests
         const string profileText = "[profiles.A]\nmodel = 'gpt-upper'\n[profiles.a]\nmodel = 'gpt-lower'\n";
         using var harness = new SwitchHarness("model = \"gpt-native\"\n" + (external ? string.Empty : profileText));
         string path = Path.Combine(harness.Home.Home, external ? "worker.config.toml" : "config.toml");
-        if (external) await File.WriteAllTextAsync(path, profileText);
+        if (external)
+        {
+            await File.WriteAllTextAsync(path, profileText);
+        }
         string Select(string key) => JsonSerializer.Serialize(new[] { new SecondaryOverrideTarget(path.ToUpperInvariant(), key) });
         SwitchRequest followUpper = harness.Request(ProviderKind.LmStudio) with
         {
@@ -204,14 +208,23 @@ public sealed class ConfigSafetyAuditTests
             new(first, await FileFingerprintService.CaptureAsync(first), Encoding.UTF8.GetBytes("model = \"first-new\"\n"), []),
             new(second, await FileFingerprintService.CaptureAsync(second), Encoding.UTF8.GetBytes("model = \"fixture-secret\"\n"), [], _ =>
             {
-                if (!cancel) throw new InvalidDataException("injected stage failure");
+                if (!cancel)
+                {
+                    throw new InvalidDataException("injected stage failure");
+                }
                 cancellation.Cancel();
                 return ValueTask.CompletedTask;
             }),
         ];
         Exception? error = await Record.ExceptionAsync(() => new AtomicBatchWriter().WriteAsync(changes, cancellation.Token));
-        if (cancel) Assert.IsAssignableFrom<OperationCanceledException>(error);
-        else Assert.IsType<InvalidDataException>(error);
+        if (cancel)
+        {
+            Assert.IsAssignableFrom<OperationCanceledException>(error);
+        }
+        else
+        {
+            Assert.IsType<InvalidDataException>(error);
+        }
         Assert.Empty(Directory.EnumerateFiles(temporary.Path, "*.tmp"));
         Assert.Empty(Directory.EnumerateFiles(temporary.Path, "*.rollback"));
         Assert.Equal("model = \"first-old\"\n", await File.ReadAllTextAsync(first));
@@ -221,7 +234,10 @@ public sealed class ConfigSafetyAuditTests
     [Fact]
     public async Task FailedDeletionOfNewCandidateIsReportedAsRollbackFailure()
     {
-        if (!OperatingSystem.IsWindows()) return;
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
         using var temporary = new TemporaryDirectory();
         string path = Path.Combine(temporary.Path, "new.toml");
         var primary = new InvalidDataException("injected post-commit failure");
@@ -245,7 +261,10 @@ public sealed class ConfigSafetyAuditTests
         }
         finally
         {
-            if (File.Exists(path)) File.SetAttributes(path, FileAttributes.Normal);
+            if (File.Exists(path))
+            {
+                File.SetAttributes(path, FileAttributes.Normal);
+            }
         }
     }
 

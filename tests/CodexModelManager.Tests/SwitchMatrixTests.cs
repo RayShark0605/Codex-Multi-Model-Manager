@@ -8,6 +8,7 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>SwitchMatrix 相关测试集。</summary>
 public sealed class SwitchMatrixTests
 {
     [Theory]
@@ -336,8 +337,7 @@ public sealed class SwitchMatrixTests
         using var harness = new SwitchHarness(SwitchHarness.BaseConfig);
         harness.Preflight.DefaultResult = FakeLmStudioSwitchPreflight.Fail();
 
-        LmStudioCompatibilityException error = await Assert.ThrowsAsync<LmStudioCompatibilityException>(
-            () => harness.Service.CreatePlanAsync(harness.Request(ProviderKind.LmStudio)));
+        LmStudioCompatibilityException error = await Assert.ThrowsAsync<LmStudioCompatibilityException>(() => harness.Service.CreatePlanAsync(harness.Request(ProviderKind.LmStudio)));
 
         Assert.Equal(CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder, error.Result.FailureCode);
         Assert.Equal(1, harness.Preflight.CallCount);

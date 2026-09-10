@@ -4,6 +4,7 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>LiveCodexSmokeIntegration 相关测试集。</summary>
 public sealed class LiveCodexSmokeIntegrationTests
 {
     [Fact]
@@ -30,8 +31,7 @@ public sealed class LiveCodexSmokeIntegrationTests
     {
         string[] candidates =
         [
-            Path.Combine(repository, "src", project, "bin", "Release", "net8.0", executable),
-            Path.Combine(repository, "src", project, "bin", "Debug", "net8.0", executable),
+            Path.Combine(repository, "src", project, "bin", "Release", "net8.0", executable), Path.Combine(repository, "src", project, "bin", "Debug", "net8.0", executable),
             Path.Combine(repository, "artifacts", "publish", "win-x64", "helpers", publishSubdirectory, executable),
         ];
         return candidates.FirstOrDefault(File.Exists) ?? throw new FileNotFoundException($"测试 Helper 尚未构建: {executable}");

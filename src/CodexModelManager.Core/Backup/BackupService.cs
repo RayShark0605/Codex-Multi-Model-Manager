@@ -9,6 +9,13 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Core.Backup;
 
+/// <summary>
+/// 配置备份服务：在 Codex 主目录的 model-switcher-backup 下维护三类快照——
+/// initial（首运行基线，不可变）、history（每次切换的时间戳快照）与
+/// supplemental-baseline（外部 override 文件的基线）。
+/// 快照先写入隐藏 staging 目录再原子改名；恢复前强制校验 manifest 形状与 SHA-256，
+/// 恢复本身通过原子批量写入完成，并会先为当前状态再留一份 history。
+/// </summary>
 public sealed class BackupService : IBackupService
 {
     private static readonly string[] PrimaryFileNames = ["config.toml", "models.json"];
@@ -24,12 +31,8 @@ public sealed class BackupService : IBackupService
     private readonly IConfigPatchEngine configValidator;
     private readonly string appVersion;
 
-    public BackupService(
-        ICodexHomeProvider homeProvider,
-        IAtomicBatchWriter writer,
-        IConfigPatchEngine configValidator,
-        string? appVersion = null,
-        string? codexVersion = null)
+    /// <summary>注入协作者构造服务；appVersion 缺省取程序集版本。</summary>
+    public BackupService(ICodexHomeProvider homeProvider, IAtomicBatchWriter writer, IConfigPatchEngine configValidator, string? appVersion = null, string? codexVersion = null)
     {
         this.homeProvider = homeProvider;
         this.writer = writer;
@@ -39,10 +42,13 @@ public sealed class BackupService : IBackupService
         BackupRoot = Path.Combine(homeProvider.GetCodexHome(), "model-switcher-backup");
     }
 
+    /// <summary>备份根目录。</summary>
     public string BackupRoot { get; }
 
+    /// <summary>记录进 manifest 的 Codex 版本（可更新）。</summary>
     public string? CodexVersion { get; set; }
 
+    /// <summary>确保 initial 基线快照存在并有效（已存在则校验后复用）；并发首运行以先完成者为准。</summary>
     public async Task<string> EnsureInitialSnapshotAsync(CancellationToken cancellationToken = default)
     {
         string directory = Path.Combine(BackupRoot, "initial");
@@ -72,7 +78,7 @@ public sealed class BackupService : IBackupService
             }
             catch (IOException) when (Directory.Exists(directory))
             {
-                // Another instance won the first-run race. Initial is immutable.
+                // 另一个实例在首运行竞速中抢先完成；initial 是不可变的
                 if (!File.Exists(Path.Combine(directory, "manifest.json")))
                 {
                     throw new InvalidDataException("Initial Snapshot 目录已存在但不完整；为避免覆盖，已停止。请人工检查该目录。");
@@ -84,10 +90,14 @@ public sealed class BackupService : IBackupService
         }
         finally
         {
-            if (Directory.Exists(staging)) Directory.Delete(staging, true);
+            if (Directory.Exists(staging))
+            {
+                Directory.Delete(staging, true);
+            }
         }
     }
 
+    /// <summary>创建一次历史快照（时间戳目录，重名碰撞时稍候重试）。</summary>
     public async Task<string> CreateHistorySnapshotAsync(
         BackupOperation operation,
         string? sourceProvider,
@@ -129,13 +139,15 @@ public sealed class BackupService : IBackupService
         }
         finally
         {
-            if (Directory.Exists(staging)) Directory.Delete(staging, true);
+            if (Directory.Exists(staging))
+            {
+                Directory.Delete(staging, true);
+            }
         }
     }
 
-    public async Task EnsureSupplementalBaselinesAsync(
-        IReadOnlyCollection<string> files,
-        CancellationToken cancellationToken = default)
+    /// <summary>为初次纳入备份的文件补建 supplemental 基线（已存在则校验后跳过）。</summary>
+    public async Task EnsureSupplementalBaselinesAsync(IReadOnlyCollection<string> files, CancellationToken cancellationToken = default)
     {
         foreach (string file in files.Select(Path.GetFullPath).Distinct(StringComparer.OrdinalIgnoreCase))
         {
@@ -170,11 +182,15 @@ public sealed class BackupService : IBackupService
             }
             finally
             {
-                if (Directory.Exists(staging)) Directory.Delete(staging, true);
+                if (Directory.Exists(staging))
+                {
+                    Directory.Delete(staging, true);
+                }
             }
         }
     }
 
+    /// <summary>按时间倒序列出全部历史快照；损坏/不兼容的目录也列出但标记哈希无效。</summary>
     public async Task<IReadOnlyList<BackupSnapshotInfo>> ListHistoryAsync(CancellationToken cancellationToken = default)
     {
         List<BackupSnapshotInfo> result = [];
@@ -204,6 +220,10 @@ public sealed class BackupService : IBackupService
         return result;
     }
 
+    /// <summary>
+    /// 从快照恢复：校验快照位于备份根内且哈希一致；恢复 initial 时同时纳入全部 supplemental 基线；
+    /// 先给当前状态拍 history，复核指纹未变后以原子批量写入还原（TOML 目标附语法校验）。
+    /// </summary>
     public async Task RestoreAsync(string snapshotDirectory, CancellationToken cancellationToken = default)
     {
         string snapshot = Path.GetFullPath(snapshotDirectory);
@@ -226,6 +246,7 @@ public sealed class BackupService : IBackupService
         List<RestoreSource> restoreSources = manifest.Files
             .Select(file => new RestoreSource(file, snapshot, file.RelativeName, file.RelativeName is not ("config.toml" or "models.json")))
             .ToList();
+        // 恢复 initial 时，把全部 supplemental 基线也纳入还原目标
         if (snapshot.Equals(Path.Combine(Path.GetFullPath(BackupRoot), "initial"), StringComparison.OrdinalIgnoreCase))
         {
             string supplementalRoot = Path.Combine(BackupRoot, "supplemental-baseline");
@@ -304,6 +325,7 @@ public sealed class BackupService : IBackupService
         await writer.WriteAsync(changes, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>创建快照目录内容：主文件 + 追加文件（supplemental/<标识>.toml）+ manifest。</summary>
     private async Task CreateSnapshotDirectoryAsync(
         string directory,
         BackupOperation operation,
@@ -340,7 +362,11 @@ public sealed class BackupService : IBackupService
             StringComparer.OrdinalIgnoreCase);
         foreach (string source in additionalFiles.Select(Path.GetFullPath).Distinct(StringComparer.OrdinalIgnoreCase))
         {
-            if (primaryFiles.Contains(source)) continue;
+            if (primaryFiles.Contains(source))
+            {
+                continue;
+            }
+
             ValidateSupplementalTarget(source);
             string relative = Path.Combine("supplemental", PathIdentifier(source) + ".toml");
             await AddSnapshotFileAsync(directory, manifest, source, relative, cancellationToken).ConfigureAwait(false);
@@ -349,17 +375,29 @@ public sealed class BackupService : IBackupService
         await WriteManifestAsync(directory, manifest, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>逐文件校验快照内容哈希（Existed=false 的条目要求对应路径不存在）。</summary>
     private async Task<bool> ValidateHashesAsync(string directory, BackupManifest manifest, CancellationToken cancellationToken, bool supplementalBaseline = false)
     {
         ValidateManifestShape(manifest, supplementalBaseline);
         foreach (BackupFileManifest file in manifest.Files)
         {
             string path;
-            try { path = ResolveSnapshotContentPath(directory, file.RelativeName); }
-            catch (InvalidDataException) { return false; }
+            try
+            {
+                path = ResolveSnapshotContentPath(directory, file.RelativeName);
+            }
+            catch (InvalidDataException)
+            {
+                return false;
+            }
+
             if (!file.Existed)
             {
-                if (File.Exists(path) || Directory.Exists(path)) return false;
+                if (File.Exists(path) || Directory.Exists(path))
+                {
+                    return false;
+                }
+
                 continue;
             }
 
@@ -373,6 +411,7 @@ public sealed class BackupService : IBackupService
         return true;
     }
 
+    /// <summary>校验 manifest 结构：版本/枚举/时间戳/非空集合，主文件唯一，条目字段形状与路径防穿越/去重。</summary>
     private void ValidateManifestShape(BackupManifest manifest, bool supplementalBaseline = false)
     {
         if (manifest.SchemaVersion != 1 || !Enum.IsDefined(manifest.Operation) ||
@@ -412,7 +451,11 @@ public sealed class BackupService : IBackupService
                 _ = Path.GetFullPath(file.OriginalPath);
                 string storageName = file.RelativeName.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
                 bool isSupplemental = file.RelativeName is not ("config.toml" or "models.json");
-                if (!supplementalBaseline && file.RelativeName == "content.toml") throw new InvalidDataException("History 不允许 baseline 存储条目。");
+                if (!supplementalBaseline && file.RelativeName == "content.toml")
+                {
+                    throw new InvalidDataException("History 不允许 baseline 存储条目。");
+                }
+
                 string target = ResolveRestoreTarget(homeProvider.GetCodexHome(), file, isSupplemental);
                 if (!storageNames.Add(storageName) || !targetPaths.Add(Path.GetFullPath(target)))
                 {
@@ -426,6 +469,7 @@ public sealed class BackupService : IBackupService
         }
     }
 
+    /// <summary>校验 initial 快照：manifest 合法、恰好包含两个主文件且指向当前主目录，全部哈希通过。</summary>
     private async Task ValidateInitialSnapshotAsync(string directory, CancellationToken cancellationToken)
     {
         BackupManifest manifest;
@@ -453,6 +497,7 @@ public sealed class BackupService : IBackupService
         }
     }
 
+    /// <summary>创建 supplemental 基线目录（单文件 content.toml + manifest）。</summary>
     private async Task CreateSupplementalBaselineAsync(string directory, string source, CancellationToken cancellationToken)
     {
         Directory.CreateDirectory(directory);
@@ -468,6 +513,7 @@ public sealed class BackupService : IBackupService
         await WriteManifestAsync(directory, manifest, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>校验 supplemental 基线：目录标识、原始路径与内容哈希都与目标文件一致。</summary>
     private async Task ValidateSupplementalBaselineAsync(string directory, string expectedSource, CancellationToken cancellationToken)
     {
         BackupManifest manifest = JsonSerializer.Deserialize<BackupManifest>(
@@ -485,12 +531,8 @@ public sealed class BackupService : IBackupService
         }
     }
 
-    private static async Task AddSnapshotFileAsync(
-        string directory,
-        BackupManifest manifest,
-        string source,
-        string relativeName,
-        CancellationToken cancellationToken)
+    /// <summary>把一个文件纳入快照：登记清单条目并复制原始字节（不存在则只登记 Existed=false）。</summary>
+    private static async Task AddSnapshotFileAsync(string directory, BackupManifest manifest, string source, string relativeName, CancellationToken cancellationToken)
     {
         TextFileSnapshot snapshot = await TextFileCodec.ReadAsync(source, cancellationToken).ConfigureAwait(false);
         manifest.Files.Add(new BackupFileManifest
@@ -503,12 +545,17 @@ public sealed class BackupService : IBackupService
             Utf8Bom = snapshot.Format.HasUtf8Bom,
             NewLine = snapshot.Format.NewLine == "\r\n" ? "CRLF" : "LF",
         });
-        if (!snapshot.Fingerprint.Exists) return;
+        if (!snapshot.Fingerprint.Exists)
+        {
+            return;
+        }
+
         string destination = ResolveSnapshotContentPath(directory, relativeName);
         Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
         await File.WriteAllBytesAsync(destination, snapshot.Bytes, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>原子写 manifest（临时文件 + Move）。</summary>
     private static async Task WriteManifestAsync(string directory, BackupManifest manifest, CancellationToken cancellationToken)
     {
         byte[] manifestBytes = JsonSerializer.SerializeToUtf8Bytes(manifest, JsonOptions);
@@ -522,19 +569,37 @@ public sealed class BackupService : IBackupService
         File.Move(temp, Path.Combine(directory, "manifest.json"));
     }
 
+    /// <summary>解析快照内存储路径：必须相对且不得越出快照目录（防路径穿越）。</summary>
     private static string ResolveSnapshotContentPath(string snapshotDirectory, string relativeName)
     {
-        if (Path.IsPathRooted(relativeName)) throw new InvalidDataException("备份包含绝对存储路径。");
+        if (Path.IsPathRooted(relativeName))
+        {
+            throw new InvalidDataException("备份包含绝对存储路径。");
+        }
+
         string root = Path.GetFullPath(snapshotDirectory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
         string candidate = Path.GetFullPath(Path.Combine(snapshotDirectory, relativeName));
-        if (!candidate.StartsWith(root, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("备份存储路径越界。");
+        if (!candidate.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException("备份存储路径越界。");
+        }
+
         return candidate;
     }
 
+    /// <summary>解析条目的还原目标：主文件回主目录；supplemental 条目回其原始路径（基线 content.toml 或 supplemental/&lt;标识&gt;.toml）。</summary>
     private string ResolveRestoreTarget(string home, BackupFileManifest file, bool isSupplemental)
     {
-        if (!isSupplemental && file.RelativeName is ("config.toml" or "models.json")) return Path.Combine(home, file.RelativeName);
-        if (!isSupplemental) throw new InvalidDataException($"备份包含不受支持的路径: {file.RelativeName}");
+        if (!isSupplemental && file.RelativeName is ("config.toml" or "models.json"))
+        {
+            return Path.Combine(home, file.RelativeName);
+        }
+
+        if (!isSupplemental)
+        {
+            throw new InvalidDataException($"备份包含不受支持的路径: {file.RelativeName}");
+        }
+
         if (file.RelativeName == "content.toml")
         {
             string baselineTarget = Path.GetFullPath(file.OriginalPath);
@@ -562,22 +627,33 @@ public sealed class BackupService : IBackupService
         return target;
     }
 
+    /// <summary>校验 supplemental 目标：必须是 TOML 且不得位于备份目录内。</summary>
     private void ValidateSupplementalTarget(string path)
     {
         string full = Path.GetFullPath(path);
-        if (!full.EndsWith(".toml", StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("Supplemental backup 只允许 TOML 配置文件。");
+        if (!full.EndsWith(".toml", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException("Supplemental backup 只允许 TOML 配置文件。");
+        }
+
         string backup = Path.GetFullPath(BackupRoot).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        if (full.StartsWith(backup, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("Supplemental target 不得位于备份目录内。");
+        if (full.StartsWith(backup, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException("Supplemental target 不得位于备份目录内。");
+        }
     }
 
+    /// <summary>路径标识：全路径大写后的 SHA-256 十六进制（作为目录/文件名）。</summary>
     private static string PathIdentifier(string path) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Path.GetFullPath(path).ToUpperInvariant())));
 
+    /// <summary>一条还原来源：清单条目、快照目录、存储相对名与是否 supplemental。</summary>
     private sealed record RestoreSource(
         BackupFileManifest File,
         string SnapshotDirectory,
         string StorageRelativeName,
         bool IsSupplemental);
 
+    /// <summary>把快照字节解码为文本快照（保留 BOM 信息并探测格式）。</summary>
     private static TextFileSnapshot DecodeSnapshot(string path, byte[] bytes)
     {
         bool bom = bytes.AsSpan().StartsWith(System.Text.Encoding.UTF8.Preamble);

@@ -5,6 +5,7 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>LmStudioIdentityAndRetry 相关测试集。</summary>
 public sealed class LmStudioIdentityAndRetryTests
 {
     private static readonly Uri Endpoint = new("http://127.0.0.1:1234");
@@ -22,7 +23,10 @@ public sealed class LmStudioIdentityAndRetryTests
         int responses = 0;
         using var http = new HttpClient(new StubHttpHandler(request =>
         {
-            if (request.Method == HttpMethod.Get) return StubHttpHandler.Json(models);
+            if (request.Method == HttpMethod.Get)
+            {
+                return StubHttpHandler.Json(models);
+            }
             responses++;
             return StubHttpHandler.Json("{\"output\":[]}");
         }));
@@ -59,7 +63,12 @@ public sealed class LmStudioIdentityAndRetryTests
         int nativeReads = 0;
         using var http = new HttpClient(new StubHttpHandler(request =>
         {
-            if (request.Method == HttpMethod.Get) { nativeReads++; return StubHttpHandler.Json(Models()); }
+            if (request.Method == HttpMethod.Get)
+            {
+                nativeReads++;
+                return StubHttpHandler.Json(Models());
+            }
+
             responses++;
             return responses == 3 ? StubHttpHandler.Json("{}", HttpStatusCode.ServiceUnavailable) : StubHttpHandler.Json("{\"output\":[]}");
         }));
@@ -77,7 +86,10 @@ public sealed class LmStudioIdentityAndRetryTests
         int responses = 0;
         using var http = new HttpClient(new StubHttpHandler(request =>
         {
-            if (request.Method == HttpMethod.Get) return StubHttpHandler.Json(Models(batch));
+            if (request.Method == HttpMethod.Get)
+            {
+                return StubHttpHandler.Json(Models(batch));
+            }
             responses++;
             return StubHttpHandler.Json("{}", HttpStatusCode.ServiceUnavailable);
         }));
@@ -93,7 +105,10 @@ public sealed class LmStudioIdentityAndRetryTests
         int responses = 0;
         using var http = new HttpClient(new StubHttpHandler(request =>
         {
-            if (request.Method == HttpMethod.Get) return StubHttpHandler.Json(Models());
+            if (request.Method == HttpMethod.Get)
+            {
+                return StubHttpHandler.Json(Models());
+            }
             responses++;
             return StubHttpHandler.Json("{}", HttpStatusCode.ServiceUnavailable);
         }));

@@ -3,6 +3,11 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Core.LmStudio;
 
+/// <summary>
+/// LM Studio 模板修复计划器：根据原始探测失败码与实例快照，定位 GGUF、读取模板、
+/// 生成修复预览，并推导运行时模板来源（内置模板或旧 v2 规则）与可选的每模型默认值持久化计划。
+/// 全程保守：任何身份或指纹不一致都会在卸载实例前阻断。
+/// </summary>
 public sealed class LmStudioTemplateRepairPlanner(
     ILmStudioInstanceController instanceController,
     IGgufChatTemplateReader ggufReader,
@@ -14,10 +19,9 @@ public sealed class LmStudioTemplateRepairPlanner(
 {
     private readonly ILmStudioModelFileLocator modelFileLocator = modelFileLocator ?? new LmStudioModelFileLocator();
     private readonly Func<string?> lmStudioVersionProvider = lmStudioVersionProvider ?? LmStudioLocalVersionDetector.Detect;
-    public async Task<LmStudioTemplateRepairPlan> CreatePlanAsync(
-        ModelProfile selectedModel,
-        CodexInstructionHierarchyProbeResult originalProbe,
-        CancellationToken cancellationToken = default)
+
+    /// <summary>为选中的已加载 LLM 实例创建模板修复计划（详见类说明）。</summary>
+    public async Task<LmStudioTemplateRepairPlan> CreatePlanAsync(ModelProfile selectedModel, CodexInstructionHierarchyProbeResult originalProbe, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(selectedModel);
         ArgumentNullException.ThrowIfNull(originalProbe);
@@ -34,6 +38,7 @@ public sealed class LmStudioTemplateRepairPlanner(
             throw new InvalidOperationException("只有当前已加载的 LLM instance 才能创建运行时模板修复计划。");
         }
 
+        // 捕获实例快照并以其为权威，重写选中模型的身份与加载信息
         LmStudioLoadedInstanceSnapshot snapshot = await instanceController.CaptureAsync(selectedModel.Id, cancellationToken).ConfigureAwait(false);
         ModelProfile authoritative = selectedModel with
         {
@@ -52,9 +57,7 @@ public sealed class LmStudioTemplateRepairPlanner(
             AvailableVariants = snapshot.LoadTarget?.AvailableVariants,
             Format = snapshot.LoadTarget?.Format,
         };
-        LmStudioModelFileResolutionAttempt resolutionAttempt = await modelFileLocator
-            .ResolveAsync(authoritative, snapshot.Endpoint, cancellationToken)
-            .ConfigureAwait(false);
+        LmStudioModelFileResolutionAttempt resolutionAttempt = await modelFileLocator.ResolveAsync(authoritative, snapshot.Endpoint, cancellationToken).ConfigureAwait(false);
         if (!resolutionAttempt.Succeeded || resolutionAttempt.Resolution is null)
         {
             throw new FileNotFoundException($"无法唯一定位当前 loaded instance 对应的 GGUF；自动修复已阻断。{resolutionAttempt.Diagnostic} 请使用只读手工选择/导出流程。");
@@ -62,6 +65,7 @@ public sealed class LmStudioTemplateRepairPlanner(
 
         LmStudioModelFileResolution resolution = resolutionAttempt.Resolution;
 
+        // lms CLI 的定位结果必须与 native 实例身份逐项一致，否则拒绝自动修复
         if (!string.Equals(resolution.SourceModelKey, snapshot.SourceModelKey, StringComparison.OrdinalIgnoreCase) ||
             !CompatibleExact(snapshot.SelectedVariant, resolution.SelectedVariant) ||
             !CompatibleExact(snapshot.Quantization, resolution.Quantization) ||
@@ -84,6 +88,7 @@ public sealed class LmStudioTemplateRepairPlanner(
             throw new InvalidDataException($"当前 GGUF Prompt Template 不满足保守修补规则：{preview.Detail}");
         }
 
+        // 续轮指令顺序失败 → 运行时是旧 v2 规则模板，需要联合证据回溯；否则视为内置模板
         (LmStudioRuntimeTemplateProvenance provenance, string? originalRuntimeTemplate) =
             failureCode == CompatibilityFailureCodes.LmStudioChatTemplateContinuationInstructionOrder
                 ? await ResolveV2ProvenanceAsync(snapshot, analysis, originalProbe, cancellationToken).ConfigureAwait(false)
@@ -94,14 +99,7 @@ public sealed class LmStudioTemplateRepairPlanner(
         if (perModelDefaultsStore is not null)
         {
             lmStudioVersion = lmStudioVersionProvider();
-            persistentDefaults = await perModelDefaultsStore.CreatePlanAsync(
-                snapshot.Endpoint,
-                lmStudioVersion,
-                resolution,
-                analysis,
-                preview,
-                provenance,
-                cancellationToken).ConfigureAwait(false);
+            persistentDefaults = await perModelDefaultsStore.CreatePlanAsync(snapshot.Endpoint, lmStudioVersion, resolution, analysis, preview, provenance, cancellationToken).ConfigureAwait(false);
         }
 
         return new LmStudioTemplateRepairPlan(
@@ -119,11 +117,12 @@ public sealed class LmStudioTemplateRepairPlanner(
             lmStudioVersion);
     }
 
-    private async Task<(LmStudioRuntimeTemplateProvenance Provenance, string Template)> ResolveV2ProvenanceAsync(
-        LmStudioLoadedInstanceSnapshot snapshot,
-        GgufChatTemplateAnalysis analysis,
-        CodexInstructionHierarchyProbeResult originalProbe,
-        CancellationToken cancellationToken)
+    /// <summary>
+    /// 回溯旧 v2 规则模板的来源：要求失败行为与 v2 精确签名一致，且存在一条
+    /// “实例/config/GGUF 指纹 + v2 模板哈希可复算”的 completed 事务佐证；
+    /// 多条佐证哈希冲突时拒绝猜测。
+    /// </summary>
+    private async Task<(LmStudioRuntimeTemplateProvenance Provenance, string Template)> ResolveV2ProvenanceAsync(LmStudioLoadedInstanceSnapshot snapshot, GgufChatTemplateAnalysis analysis, CodexInstructionHierarchyProbeResult originalProbe, CancellationToken cancellationToken)
     {
         if (!HasExactV2Behavior(originalProbe))
         {
@@ -141,16 +140,12 @@ public sealed class LmStudioTemplateRepairPlanner(
 
             try
             {
-                string recreated = templateRepair.RecreateKnownTemplate(
-                    analysis,
-                    PromptTemplateRepairService.LegacyLeadingRuleVersion,
-                    record.PatchedTemplateSha256);
+                string recreated = templateRepair.RecreateKnownTemplate(analysis, PromptTemplateRepairService.LegacyLeadingRuleVersion, record.PatchedTemplateSha256);
                 matches.Add((record, recreated));
             }
             catch (InvalidDataException)
             {
-                // A completed record whose deterministic hash no longer matches is
-                // not provenance for the currently loaded runtime template.
+                // completed 记录的确定性哈希已无法复算时，它不能作为当前运行时模板的来源佐证
             }
         }
 
@@ -165,20 +160,12 @@ public sealed class LmStudioTemplateRepairPlanner(
             throw new InvalidDataException("多个 completed 事务对当前 v2 模板哈希给出冲突结论；拒绝猜测回滚来源。");
         }
 
-        (LmStudioTemplateTransactionRecord evidence, string template) = matches
-            .OrderByDescending(match => match.Record.UpdatedAt)
-            .First();
-        return (
-            new LmStudioRuntimeTemplateProvenance(
-                LmStudioRuntimeTemplateMode.ManagerRule,
-                PromptTemplateRepairService.LegacyLeadingRuleVersion,
-                evidence.PatchedTemplateSha256,
-                evidence.TransactionId),
-            template);
+        (LmStudioTemplateTransactionRecord evidence, string template) = matches.OrderByDescending(match => match.Record.UpdatedAt).First();
+        return (new LmStudioRuntimeTemplateProvenance(LmStudioRuntimeTemplateMode.ManagerRule, PromptTemplateRepairService.LegacyLeadingRuleVersion, evidence.PatchedTemplateSha256, evidence.TransactionId), template);
     }
 
-    private static (LmStudioRuntimeTemplateProvenance Provenance, string? Template) ResolveBuiltInProvenance(
-        CodexInstructionHierarchyProbeResult originalProbe)
+    /// <summary>推导内置模板来源：失败行为必须精确匹配“首条指令失败”或“仅前缀续轮失败”两种内置模板签名之一。</summary>
+    private static (LmStudioRuntimeTemplateProvenance Provenance, string? Template) ResolveBuiltInProvenance(CodexInstructionHierarchyProbeResult originalProbe)
     {
         bool leadingInstructionFailure =
             originalProbe.Control.Passed &&
@@ -204,6 +191,7 @@ public sealed class LmStudioTemplateRepairPlanner(
         return (new LmStudioRuntimeTemplateProvenance(LmStudioRuntimeTemplateMode.BuiltIn), null);
     }
 
+    /// <summary>判断探测结果是否为 v2 规则模板的精确行为签名（前三步通过、续轮失败且失败码匹配）。</summary>
     private static bool HasExactV2Behavior(CodexInstructionHierarchyProbeResult probe) =>
         probe.Control.Passed &&
         probe.LeadingDeveloper.Passed &&
@@ -211,10 +199,8 @@ public sealed class LmStudioTemplateRepairPlanner(
         !probe.ContinuationDeveloper.Passed &&
         string.Equals(probe.FailureCode, CompatibilityFailureCodes.LmStudioChatTemplateContinuationInstructionOrder, StringComparison.Ordinal);
 
-    private static bool MatchesCompletedV2Evidence(
-        LmStudioTemplateTransactionRecord record,
-        LmStudioLoadedInstanceSnapshot snapshot,
-        GgufChatTemplateAnalysis analysis) =>
+    /// <summary>判断 completed 事务是否与当前实例/GGUF 全量一致（状态、规则版本、实例身份、加载配置与 GGUF 五重指纹）。</summary>
+    private static bool MatchesCompletedV2Evidence(LmStudioTemplateTransactionRecord record, LmStudioLoadedInstanceSnapshot snapshot, GgufChatTemplateAnalysis analysis) =>
         record.State == LmStudioTemplateTransactionState.Completed &&
         string.Equals(record.RuleVersion, PromptTemplateRepairService.LegacyLeadingRuleVersion, StringComparison.Ordinal) &&
         record.PatchedInstanceId?.Equals(snapshot.InstanceId, StringComparison.Ordinal) == true &&
@@ -233,6 +219,7 @@ public sealed class LmStudioTemplateRepairPlanner(
         record.GgufVersion == analysis.GgufVersion &&
         record.OriginalTemplateSha256.Equals(analysis.TemplateSha256, StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>忽略大小写且“同空同有”的精确匹配（一侧空白即要求另一侧也空白）。</summary>
     private static bool CompatibleExact(string? left, string? right) =>
         string.IsNullOrWhiteSpace(left) && string.IsNullOrWhiteSpace(right) ||
         !string.IsNullOrWhiteSpace(left) && !string.IsNullOrWhiteSpace(right) && left.Equals(right, StringComparison.OrdinalIgnoreCase);

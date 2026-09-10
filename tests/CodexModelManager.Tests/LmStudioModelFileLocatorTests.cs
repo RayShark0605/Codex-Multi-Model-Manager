@@ -4,6 +4,7 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>LmStudioModelFileLocator 相关测试集。</summary>
 public sealed class LmStudioModelFileLocatorTests
 {
     [Fact]
@@ -13,22 +14,18 @@ public sealed class LmStudioModelFileLocatorTests
         string downloads = ConfigureDownloads(temporary.Path);
         const string relativePath = "unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q6_K_XL.gguf";
         string gguf = CreateFile(downloads, relativePath);
-        var runner = new StubLmsCliCommandRunner(
-            Success("[{\"model\":{\"modelKey\":\"qwen/qwen3.8-27b\"},\"variants\":[]} ]"),
+        var runner = new StubLmsCliCommandRunner(Success("[{\"model\":{\"modelKey\":\"qwen/qwen3.8-27b\"},\"variants\":[]} ]"),
             Success(CreatePsJson(relativePath)));
         var locator = new LmStudioModelFileLocator(runner, () => temporary.Path);
 
-        LmStudioModelFileResolutionAttempt attempt = await locator.ResolveAsync(
-            CreateLoadedModel(),
-            new Uri("http://127.0.0.1:1234"));
+        LmStudioModelFileResolutionAttempt attempt = await locator.ResolveAsync(CreateLoadedModel(), new Uri("http://127.0.0.1:1234"));
 
         Assert.True(attempt.Succeeded, attempt.Diagnostic);
         Assert.Equal(LmStudioModelFileResolutionStatus.Success, attempt.Status);
         Assert.Equal(Path.GetFullPath(gguf), attempt.Resolution?.FilePath);
         Assert.Equal("lms ps --json", attempt.Resolution?.Source);
         Assert.Equal("qwen3.8-27b@q6_k_xl", attempt.Resolution?.SourceModelKey);
-        Assert.Collection(
-            runner.Calls,
+        Assert.Collection(runner.Calls,
             call => Assert.Equal(["ls", "--json", "--variants"], call),
             call => Assert.Equal(["ps", "--json", "--host", "127.0.0.1", "--port", "1234"], call));
     }
@@ -61,9 +58,7 @@ public sealed class LmStudioModelFileLocatorTests
         var runner = new StubLmsCliCommandRunner(Success("[]"), Success(processes));
         var locator = new LmStudioModelFileLocator(runner, () => temporary.Path);
 
-        LmStudioModelFileResolutionAttempt attempt = await locator.ResolveAsync(
-            model,
-            new Uri("http://127.0.0.1:1234"));
+        LmStudioModelFileResolutionAttempt attempt = await locator.ResolveAsync(model, new Uri("http://127.0.0.1:1234"));
 
         Assert.True(attempt.Succeeded, attempt.Diagnostic);
         Assert.Equal(Path.GetFullPath(gguf), attempt.Resolution?.FilePath);
@@ -114,11 +109,7 @@ public sealed class LmStudioModelFileLocatorTests
             SourceModelKey = "unsloth/qwen3.8-27b@q6_k_xl",
         };
 
-        LmStudioModelFileResolutionAttempt attempt = LmStudioModelFileLocator.ResolvePsFromJson(
-            model,
-            CreatePsJson(relativePath),
-            settings,
-            temporary.Path);
+        LmStudioModelFileResolutionAttempt attempt = LmStudioModelFileLocator.ResolvePsFromJson(model, CreatePsJson(relativePath), settings, temporary.Path);
 
         Assert.True(attempt.Succeeded, attempt.Diagnostic);
         Assert.Equal("unsloth/qwen3.8-27b@q6_k_xl", attempt.Resolution?.SourceModelKey);
@@ -163,11 +154,7 @@ public sealed class LmStudioModelFileLocatorTests
             model = model with { SourceModelKey = "other/qwen3.8-27b@q6_k_xl" };
         }
 
-        LmStudioModelFileResolutionAttempt attempt = LmStudioModelFileLocator.ResolvePsFromJson(
-            model,
-            json,
-            settings,
-            temporary.Path);
+        LmStudioModelFileResolutionAttempt attempt = LmStudioModelFileLocator.ResolvePsFromJson(model, json, settings, temporary.Path);
 
         Assert.Equal(LmStudioModelFileResolutionStatus.IdentityMismatch, attempt.Status);
         Assert.Null(attempt.Resolution);
@@ -182,16 +169,8 @@ public sealed class LmStudioModelFileLocatorTests
         CreateFile(downloads, "unsloth/model.gguf");
         string settings = JsonSerializer.Serialize(new { downloadsFolder = downloads });
 
-        LmStudioModelFileResolutionAttempt nativeOnly = LmStudioModelFileLocator.ResolvePsFromJson(
-            CreateLoadedModel(),
-            CreatePsJson("unsloth/model.gguf", quantization: null, includeQuantization: false),
-            settings,
-            temporary.Path);
-        LmStudioModelFileResolutionAttempt cliOnly = LmStudioModelFileLocator.ResolvePsFromJson(
-            CreateLoadedModel() with { Quantization = null },
-            CreatePsJson("unsloth/model.gguf"),
-            settings,
-            temporary.Path);
+        LmStudioModelFileResolutionAttempt nativeOnly = LmStudioModelFileLocator.ResolvePsFromJson(CreateLoadedModel(), CreatePsJson("unsloth/model.gguf", quantization: null, includeQuantization: false), settings, temporary.Path);
+        LmStudioModelFileResolutionAttempt cliOnly = LmStudioModelFileLocator.ResolvePsFromJson(CreateLoadedModel() with { Quantization = null }, CreatePsJson("unsloth/model.gguf"), settings, temporary.Path);
 
         Assert.Equal(LmStudioModelFileResolutionStatus.IdentityMismatch, nativeOnly.Status);
         Assert.Contains("quantization", nativeOnly.Diagnostic, StringComparison.Ordinal);
@@ -205,10 +184,7 @@ public sealed class LmStudioModelFileLocatorTests
     [InlineData(null, "Q6_K_XL", false)]
     [InlineData("Q6_K_XL", "Q6_K_XL", true)]
     [InlineData("Q6_K_XL", "Q4_K_M", false)]
-    public void VariantEvidenceUsesTheSameNullableExactQuantizationRule(
-        string? nativeQuantization,
-        string? cliQuantization,
-        bool shouldResolve)
+    public void VariantEvidenceUsesTheSameNullableExactQuantizationRule(string? nativeQuantization, string? cliQuantization, bool shouldResolve)
     {
         using var temporary = new TemporaryDirectory();
         string downloads = Path.Combine(temporary.Path, "downloads");
@@ -225,11 +201,7 @@ public sealed class LmStudioModelFileLocatorTests
         };
         string variants = JsonSerializer.Serialize(new[] { candidate });
 
-        LmStudioModelFileResolution? resolution = LmStudioModelFileLocator.ResolveFromJson(
-            CreateLoadedModel() with { Quantization = nativeQuantization },
-            variants,
-            settings,
-            temporary.Path);
+        LmStudioModelFileResolution? resolution = LmStudioModelFileLocator.ResolveFromJson(CreateLoadedModel() with { Quantization = nativeQuantization }, variants, settings, temporary.Path);
 
         if (shouldResolve)
         {
@@ -263,11 +235,7 @@ public sealed class LmStudioModelFileLocatorTests
             includeQuantization: false,
             indexedModelIdentifier: "esatapedico/other/model.gguf");
 
-        LmStudioModelFileResolutionAttempt attempt = LmStudioModelFileLocator.ResolvePsFromJson(
-            model,
-            processes,
-            settings,
-            temporary.Path);
+        LmStudioModelFileResolutionAttempt attempt = LmStudioModelFileLocator.ResolvePsFromJson(model, processes, settings, temporary.Path);
 
         Assert.Equal(LmStudioModelFileResolutionStatus.IdentityMismatch, attempt.Status);
         Assert.Contains("source/path/indexedModelIdentifier", attempt.Diagnostic, StringComparison.Ordinal);
@@ -295,11 +263,7 @@ public sealed class LmStudioModelFileLocatorTests
             includeQuantization: false,
             indexedModelIdentifier: "qwen3.8-27b@loaded-instance");
 
-        LmStudioModelFileResolutionAttempt attempt = LmStudioModelFileLocator.ResolvePsFromJson(
-            model,
-            processes,
-            settings,
-            temporary.Path);
+        LmStudioModelFileResolutionAttempt attempt = LmStudioModelFileLocator.ResolvePsFromJson(model, processes, settings, temporary.Path);
 
         Assert.Equal(LmStudioModelFileResolutionStatus.IdentityMismatch, attempt.Status);
         Assert.Contains("source/path/indexedModelIdentifier", attempt.Diagnostic, StringComparison.Ordinal);
@@ -309,10 +273,7 @@ public sealed class LmStudioModelFileLocatorTests
     [InlineData(true, false, true)]
     [InlineData(false, true, true)]
     [InlineData(false, false, false)]
-    public void FullPathSourceRequiresAtLeastOneExactCliPathIdentifier(
-        bool includePath,
-        bool includeIndexedModelIdentifier,
-        bool expectedSuccess)
+    public void FullPathSourceRequiresAtLeastOneExactCliPathIdentifier(bool includePath, bool includeIndexedModelIdentifier, bool expectedSuccess)
     {
         using var temporary = new TemporaryDirectory();
         string downloads = Path.Combine(temporary.Path, "downloads");
@@ -333,11 +294,7 @@ public sealed class LmStudioModelFileLocatorTests
             includePath: includePath,
             includeIndexedModelIdentifier: includeIndexedModelIdentifier);
 
-        LmStudioModelFileResolutionAttempt attempt = LmStudioModelFileLocator.ResolvePsFromJson(
-            model,
-            processes,
-            settings,
-            temporary.Path);
+        LmStudioModelFileResolutionAttempt attempt = LmStudioModelFileLocator.ResolvePsFromJson(model, processes, settings, temporary.Path);
 
         Assert.Equal(expectedSuccess, attempt.Succeeded);
         Assert.Equal(
@@ -451,14 +408,11 @@ public sealed class LmStudioModelFileLocatorTests
         using var temporary = new TemporaryDirectory();
         string downloads = ConfigureDownloads(temporary.Path);
         CreateFile(downloads, "unsloth/model.gguf");
-        var runner = new StubLmsCliCommandRunner(
-            Success("{not-json"),
+        var runner = new StubLmsCliCommandRunner(Success("{not-json"),
             Success(CreatePsJson("unsloth/model.gguf")));
         var locator = new LmStudioModelFileLocator(runner, () => temporary.Path);
 
-        LmStudioModelFileResolutionAttempt attempt = await locator.ResolveAsync(
-            CreateLoadedModel(),
-            new Uri("http://127.0.0.1:1234"));
+        LmStudioModelFileResolutionAttempt attempt = await locator.ResolveAsync(CreateLoadedModel(), new Uri("http://127.0.0.1:1234"));
 
         Assert.Equal(LmStudioModelFileResolutionStatus.InvalidJson, attempt.Status);
         Assert.Null(attempt.Resolution);
@@ -483,9 +437,7 @@ public sealed class LmStudioModelFileLocatorTests
         var runner = new StubLmsCliCommandRunner(variants, processes);
         var locator = new LmStudioModelFileLocator(runner, () => temporary.Path);
 
-        LmStudioModelFileResolutionAttempt attempt = await locator.ResolveAsync(
-            CreateLoadedModel(),
-            new Uri("http://127.0.0.1:1234"));
+        LmStudioModelFileResolutionAttempt attempt = await locator.ResolveAsync(CreateLoadedModel(), new Uri("http://127.0.0.1:1234"));
 
         Assert.Equal(LmStudioModelFileResolutionStatus.CliTimedOut, attempt.Status);
         Assert.Null(attempt.Resolution);
@@ -506,9 +458,7 @@ public sealed class LmStudioModelFileLocatorTests
         var runner = new StubLmsCliCommandRunner(result, result);
         var locator = new LmStudioModelFileLocator(runner, () => temporary.Path);
 
-        LmStudioModelFileResolutionAttempt attempt = await locator.ResolveAsync(
-            CreateLoadedModel(),
-            new Uri("http://127.0.0.1:1234"));
+        LmStudioModelFileResolutionAttempt attempt = await locator.ResolveAsync(CreateLoadedModel(), new Uri("http://127.0.0.1:1234"));
 
         Assert.Equal(expectedStatus, attempt.Status);
         Assert.Null(attempt.Resolution);
@@ -524,9 +474,7 @@ public sealed class LmStudioModelFileLocatorTests
         var runner = new StubLmsCliCommandRunner(new LmsCliCommandResult(LmsCliCommandStatus.Unavailable, null));
         var locator = new LmStudioModelFileLocator(runner, () => temporary.Path);
 
-        LmStudioModelFileResolutionAttempt attempt = await locator.ResolveAsync(
-            CreateLoadedModel(),
-            new Uri("http://127.0.0.1:1234"));
+        LmStudioModelFileResolutionAttempt attempt = await locator.ResolveAsync(CreateLoadedModel(), new Uri("http://127.0.0.1:1234"));
 
         Assert.Equal(LmStudioModelFileResolutionStatus.CliUnavailable, attempt.Status);
         Assert.Single(runner.Calls);
@@ -550,16 +498,12 @@ public sealed class LmStudioModelFileLocatorTests
         string settingsDirectory = Path.Combine(temporary.Path, ".lmstudio");
         Directory.CreateDirectory(settingsDirectory);
         File.WriteAllText(Path.Combine(settingsDirectory, "settings.json"), "{invalid");
-        LmStudioModelFileResolutionAttempt invalidSettings = await locator.ResolveAsync(
-            CreateLoadedModel(),
-            new Uri("http://127.0.0.1:1234"));
+        LmStudioModelFileResolutionAttempt invalidSettings = await locator.ResolveAsync(CreateLoadedModel(), new Uri("http://127.0.0.1:1234"));
         Assert.Equal(LmStudioModelFileResolutionStatus.InvalidSettings, invalidSettings.Status);
         Assert.Empty(runner.Calls);
 
         File.WriteAllText(Path.Combine(settingsDirectory, "settings.json"), "{\"downloadsFolder\":42}");
-        LmStudioModelFileResolutionAttempt wrongSettingsType = await locator.ResolveAsync(
-            CreateLoadedModel(),
-            new Uri("http://127.0.0.1:1234"));
+        LmStudioModelFileResolutionAttempt wrongSettingsType = await locator.ResolveAsync(CreateLoadedModel(), new Uri("http://127.0.0.1:1234"));
         Assert.Equal(LmStudioModelFileResolutionStatus.InvalidSettings, wrongSettingsType.Status);
         Assert.Empty(runner.Calls);
     }
@@ -587,9 +531,7 @@ public sealed class LmStudioModelFileLocatorTests
         Directory.CreateDirectory(downloads);
         string settingsDirectory = Path.Combine(userProfile, ".lmstudio");
         Directory.CreateDirectory(settingsDirectory);
-        File.WriteAllText(
-            Path.Combine(settingsDirectory, "settings.json"),
-            JsonSerializer.Serialize(new { downloadsFolder = downloads }));
+        File.WriteAllText(Path.Combine(settingsDirectory, "settings.json"), JsonSerializer.Serialize(new { downloadsFolder = downloads }));
         return downloads;
     }
 

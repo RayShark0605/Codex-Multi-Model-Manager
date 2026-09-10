@@ -6,6 +6,7 @@ using CodexModelManager.Core.Infrastructure;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>ProcessAndProtocolRemediation 相关测试集。</summary>
 public sealed class ProcessAndProtocolRemediationTests
 {
     [Theory]
@@ -15,10 +16,7 @@ public sealed class ProcessAndProtocolRemediationTests
     [InlineData("2", 1, false)]
     [InlineData("\"other\"", 1, false)]
     [InlineData("null", 1, false)]
-    public void AppServerResponseIdAcceptsOnlyMatchingNumberOrDecimalString(
-        string json,
-        int expected,
-        bool matches)
+    public void AppServerResponseIdAcceptsOnlyMatchingNumberOrDecimalString(string json, int expected, bool matches)
     {
         using JsonDocument document = JsonDocument.Parse(json);
         Assert.Equal(matches, CodexAppServerClient.MatchesResponseId(document.RootElement, expected));
@@ -27,8 +25,7 @@ public sealed class ProcessAndProtocolRemediationTests
     [Fact]
     public void AppServerModelNumericFieldsRejectWrongKindsWithoutInvalidOperationEscape()
     {
-        using JsonDocument document = JsonDocument.Parse(
-            "{\"data\":[{\"id\":\"fixture\",\"contextWindow\":\"not-a-number\"}]}");
+        using JsonDocument document = JsonDocument.Parse("{\"data\":[{\"id\":\"fixture\",\"contextWindow\":\"not-a-number\"}]}");
 
         var models = CodexAppServerClient.ParseAppServerModels(document.RootElement);
 
@@ -55,8 +52,7 @@ public sealed class ProcessAndProtocolRemediationTests
         File.WriteAllText(node, string.Empty);
         File.WriteAllText(entry, "// fixture");
 
-        CodexLaunchCommand command = Assert.IsType<CodexLaunchCommand>(
-            CodexExecutableLocator.TryCreateNpmInvocation(shim, [bin]));
+        CodexLaunchCommand command = Assert.IsType<CodexLaunchCommand>(CodexExecutableLocator.TryCreateNpmInvocation(shim, [bin]));
         ProcessStartInfo start = command.CreateStartInfo(["app-server", "--flag=value with spaces"]);
 
         Assert.Equal(Path.GetFullPath(node), command.FileName);
@@ -122,10 +118,7 @@ public sealed class ProcessAndProtocolRemediationTests
     public async Task CodexProcessReaderPreservesUtf8NonAsciiOutputIndependentOfParentCodePage()
     {
         string serverDll = GetTestMcpServerDll();
-        var command = new CodexLaunchCommand(
-            GetDotnetHost(),
-            [serverDll, "--emit-utf8-fixture"],
-            "UTF-8 test helper");
+        var command = new CodexLaunchCommand(GetDotnetHost(), [serverDll, "--emit-utf8-fixture"], "UTF-8 test helper");
         using var temporary = new TemporaryDirectory();
         var client = new CodexAppServerClient(temporary.Path, command);
 
@@ -156,10 +149,7 @@ public sealed class ProcessAndProtocolRemediationTests
         Task neverCompletes = Task.Delay(Timeout.InfiniteTimeSpan);
         var stopwatch = Stopwatch.StartNew();
 
-        await BoundedProcessCleanup.TerminateAndDrainAsync(
-            process,
-            [neverCompletes],
-            TimeSpan.FromMilliseconds(100));
+        await BoundedProcessCleanup.TerminateAndDrainAsync(process, [neverCompletes], TimeSpan.FromMilliseconds(100));
 
         Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(2), stopwatch.Elapsed.ToString());
     }
@@ -170,10 +160,7 @@ public sealed class ProcessAndProtocolRemediationTests
         var process = new Process();
         process.Dispose();
 
-        await BoundedProcessCleanup.TerminateAndDrainAsync(
-            process,
-            [],
-            TimeSpan.FromMilliseconds(50));
+        await BoundedProcessCleanup.TerminateAndDrainAsync(process, [], TimeSpan.FromMilliseconds(50));
     }
 
     [Fact]
@@ -231,9 +218,7 @@ public sealed class ProcessAndProtocolRemediationTests
         ProcessStartInfo start = new CodexLaunchCommand(GetDotnetHost(), [GetTestMcpServerDll()], "protocol output fixture")
             .CreateStartInfo(["--process-fixture-large-stderr"]);
 
-        await Assert.ThrowsAsync<ProcessOutputLimitException>(() => BoundedProcessRunner.RunProtocolAsync(
-            start, TimeSpan.FromSeconds(5), 256 * 1024,
-            async (connection, cancellationToken) => await connection.ReadLineAsync(cancellationToken), CancellationToken.None));
+        await Assert.ThrowsAsync<ProcessOutputLimitException>(() => BoundedProcessRunner.RunProtocolAsync(start, TimeSpan.FromSeconds(5), 256 * 1024, async (connection, cancellationToken) => await connection.ReadLineAsync(cancellationToken), CancellationToken.None));
     }
 
     [Fact]
@@ -243,8 +228,7 @@ public sealed class ProcessAndProtocolRemediationTests
             .CreateStartInfo(["--emit-utf8-fixture"]);
         List<string> lines = [];
 
-        BoundedProcessResult result = await BoundedProcessRunner.RunAsync(
-            start, TimeSpan.FromSeconds(5), 16 * 1024 * 1024, 1024 * 1024, CancellationToken.None, lines.Add);
+        BoundedProcessResult result = await BoundedProcessRunner.RunAsync(start, TimeSpan.FromSeconds(5), 16 * 1024 * 1024, 1024 * 1024, CancellationToken.None, lines.Add);
 
         Assert.Equal(0, result.ExitCode);
         Assert.Empty(result.StandardOutput);
@@ -260,11 +244,7 @@ public sealed class ProcessAndProtocolRemediationTests
             "Release";
 #endif
         string root = FindRepositoryRoot();
-        string path = Path.Combine(
-            root,
-            "src",
-            "CodexModelManager.TestMcpServer",
-            "bin",
+        string path = Path.Combine(root, "src", "CodexModelManager.TestMcpServer", "bin",
             configuration,
             "net8.0",
             "CodexModelManager.TestMcpServer.dll");

@@ -1,7 +1,12 @@
 namespace CodexModelManager.Core.LmStudio;
 
+/// <summary>
+/// LM Studio 端点安全策略：只接受 loopback HTTP/HTTPS 或非 loopback 的 HTTPS，
+/// 且不允许在 URI 中嵌入凭据或携带 query/fragment。
+/// </summary>
 public static class LmStudioEndpointPolicy
 {
+    /// <summary>校验端点是否满足安全策略，不满足即抛 InvalidOperationException。</summary>
     public static void Validate(Uri endpoint)
     {
         ArgumentNullException.ThrowIfNull(endpoint);

@@ -3,6 +3,10 @@ using CodexModelManager.Core.Security;
 
 namespace CodexModelManager.App;
 
+/// <summary>
+/// UI 异常上报器：把未处理异常记入日志（脱敏后）并以消息框展示；
+/// 展示通道本身失败时逐级降级，绝不让“报告异常”再抛出异常。
+/// </summary>
 internal sealed class UiExceptionReporter
 {
     private const string FallbackMessage = "程序遇到未处理的界面错误。错误详情无法安全显示，请查看应用日志。";
@@ -10,10 +14,8 @@ internal sealed class UiExceptionReporter
     private readonly SecretRedactor redactor;
     private readonly Action<string, string, MessageBoxIcon> showMessage;
 
-    public UiExceptionReporter(
-        IAppLogger logger,
-        SecretRedactor redactor,
-        Action<string, string, MessageBoxIcon>? showMessage = null)
+    /// <summary>构造上报器；showMessage 可注入以便测试。</summary>
+    public UiExceptionReporter(IAppLogger logger, SecretRedactor redactor, Action<string, string, MessageBoxIcon>? showMessage = null)
     {
         this.logger = logger ?? throw new ArgumentNullException(nameof(logger));
         this.redactor = redactor ?? throw new ArgumentNullException(nameof(redactor));
@@ -21,6 +23,7 @@ internal sealed class UiExceptionReporter
             MessageBox.Show(message, title, MessageBoxButtons.OK, icon));
     }
 
+    /// <summary>记录并展示一个未处理异常（每一级失败都有兜底）。</summary>
     public void Report(Exception exception, string title)
     {
         ArgumentNullException.ThrowIfNull(exception);

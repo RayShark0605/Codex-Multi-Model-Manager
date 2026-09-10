@@ -9,6 +9,7 @@ using CodexModelManager.Core.Security;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>GlmProvider 相关测试集。</summary>
 public sealed class GlmProviderTests
 {
     [Fact]
@@ -52,8 +53,7 @@ public sealed class GlmProviderTests
         using var harness = new SwitchHarness(SwitchHarness.BaseConfig);
         harness.Secrets.Delete(CredentialNames.Glm);
 
-        InvalidOperationException error = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => harness.Service.CreatePlanAsync(harness.Request(ProviderKind.GLM)));
+        InvalidOperationException error = await Assert.ThrowsAsync<InvalidOperationException>(() => harness.Service.CreatePlanAsync(harness.Request(ProviderKind.GLM)));
 
         Assert.Contains("尚未在 Windows Credential Manager 配置 GLM Token", error.Message, StringComparison.Ordinal);
     }
@@ -62,12 +62,9 @@ public sealed class GlmProviderTests
     public async Task GlmMissingCatalogMissingPlatformAndUnknownModelAreRejected()
     {
         using var harness = new SwitchHarness(SwitchHarness.BaseConfig);
-        await Assert.ThrowsAsync<InvalidOperationException>(
-            () => harness.Service.CreatePlanAsync(harness.Request(ProviderKind.GLM) with { GlmCatalogPath = null }));
-        await Assert.ThrowsAsync<InvalidOperationException>(
-            () => harness.Service.CreatePlanAsync(harness.Request(ProviderKind.GLM) with { GlmPlatform = null }));
-        InvalidOperationException unknown = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => harness.Service.CreatePlanAsync(harness.Request(ProviderKind.GLM) with { TargetModel = "glm-4.6" }));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => harness.Service.CreatePlanAsync(harness.Request(ProviderKind.GLM) with { GlmCatalogPath = null }));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => harness.Service.CreatePlanAsync(harness.Request(ProviderKind.GLM) with { GlmPlatform = null }));
+        InvalidOperationException unknown = await Assert.ThrowsAsync<InvalidOperationException>(() => harness.Service.CreatePlanAsync(harness.Request(ProviderKind.GLM) with { TargetModel = "glm-4.6" }));
         Assert.Contains("GLM catalog 中不存在所选模型", unknown.Message, StringComparison.Ordinal);
     }
 
@@ -75,8 +72,7 @@ public sealed class GlmProviderTests
     public async Task GlmReasoningEffortIsValidatedAgainstOfficialCatalog()
     {
         using var harness = new SwitchHarness(SwitchHarness.BaseConfig);
-        InvalidOperationException error = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => harness.Service.CreatePlanAsync(harness.Request(ProviderKind.GLM) with { ReasoningEffort = "medium" }));
+        InvalidOperationException error = await Assert.ThrowsAsync<InvalidOperationException>(() => harness.Service.CreatePlanAsync(harness.Request(ProviderKind.GLM) with { ReasoningEffort = "medium" }));
         Assert.Contains("GLM catalog 不支持 reasoning effort: medium", error.Message, StringComparison.Ordinal);
 
         SwitchPlan plan = await harness.Service.CreatePlanAsync(harness.Request(ProviderKind.GLM) with { ReasoningEffort = "low" });
@@ -161,7 +157,7 @@ public sealed class GlmProviderTests
     {
         Assert.Equal(ProviderKind.GLM, CodexRuntimeProbe.ParseProvider("ZAI"));
         Assert.Equal(ProviderKind.GLM, CodexRuntimeProbe.ParseProvider("glm"));
-        // The enum name is user-facing (provider combo, current provider, backup history).
+        // 枚举名会直接展示给用户（Provider 下拉框、当前 Provider、备份历史）。
         Assert.Equal("GLM", ProviderKind.GLM.ToString());
     }
 

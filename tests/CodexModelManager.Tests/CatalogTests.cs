@@ -8,6 +8,7 @@ using CodexModelManager.Core.Providers;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>Catalog 相关测试集。</summary>
 public sealed class CatalogTests
 {
     [Fact]

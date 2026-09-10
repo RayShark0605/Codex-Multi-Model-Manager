@@ -7,6 +7,7 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>ReviewCoreRemediation 相关测试集。</summary>
 public sealed class ReviewCoreRemediationTests
 {
     [Fact]
@@ -62,10 +63,8 @@ public sealed class ReviewCoreRemediationTests
         int suggestedCompact = ConfigurationSwitchService.SuggestAutoCompact(context);
         int suggestedToolOutput = ConfigurationSwitchService.SuggestToolOutputLimit(context);
         SwitchRequest automaticByOmission = ConfigurationSwitchService.NormalizeSwitchRequest(CreateLmRequest(context));
-        SwitchRequest automaticByMatchingValue = ConfigurationSwitchService.NormalizeSwitchRequest(
-            CreateLmRequest(context) with { AutoCompactTokenLimit = suggestedCompact });
-        SwitchRequest manualByValue = ConfigurationSwitchService.NormalizeSwitchRequest(
-            CreateLmRequest(context) with { AutoCompactTokenLimit = suggestedCompact - 1_024 });
+        SwitchRequest automaticByMatchingValue = ConfigurationSwitchService.NormalizeSwitchRequest(CreateLmRequest(context) with { AutoCompactTokenLimit = suggestedCompact });
+        SwitchRequest manualByValue = ConfigurationSwitchService.NormalizeSwitchRequest(CreateLmRequest(context) with { AutoCompactTokenLimit = suggestedCompact - 1_024 });
         SwitchRequest explicitAutomatic = ConfigurationSwitchService.NormalizeSwitchRequest(
             CreateLmRequest(context) with { AutoCompactMode = AutoCompactMode.Automatic });
         SwitchRequest explicitManual = ConfigurationSwitchService.NormalizeSwitchRequest(

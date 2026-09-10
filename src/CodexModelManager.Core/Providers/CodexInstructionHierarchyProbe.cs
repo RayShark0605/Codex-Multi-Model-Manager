@@ -9,6 +9,12 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Core.Providers;
 
+/// <summary>
+/// Codex 指令层级探测器：向 Responses 端点依次发送四种形态的请求
+/// （普通控制、前导 developer、多轮会话控制、后置 developer），
+/// 通过则证明模型的 Prompt Template 满足 Codex 的指令层级要求；
+/// 失败时按响应特征归类失败码并生成可读说明。
+/// </summary>
 public sealed class CodexInstructionHierarchyProbe : ICodexInstructionHierarchyProbe
 {
     private const int MaximumErrorBodyBytes = 64 * 1024;
@@ -19,12 +25,8 @@ public sealed class CodexInstructionHierarchyProbe : ICodexInstructionHierarchyP
     private readonly string responsesPath;
     private readonly TimeSpan requestTimeout;
 
-    public CodexInstructionHierarchyProbe(
-        HttpClient httpClient,
-        Uri endpoint,
-        Func<string?>? tokenProvider = null,
-        string responsesPath = "v1/responses",
-        TimeSpan? requestTimeout = null)
+    /// <summary>构造探测器；responsesPath 必须是相对路径，默认单请求超时 45 秒。</summary>
+    public CodexInstructionHierarchyProbe(HttpClient httpClient, Uri endpoint, Func<string?>? tokenProvider = null, string responsesPath = "v1/responses", TimeSpan? requestTimeout = null)
     {
         LmStudioEndpointPolicy.Validate(endpoint);
         if (Uri.TryCreate(responsesPath, UriKind.Absolute, out _))
@@ -33,17 +35,14 @@ public sealed class CodexInstructionHierarchyProbe : ICodexInstructionHierarchyP
         }
 
         this.httpClient = httpClient;
-        this.endpoint = endpoint.AbsoluteUri.EndsWith('/')
-            ? endpoint
-            : new Uri(endpoint.AbsoluteUri + "/");
+        this.endpoint = endpoint.AbsoluteUri.EndsWith('/') ? endpoint : new Uri(endpoint.AbsoluteUri + "/");
         this.tokenProvider = tokenProvider;
         this.responsesPath = responsesPath.TrimStart('/');
         this.requestTimeout = requestTimeout ?? TimeSpan.FromSeconds(45);
     }
 
-    public async Task<CodexInstructionHierarchyProbeResult> ProbeAsync(
-        string modelId,
-        CancellationToken cancellationToken = default)
+    /// <summary>顺序执行四阶段探测，任一步失败即返回该步的失败结果。</summary>
+    public async Task<CodexInstructionHierarchyProbeResult> ProbeAsync(string modelId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(modelId);
         DateTimeOffset checkedAt = DateTimeOffset.Now;
@@ -105,6 +104,7 @@ public sealed class CodexInstructionHierarchyProbe : ICodexInstructionHierarchyP
         }
     }
 
+    /// <summary>按探测形态构造请求体：不同形态在消息序列中插入/省略 developer 指令。</summary>
     internal static object CreateProbeBody(string modelId, ProbeShape shape)
     {
         object[] input = shape switch
@@ -146,6 +146,7 @@ public sealed class CodexInstructionHierarchyProbe : ICodexInstructionHierarchyP
         };
     }
 
+    /// <summary>发送一次探测请求：附 Bearer token，读取限长响应体，成功以“HTTP 成功且有 output 数组”判定。</summary>
     private async Task<ProbeHttpResult> SendAsync<T>(T body, CancellationToken cancellationToken)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -167,22 +168,17 @@ public sealed class CodexInstructionHierarchyProbe : ICodexInstructionHierarchyP
         return new ProbeHttpResult(new CodexInstructionProbeStepResult(passed, (int)response.StatusCode), response.StatusCode, bodyText);
     }
 
-    private static CodexInstructionHierarchyProbeResult Result(
-        CodexInstructionProbeStepResult control,
-        CodexInstructionProbeStepResult leadingDeveloper,
-        CodexInstructionProbeStepResult conversationControl,
-        CodexInstructionProbeStepResult continuationDeveloper,
-        string? failureCode,
-        string detail,
-        DateTimeOffset checkedAt) => new(
-            control,
-            leadingDeveloper,
-            conversationControl,
-            continuationDeveloper,
-            failureCode,
-            detail,
-            checkedAt);
+    /// <summary>组装四阶段探测结果。</summary>
+    private static CodexInstructionHierarchyProbeResult Result(CodexInstructionProbeStepResult control, CodexInstructionProbeStepResult leadingDeveloper, CodexInstructionProbeStepResult conversationControl, CodexInstructionProbeStepResult continuationDeveloper, string? failureCode, string detail, DateTimeOffset checkedAt) => new(
+        control,
+        leadingDeveloper,
+        conversationControl,
+        continuationDeveloper,
+        failureCode,
+        detail,
+        checkedAt);
 
+    /// <summary>按状态码、响应体特征与探测形态归类失败码（认证 / 控制失败 / 模板顺序 / developer 角色 / 其他）。</summary>
     private static string ClassifyFailure(HttpStatusCode statusCode, string body, ProbeShape shape)
     {
         if (statusCode == HttpStatusCode.Unauthorized)
@@ -222,34 +218,34 @@ public sealed class CodexInstructionHierarchyProbe : ICodexInstructionHierarchyP
         return CompatibilityFailureCodes.OtherProviderError;
     }
 
-    private static string DescribeFailure(
-        string failureCode,
-        int? httpStatus,
-        ProbeShape shape) => failureCode switch
-        {
-            CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder when shape == ProbeShape.LeadingDeveloper =>
-                "模型 Prompt Template 拒绝前导独立 developer 指令；需要应用兼容模板并重载模型。",
-            CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder when shape == ProbeShape.ContinuationDeveloper =>
-                "模型 Prompt Template 只接受开头连续的 system/developer 指令，拒绝多轮对话中的后置 developer；需要应用兼容模板并重载模型。",
-            CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder =>
-                "模型 Prompt Template 拒绝 Codex 的 system/developer 指令顺序；需要应用兼容模板并重载模型。",
-            CompatibilityFailureCodes.LmStudioChatTemplateDeveloperRole =>
-                "模型 Prompt Template 不支持 Codex developer 指令角色；需要应用兼容模板并重载模型。",
-            CompatibilityFailureCodes.LmStudioChatTemplateContinuationInstructionOrder =>
-                "旧版运行时 Prompt Template 拒绝多轮对话中的后置 developer 指令；需要升级为 interleaved-instructions v3。",
-            CompatibilityFailureCodes.AuthenticationRequired =>
-                "LM Studio 返回 HTTP 401，需要有效的 API Token。",
-            CompatibilityFailureCodes.ResponsesControlFailed =>
-                $"普通 Responses control 请求失败（HTTP {FormatStatus(httpStatus)}）。",
-            CompatibilityFailureCodes.ResponsesConversationControlFailed =>
-                $"不含后置 developer 的多轮 conversation control 请求失败（HTTP {FormatStatus(httpStatus)}）；该错误不允许自动套用模板修补。",
-            CompatibilityFailureCodes.Timeout =>
-                "Codex 指令层级预检超时。",
-            _ => $"Codex-shaped Responses 请求失败（HTTP {FormatStatus(httpStatus)}）。",
-        };
+    /// <summary>把失败码翻译为面向用户的说明文案（结合探测形态与 HTTP 状态）。</summary>
+    private static string DescribeFailure(string failureCode, int? httpStatus, ProbeShape shape) => failureCode switch
+    {
+        CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder when shape == ProbeShape.LeadingDeveloper =>
+            "模型 Prompt Template 拒绝前导独立 developer 指令；需要应用兼容模板并重载模型。",
+        CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder when shape == ProbeShape.ContinuationDeveloper =>
+            "模型 Prompt Template 只接受开头连续的 system/developer 指令，拒绝多轮对话中的后置 developer；需要应用兼容模板并重载模型。",
+        CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder =>
+            "模型 Prompt Template 拒绝 Codex 的 system/developer 指令顺序；需要应用兼容模板并重载模型。",
+        CompatibilityFailureCodes.LmStudioChatTemplateDeveloperRole =>
+            "模型 Prompt Template 不支持 Codex developer 指令角色；需要应用兼容模板并重载模型。",
+        CompatibilityFailureCodes.LmStudioChatTemplateContinuationInstructionOrder =>
+            "旧版运行时 Prompt Template 拒绝多轮对话中的后置 developer 指令；需要升级为 interleaved-instructions v3。",
+        CompatibilityFailureCodes.AuthenticationRequired =>
+            "LM Studio 返回 HTTP 401，需要有效的 API Token。",
+        CompatibilityFailureCodes.ResponsesControlFailed =>
+            $"普通 Responses control 请求失败（HTTP {FormatStatus(httpStatus)}）。",
+        CompatibilityFailureCodes.ResponsesConversationControlFailed =>
+            $"不含后置 developer 的多轮 conversation control 请求失败（HTTP {FormatStatus(httpStatus)}）；该错误不允许自动套用模板修补。",
+        CompatibilityFailureCodes.Timeout =>
+            "Codex 指令层级预检超时。",
+        _ => $"Codex-shaped Responses 请求失败（HTTP {FormatStatus(httpStatus)}）。",
+    };
 
+    /// <summary>格式化 HTTP 状态码（缺失时显示“未知”）。</summary>
     private static string FormatStatus(int? status) => status?.ToString(CultureInfo.InvariantCulture) ?? "未知";
 
+    /// <summary>判断响应体是否为带 output 数组的 JSON 对象（探测成功的必要条件）。</summary>
     private static bool HasOutputArray(string body)
     {
         try
@@ -265,6 +261,7 @@ public sealed class CodexInstructionHierarchyProbe : ICodexInstructionHierarchyP
         }
     }
 
+    /// <summary>限长读取响应体（至多 64 KB，避免错误页拖垮内存）。</summary>
     private static async Task<string> ReadLimitedBodyAsync(HttpContent content, CancellationToken cancellationToken)
     {
         await using Stream source = await content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
@@ -285,6 +282,7 @@ public sealed class CodexInstructionHierarchyProbe : ICodexInstructionHierarchyP
         return Encoding.UTF8.GetString(buffer.GetBuffer(), 0, checked((int)buffer.Length));
     }
 
+    /// <summary>探测请求的消息形态。</summary>
     internal enum ProbeShape
     {
         Control,
@@ -293,6 +291,7 @@ public sealed class CodexInstructionHierarchyProbe : ICodexInstructionHierarchyP
         ContinuationDeveloper
     }
 
+    /// <summary>单次探测请求的 HTTP 层结果。</summary>
     private sealed record ProbeHttpResult(
         CodexInstructionProbeStepResult Step,
         HttpStatusCode StatusCode,

@@ -4,10 +4,13 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Core.Providers;
 
+/// <summary>OpenAI 原生 Provider：模型与能力来自 Codex app-server（或本机缓存），不做计费冒烟测试。</summary>
 public sealed class OpenAiProvider(CodexAppServerClient appServer) : IModelProvider
 {
+    /// <summary>Provider 类别：OpenAI。</summary>
     public ProviderKind Kind => ProviderKind.OpenAI;
 
+    /// <summary>探测可用性：能发现模型即视为可用。</summary>
     public async Task<ProviderProbeResult> ProbeAsync(CancellationToken cancellationToken = default)
     {
         string? version = await appServer.GetVersionAsync(cancellationToken).ConfigureAwait(false);
@@ -15,8 +18,10 @@ public sealed class OpenAiProvider(CodexAppServerClient appServer) : IModelProvi
         return new ProviderProbeResult(models.Count > 0, models.Count > 0 ? $"发现 {models.Count} 个 OpenAI/Codex 模型。" : "无法从 app-server 或 cache 发现模型。", version);
     }
 
+    /// <summary>发现模型清单（app-server 实时优先，失败回退缓存）。</summary>
     public Task<IReadOnlyList<ModelProfile>> DiscoverModelsAsync(CancellationToken cancellationToken = default) => appServer.ListModelsAsync(cancellationToken);
 
+    /// <summary>基于 catalog 可见性与 provider 能力快照组装兼容性报告（不做真实调用）。</summary>
     public async Task<CompatibilityReport> TestCompatibilityAsync(string modelId, CancellationToken cancellationToken = default)
     {
         IReadOnlyList<ModelProfile> models = await appServer.ListModelsAsync(cancellationToken).ConfigureAwait(false);

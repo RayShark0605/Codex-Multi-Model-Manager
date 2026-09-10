@@ -6,6 +6,7 @@ using CodexModelManager.Core.Providers;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>RepairConfirmationAudit 相关测试集。</summary>
 public sealed class RepairConfirmationAuditTests
 {
     [Fact]

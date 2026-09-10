@@ -5,6 +5,7 @@ using CodexModelManager.Core.Infrastructure;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>ConfigPatchEngine 相关测试集。</summary>
 public sealed class ConfigPatchEngineTests
 {
     private readonly TomlConfigPatchEngine engine = new();
@@ -13,8 +14,7 @@ public sealed class ConfigPatchEngineTests
     public void PatchPreservesCommentsMcpProjectsPermissionsAndUnknownSections()
     {
         string original = SwitchHarness.BaseConfig + "\n[future.unknown]\nmagic = { value = 7 } # keep\n";
-        ConfigPatchResult result = engine.Apply(original, new ConfigPatchRequest(
-            new Dictionary<string, string?> { ["model"] = "\"qwen/local\"", ["model_provider"] = "\"lmstudio\"" },
+        ConfigPatchResult result = engine.Apply(original, new ConfigPatchRequest(new Dictionary<string, string?> { ["model"] = "\"qwen/local\"", ["model_provider"] = "\"lmstudio\"" },
             new Dictionary<string, string?>()));
         string normalized = result.Text.Replace("\r\n", "\n", StringComparison.Ordinal);
 
@@ -35,7 +35,11 @@ public sealed class ConfigPatchEngineTests
     {
         string original = $"model = \"old\"{newline}{newline}[mcp_servers.x]{newline}command = \"x\"{newline}";
         string result = engine.Apply(original, new ConfigPatchRequest(new Dictionary<string, string?> { ["model"] = "\"new\"" }, new Dictionary<string, string?>())).Text;
-        if (newline == "\r\n") Assert.DoesNotContain("\n", result.Replace("\r\n", string.Empty, StringComparison.Ordinal), StringComparison.Ordinal);
+        if (newline == "\r\n")
+        {
+            Assert.DoesNotContain("\n", result.Replace("\r\n", string.Empty, StringComparison.Ordinal), StringComparison.Ordinal);
+        }
+
         Assert.EndsWith(newline, result, StringComparison.Ordinal);
     }
 
@@ -89,8 +93,7 @@ public sealed class ConfigPatchEngineTests
         const string arraySection = "[[future.workers]]\nname = \"first\"\n\n[[future.workers]]\nname = \"second\"\n";
         string original = "model = \"x\"\n\n[model_providers.deepseek]\nname = \"old\"\n\n" + arraySection;
 
-        string result = engine.Apply(original, new ConfigPatchRequest(
-            new Dictionary<string, string?> { ["model_provider"] = "\"openai\"" },
+        string result = engine.Apply(original, new ConfigPatchRequest(new Dictionary<string, string?> { ["model_provider"] = "\"openai\"" },
             new Dictionary<string, string?> { ["model_providers.deepseek"] = null },
             ["model_providers.deepseek"])).Text;
 
@@ -104,8 +107,7 @@ public sealed class ConfigPatchEngineTests
     {
         const string original = "model = \"x\"\n\n[projects.'C:\\work.one']\ntrust_level = \"trusted\"\n\n[projects.'C:\\work.two']\ntrust_level = \"trusted\"\n";
 
-        ConfigPatchResult result = engine.Apply(original, new ConfigPatchRequest(
-            new Dictionary<string, string?> { ["model"] = "\"y\"" },
+        ConfigPatchResult result = engine.Apply(original, new ConfigPatchRequest(new Dictionary<string, string?> { ["model"] = "\"y\"" },
             new Dictionary<string, string?>()));
 
         Assert.Equal(2, result.Preservation.ProjectCount);

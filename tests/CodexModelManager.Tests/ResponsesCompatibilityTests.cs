@@ -5,6 +5,7 @@ using CodexModelManager.Core.Providers;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>ResponsesCompatibility 相关测试集。</summary>
 public sealed class ResponsesCompatibilityTests
 {
     [Fact]

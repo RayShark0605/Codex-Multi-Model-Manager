@@ -6,6 +6,7 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>LmStudioClient 相关测试集。</summary>
 public sealed class LmStudioClientTests
 {
     [Fact]
@@ -76,11 +77,7 @@ public sealed class LmStudioClientTests
         var client = new LmStudioClient(new Uri("http://127.0.0.1:1234"), () => "test-token", http);
         var config = new LmStudioLoadConfiguration(ContextLength: 32_768, EvalBatchSize: 4_096, FlashAttention: true, ReasoningBudgetMessage: string.Empty);
 
-        LmStudioLoadResponse response = await client.LoadAsync(
-            "qwen/qwen3.8-27b",
-            config,
-            new LmStudioPromptTemplateConfiguration("jinja", "{{ messages }}", []),
-            120);
+        LmStudioLoadResponse response = await client.LoadAsync("qwen/qwen3.8-27b", config, new LmStudioPromptTemplateConfiguration("jinja", "{{ messages }}", []), 120);
 
         Assert.Equal("qwen/qwen3.8-27b:2", response.InstanceId);
         Assert.Equal("Bearer", authorization?.Scheme);

@@ -5,11 +5,15 @@ using CodexModelManager.Core.Models;
 namespace CodexModelManager.Core.Codex;
 
 /// <summary>
-/// Validates with Tomlyn, but patches only exact source spans. It never serializes
-/// the user's TOML document, so comments, ordering and unknown configuration survive.
+/// TOML 配置补丁引擎：用 Tomlyn 做语法校验，但编辑只针对原文跨距（span）——
+/// 从不序列化用户的 TOML 文档，因此注释、顺序与未知配置都能原样保留。
 /// </summary>
 public sealed class TomlConfigPatchEngine : IConfigPatchEngine
 {
+    /// <summary>
+    /// 应用补丁：先校验只动纳管键/表，再按“根键改值或插入、表整体删除或追加”生成编辑，
+    /// 从后往前应用后重新读取，返回新文本与变更/保留摘要。
+    /// </summary>
     public ConfigPatchResult Apply(string originalText, ConfigPatchRequest request)
     {
         ArgumentNullException.ThrowIfNull(originalText);
@@ -42,6 +46,7 @@ public sealed class TomlConfigPatchEngine : IConfigPatchEngine
             TomlSourceAssignment? entry = parsed.Assignments.SingleOrDefault(item => item.IsDocumentRoot && item.Segments.Count == 1 && item.Segments[0] == key);
             if (entry is null)
             {
+                // 文档根没有该键：新增（newRawValue 为 null 表示无需处理）
                 if (newRawValue is not null)
                 {
                     rootInsertions.Add($"{key} = {newRawValue}");
@@ -67,6 +72,7 @@ public sealed class TomlConfigPatchEngine : IConfigPatchEngine
             mutations.Add(new ConfigMutation(key, ConfigMutationKind.Change, DisplayValue(key, entry.RawValue), DisplayValue(key, newRawValue), IsSecret(key)));
         }
 
+        // 根键插入点：首个表之前（无表则文末），保证根键始终位于任何表头之前
         if (rootInsertions.Count > 0)
         {
             int insertAt = parsed.Tables.Count > 0 ? parsed.Tables[0].Start : originalText.Length;
@@ -122,6 +128,7 @@ public sealed class TomlConfigPatchEngine : IConfigPatchEngine
         }
 
         string candidate = ApplyEdits(originalText, edits);
+        // 表插入统一追加在文末，保证与现有内容之间隔一个空行，末尾换行与原文风格一致
         if (tableInsertions.Count > 0)
         {
             if (candidate.Length > 0 && !EndsWithNewLine(candidate))
@@ -142,17 +149,10 @@ public sealed class TomlConfigPatchEngine : IConfigPatchEngine
         }
 
         ConfigReadResult after = Read(candidate);
-        return new ConfigPatchResult(
-            candidate,
-            mutations,
-            new PreservationSummary(
-                after.McpServerCount,
-                after.ProjectCount,
-                after.HookSectionCount,
-                after.PluginSectionCount,
-                true));
+        return new ConfigPatchResult(candidate, mutations, new PreservationSummary(after.McpServerCount, after.ProjectCount, after.HookSectionCount, after.PluginSectionCount, true));
     }
 
+    /// <summary>结构化读取：根键值、表体（同路径多表体以换行拼接）与 mcp/projects/hooks/plugins 计数。</summary>
     public ConfigReadResult Read(string text)
     {
         TomlSourceDocument parsed = TomlSourceDocument.Parse(text);
@@ -173,14 +173,20 @@ public sealed class TomlConfigPatchEngine : IConfigPatchEngine
             parsed.Tables.Count(item => item.Path.Equals("plugins", StringComparison.Ordinal) || item.Path.StartsWith("plugins.", StringComparison.Ordinal)));
     }
 
+    /// <summary>校验文本是合法 TOML（非法即抛异常）。</summary>
     public void Validate(string text) => TomlSourceDocument.ParseSyntax(text);
 
+    /// <summary>统计 root.<name> 一级子表的不同名称数（如 mcp_servers.<name>）。</summary>
     private static int CountTopLevelTables(IEnumerable<TomlSourceTable> tables, string root) =>
         tables.Where(item => item.Segments.Count >= 2 && item.Segments[0].Equals(root, StringComparison.Ordinal))
             .Select(item => item.Segments[1])
             .Distinct(StringComparer.Ordinal)
             .Count();
 
+    /// <summary>
+    /// 从后往前应用全部编辑：先按起点（其次长度）降序排序并检查跨距互不重叠，
+    /// 再逐个 Remove + Insert，避免前面的改动使后续偏移失效。
+    /// </summary>
     private static string ApplyEdits(string text, IEnumerable<TextEdit> edits)
     {
         TextEdit[] ordered = edits
@@ -207,33 +213,41 @@ public sealed class TomlConfigPatchEngine : IConfigPatchEngine
         return builder.ToString();
     }
 
+    /// <summary>把表体换行统一为目标风格（先全部归一为 \n，去首尾空行，再替换）。</summary>
     private static string NormalizeBody(string body, string newLine)
     {
         string normalized = body.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n').Trim('\n');
         return normalized.Replace("\n", newLine, StringComparison.Ordinal);
     }
 
+    /// <summary>原始值规范化（仅去首尾空白），用于等值比较。</summary>
     private static string NormalizeRawValue(string value) => value.Trim();
 
+    /// <summary>变更明细里的展示值：敏感键一律显示 &lt;redacted&gt;。</summary>
     private static string DisplayValue(string key, string rawValue) => IsSecret(key) ? "<redacted>" : rawValue.Trim();
 
+    /// <summary>按键名判断是否敏感（token/secret/password/api_key）。</summary>
     private static bool IsSecret(string key) =>
         key.Contains("token", StringComparison.OrdinalIgnoreCase) ||
         key.Contains("secret", StringComparison.OrdinalIgnoreCase) ||
         key.Contains("password", StringComparison.OrdinalIgnoreCase) ||
         key.Contains("api_key", StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>按内容判断表体是否包含敏感配置。</summary>
     private static bool ContainsSecret(string value) =>
         value.Contains("experimental_bearer_token", StringComparison.OrdinalIgnoreCase) ||
         value.Contains("api_key", StringComparison.OrdinalIgnoreCase) ||
         value.Contains("token", StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>探测文本换行风格：含 CRLF 用 CRLF，否则 LF。</summary>
     private static string DetectNewLine(string text) => text.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
 
+    /// <summary>判断文本是否以换行结尾。</summary>
     private static bool EndsWithNewLine(string text) => EndsWithNewLine(text.AsSpan());
 
+    /// <summary>判断只读文本段是否以换行结尾。</summary>
     private static bool EndsWithNewLine(ReadOnlySpan<char> text) => text.Length > 0 && text[^1] == '\n';
 
+    /// <summary>一次原文替换编辑：起点、长度与替换文本。</summary>
     private sealed record TextEdit(int Start, int Length, string Replacement);
-
 }

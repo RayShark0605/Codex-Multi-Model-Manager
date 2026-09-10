@@ -7,16 +7,27 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Core.LmStudio;
 
+/// <summary>
+/// 提示词模板修复服务：对 Qwen 系模板做“逐字锚点匹配 + 精确替换”的保守修补与升级
+/// （源 → v2（legacy）或 v3（现行）），并可把修复工件（原模板、补丁模板、清单、
+/// 手工应用说明）导出到磁盘。所有替换都以确定性哈希复核，绝不生成猜测模板。
+/// </summary>
 public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
 {
+    /// <summary>现行规则版本（交错指令 v3）。</summary>
     public const string CurrentRuleVersion = "qwen-interleaved-instructions-v3";
+
+    /// <summary>旧版规则版本（前导指令 v2，仅用于识别与升级）。</summary>
     public const string LegacyLeadingRuleVersion = "qwen-leading-instructions-v2";
+
+    /// <summary>规则版本别名（等于现行版本）。</summary>
     public const string RuleVersion = CurrentRuleVersion;
 
     private const string V3Marker = "{# CMM-CODEX-INSTRUCTION-HIERARCHY qwen-interleaved-instructions-v3 #}";
     private const string V2Marker = "{# CMM-CODEX-INSTRUCTION-HIERARCHY qwen-leading-instructions-v2 #}";
     private const string GenericMarker = "CMM-CODEX-INSTRUCTION-HIERARCHY";
 
+    // ---- 源模板（未打补丁的 Qwen 原生形态）锚点片段 ----
     private const string SourceNoMessages = """
         {%- if not messages %}
             {{- raise_exception('No messages provided.') }}
@@ -63,6 +74,7 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
             {%- set content = render_content(message.content, true)|trim %}
         """;
 
+    // ---- v2（legacy）目标片段：前导指令合并，后置指令拒绝 ----
     private const string V2InstructionScan = """
         {%- if not messages %}
             {{- raise_exception('No messages provided.') }}
@@ -134,6 +146,7 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
                 {%- endif %}
         """;
 
+    // ---- v3（现行）目标片段：全量交错指令合并 ----
     private const string V3NoMessages = """
         {%- if not messages %}
             {{- raise_exception('No messages provided.') }}
@@ -210,11 +223,16 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
     private static readonly JsonSerializerOptions ManifestJsonOptions = new() { WriteIndented = true };
     private readonly IGgufChatTemplateReader ggufReader;
 
+    /// <summary>构造服务；未提供 GGUF 读取器时使用默认实现。</summary>
     public PromptTemplateRepairService(IGgufChatTemplateReader? ggufReader = null)
     {
         this.ggufReader = ggufReader ?? new GgufChatTemplateReader();
     }
 
+    /// <summary>
+    /// 创建修复预览：已是 v3 → AlreadyCompatible；是 v2 → UpgradeRequired（附升级结果）；
+    /// 匹配受支持源模式 → Supported（附补丁结果）；未知管理器标记或锚点不匹配 → Unsupported。
+    /// </summary>
     public PromptTemplateRepairPreview CreatePreview(GgufChatTemplateAnalysis analysis)
     {
         ArgumentNullException.ThrowIfNull(analysis);
@@ -267,10 +285,8 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
         }
     }
 
-    public string RecreateKnownTemplate(
-        GgufChatTemplateAnalysis analysis,
-        string ruleVersion,
-        string expectedTemplateSha256)
+    /// <summary>按规则版本从原始模板确定性重建已知模板，并核对 SHA-256 与事务证据一致。</summary>
+    public string RecreateKnownTemplate(GgufChatTemplateAnalysis analysis, string ruleVersion, string expectedTemplateSha256)
     {
         ArgumentNullException.ThrowIfNull(analysis);
         ArgumentException.ThrowIfNullOrWhiteSpace(ruleVersion);
@@ -292,11 +308,11 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
         return recreated;
     }
 
-    public async Task<PromptTemplateRepairArtifact> ExportAsync(
-        GgufChatTemplateAnalysis analysis,
-        string modelId,
-        string outputRoot,
-        CancellationToken cancellationToken = default)
+    /// <summary>
+    /// 导出修复工件：重读 GGUF 核对指纹未变、重新生成预览，写出原模板/补丁模板/manifest/APPLY.md；
+    /// 任何失败都会删除本次创建的输出目录（严格限定在 root 之内才删）。
+    /// </summary>
+    public async Task<PromptTemplateRepairArtifact> ExportAsync(GgufChatTemplateAnalysis analysis, string modelId, string outputRoot, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(analysis);
         ArgumentException.ThrowIfNullOrWhiteSpace(modelId);
@@ -326,9 +342,7 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
         Directory.CreateDirectory(root);
         string modelDirectory = Path.Combine(root, SanitizePathSegment(modelId));
         Directory.CreateDirectory(modelDirectory);
-        string directory = Path.Combine(
-            modelDirectory,
-            DateTime.Now.ToString("yyyyMMdd-HHmmssfff", System.Globalization.CultureInfo.InvariantCulture) + "-" + Guid.NewGuid().ToString("N"));
+        string directory = Path.Combine(modelDirectory, DateTime.Now.ToString("yyyyMMdd-HHmmssfff", System.Globalization.CultureInfo.InvariantCulture) + "-" + Guid.NewGuid().ToString("N"));
 
         Directory.CreateDirectory(directory);
         try
@@ -385,13 +399,16 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
         }
     }
 
+    /// <summary>修补为现行 v3：前缀合并 system 族走专用规则，其余走原始模板规则。</summary>
     internal static string PatchExactQwenTemplate(string template) =>
         QwenPrefixMergedSystemTemplateRule.IsSourceCandidate(template)
             ? QwenPrefixMergedSystemTemplateRule.Patch(template)
             : PatchOriginalTemplate(template, CurrentRuleVersion);
 
+    /// <summary>修补为旧版 v2（仅测试与 v2 重建使用）。</summary>
     public static string PatchExactQwenTemplateV2(string template) => PatchOriginalTemplate(template, LegacyLeadingRuleVersion);
 
+    /// <summary>把精确匹配的 v2 模板升级为 v3（五段替换后按 v3 校验）。</summary>
     internal static string UpgradeExactV2Template(string template)
     {
         ValidateKnownV2Template(template);
@@ -410,6 +427,7 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
         return RestoreNewLine(upgraded, newLine);
     }
 
+    /// <summary>按规则版本（v2/v3）对原始模板做五段精确替换并校验结果。</summary>
     private static string PatchOriginalTemplate(string template, string ruleVersion)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(template);
@@ -463,6 +481,7 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
         return RestoreNewLine(patched, newLine);
     }
 
+    /// <summary>校验原始模板锚点：各区段各出现一次，普通 system 区恰好匹配 simple/reasoning 一个变体。</summary>
     private static void ValidateOriginalAnchors(string normalized, out bool simpleSystem)
     {
         RequireCount(normalized, "{%- macro render_content(content, do_vision_count, is_system_content=false) %}", 1, "render_content 宏");
@@ -482,6 +501,7 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
         simpleSystem = simpleSystemCount == 1;
     }
 
+    /// <summary>校验 v2 模板：标记、扫描区、合并区与拒绝分支齐备且唯一，v3 片段与旧异常清零。</summary>
     private static void ValidateKnownV2Template(string template)
     {
         string newLine = DetectNewLine(template);
@@ -505,6 +525,7 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
         RequireCount(normalized, NormalizeRawLiteral(V2LoopSystem), 1, "v2 后置 instruction 拒绝分支");
     }
 
+    /// <summary>校验 v3 模板（兼容前缀合并族的专用校验），结构与 v2 校验同理。</summary>
     private static void ValidateKnownV3Template(string template)
     {
         if (QwenPrefixMergedSystemTemplateRule.IsPatchedCandidate(template))
@@ -534,6 +555,7 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
         RequireCount(normalized, NormalizeRawLiteral(V3LoopSystem), 1, "v3 instruction 消费分支");
     }
 
+    /// <summary>重建 v2：已是 v2 则校验后原样返回，原始模板则打 v2 补丁。</summary>
     private static string RecreateV2(string template)
     {
         if (template.Contains(V2Marker, StringComparison.Ordinal))
@@ -550,6 +572,7 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
         return PatchExactQwenTemplateV2(template);
     }
 
+    /// <summary>重建 v3：已是 v3 则校验后返回，是 v2 则升级，原始模板则打 v3 补丁。</summary>
     private static string RecreateV3(string template)
     {
         if (template.Contains(V3Marker, StringComparison.Ordinal))
@@ -571,12 +594,10 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
         return PatchExactQwenTemplate(template);
     }
 
-    private static PromptTemplateRepairPreview Preview(
-        PromptTemplateRepairStatus status,
-        string detail,
-        string template,
-        string ruleVersion) => new(status, detail, template, ComputeSha(template), ruleVersion);
+    /// <summary>组装带补丁模板哈希的预览。</summary>
+    private static PromptTemplateRepairPreview Preview(PromptTemplateRepairStatus status, string detail, string template, string ruleVersion) => new(status, detail, template, ComputeSha(template), ruleVersion);
 
+    /// <summary>校验分析对象里模板正文与记录哈希一致。</summary>
     private static void ValidateAnalysisHash(GgufChatTemplateAnalysis analysis)
     {
         string computedOriginalSha = ComputeSha(analysis.ChatTemplate);
@@ -586,8 +607,10 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
         }
     }
 
+    /// <summary>计算模板的 SHA-256（UTF-8 无 BOM）。</summary>
     private static string ComputeSha(string template) => Convert.ToHexString(SHA256.HashData(Utf8NoBom.GetBytes(template)));
 
+    /// <summary>探测模板换行风格；混合换行拒绝修补以保持原文。</summary>
     private static string DetectNewLine(string template)
     {
         bool hasCrLf = template.Contains("\r\n", StringComparison.Ordinal);
@@ -600,12 +623,16 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
         return hasCrLf ? "\r\n" : "\n";
     }
 
+    /// <summary>换行归一为 LF（已是 LF 原样返回）。</summary>
     private static string Normalize(string template, string newLine) => newLine == "\n" ? template : template.Replace("\r\n", "\n", StringComparison.Ordinal);
 
+    /// <summary>换行还原为原风格（原为 LF 原样返回）。</summary>
     private static string RestoreNewLine(string template, string newLine) => newLine == "\n" ? template : template.Replace("\n", "\r\n", StringComparison.Ordinal);
 
+    /// <summary>内嵌字面量统一按 LF 处理。</summary>
     private static string NormalizeRawLiteral(string value) => value.Replace("\r\n", "\n", StringComparison.Ordinal);
 
+    /// <summary>断言子串出现次数恰为期望值，否则抛出带说明的校验异常。</summary>
     private static void RequireCount(string text, string value, int expected, string description)
     {
         int actual = CountOccurrences(text, value);
@@ -615,6 +642,7 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
         }
     }
 
+    /// <summary>统计子串出现次数。</summary>
     private static int CountOccurrences(string text, string value)
     {
         int count = 0;
@@ -628,6 +656,7 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
         return count;
     }
 
+    /// <summary>净化路径段：替换非法字符、截断到 80 字符、规避 Windows 保留设备名。</summary>
     internal static string SanitizePathSegment(string value)
     {
         char[] invalid = Path.GetInvalidFileNameChars();
@@ -652,6 +681,7 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
         return safe;
     }
 
+    /// <summary>判断 candidate 是否为 parent 的严格后代（不等于 parent、不越界到父目录之外）。</summary>
     internal static bool IsStrictDescendant(string parent, string candidate)
     {
         string fullParent = Path.GetFullPath(parent);
@@ -670,6 +700,7 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
             !relative.StartsWith(".." + Path.AltDirectorySeparatorChar, StringComparison.Ordinal);
     }
 
+    /// <summary>判断名称是否为 Windows 保留设备名（CON/PRN/AUX/NUL/COM1-9/LPT1-9 等）。</summary>
     private static bool IsWindowsReservedDeviceName(string value)
     {
         if (value.Equals("CON", StringComparison.OrdinalIgnoreCase) ||
@@ -682,11 +713,10 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
             return true;
         }
 
-        return value.Length == 4 &&
-            (value.StartsWith("COM", StringComparison.OrdinalIgnoreCase) || value.StartsWith("LPT", StringComparison.OrdinalIgnoreCase)) &&
-            value[3] is >= '1' and <= '9';
+        return value.Length == 4 && (value.StartsWith("COM", StringComparison.OrdinalIgnoreCase) || value.StartsWith("LPT", StringComparison.OrdinalIgnoreCase)) && value[3] is >= '1' and <= '9';
     }
 
+    /// <summary>以 CreateNew + WriteThrough 写出新文件（绝不覆盖既有文件）。</summary>
     private static async Task WriteNewAsync(string path, byte[] bytes, CancellationToken cancellationToken)
     {
         await using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 16 * 1024, FileOptions.Asynchronous | FileOptions.WriteThrough);
@@ -694,6 +724,7 @@ public sealed class PromptTemplateRepairService : IPromptTemplateRepairService
         stream.Flush(flushToDisk: true);
     }
 
+    /// <summary>生成手工应用说明（APPLY.md 的内容）。</summary>
     private static string BuildApplyInstructions(string modelId, string originalSha, string patchedSha) => $$"""
         # Apply the Codex-compatible LM Studio Prompt Template
 

@@ -1,7 +1,9 @@
 namespace CodexModelManager.App;
 
+/// <summary>WinForms 程序入口：初始化异常捕获、组合根与主窗体消息循环。</summary>
 internal static class Program
 {
+    /// <summary>程序主入口。</summary>
     [STAThread]
     private static void Main()
     {
@@ -25,6 +27,7 @@ internal static class Program
         }
         catch (Exception exception)
         {
+            // 启动阶段失败：有 reporter 用 reporter，否则降级为脱敏后的消息框
             if (reporter is not null)
             {
                 reporter.Report(exception, "程序启动失败");
@@ -45,6 +48,7 @@ internal static class Program
         }
     }
 
+    /// <summary>构造 UI 线程异常处理器（转发给 reporter 记录并展示）。</summary>
     internal static ThreadExceptionEventHandler CreateThreadExceptionHandler(UiExceptionReporter reporter)
     {
         ArgumentNullException.ThrowIfNull(reporter);

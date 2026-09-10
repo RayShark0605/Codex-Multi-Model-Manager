@@ -7,6 +7,7 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>LmStudioTemplateRepairPlanner 相关测试集。</summary>
 public sealed class LmStudioTemplateRepairPlannerTests
 {
     [Fact]
@@ -15,10 +16,7 @@ public sealed class LmStudioTemplateRepairPlannerTests
         using var temporary = new TemporaryDirectory();
         PlannerFixture fixture = CreateFixture(temporary.Path);
         var controller = new PlanningOnlyInstanceController(fixture.Snapshot);
-        var locator = new FakeModelFileLocator(new LmStudioModelFileResolutionAttempt(
-            LmStudioModelFileResolutionStatus.Success,
-            fixture.Resolution,
-            "test success"));
+        var locator = new FakeModelFileLocator(new LmStudioModelFileResolutionAttempt(LmStudioModelFileResolutionStatus.Success, fixture.Resolution, "test success"));
         var store = new LmStudioTemplateTransactionStore(Path.Combine(temporary.Path, "transactions"));
         var planner = new LmStudioTemplateRepairPlanner(
             controller,
@@ -27,9 +25,7 @@ public sealed class LmStudioTemplateRepairPlannerTests
             store,
             locator);
 
-        LmStudioTemplateRepairPlan plan = await planner.CreatePlanAsync(
-            fixture.Model,
-            PrefixOnlyContinuationFailure());
+        LmStudioTemplateRepairPlan plan = await planner.CreatePlanAsync(fixture.Model, PrefixOnlyContinuationFailure());
 
         Assert.Equal(1, controller.CaptureCount);
         Assert.Equal(0, controller.LifecycleMutationCount);
@@ -49,10 +45,7 @@ public sealed class LmStudioTemplateRepairPlannerTests
         using var temporary = new TemporaryDirectory();
         PlannerFixture fixture = CreateFixture(temporary.Path);
         var controller = new PlanningOnlyInstanceController(fixture.Snapshot);
-        var locator = new FakeModelFileLocator(new LmStudioModelFileResolutionAttempt(
-            LmStudioModelFileResolutionStatus.Success,
-            fixture.Resolution,
-            "test success"));
+        var locator = new FakeModelFileLocator(new LmStudioModelFileResolutionAttempt(LmStudioModelFileResolutionStatus.Success, fixture.Resolution, "test success"));
         var store = new LmStudioTemplateTransactionStore(Path.Combine(temporary.Path, "transactions"));
         var planner = new LmStudioTemplateRepairPlanner(
             controller,

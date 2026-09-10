@@ -5,6 +5,11 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Core.Providers;
 
+/// <summary>
+/// Responses 协议兼容性测试客户端：对目标端点依次执行四阶段指令层级探测、
+/// Streaming（SSE）、Tool Calling 与 Reasoning 四个阶段，逐阶段汇入能力报告；
+/// 前置阶段失败时后续阶段标记 Untested，不发送依赖请求。
+/// </summary>
 public sealed class ResponsesCompatibilityClient
 {
     private const int MaximumStreamingBodyBytes = 64 * 1024;
@@ -16,12 +21,8 @@ public sealed class ResponsesCompatibilityClient
     private readonly string responsesPath;
     private readonly TimeSpan stageTimeout;
 
-    public ResponsesCompatibilityClient(
-        HttpClient httpClient,
-        Uri endpoint,
-        Func<string?>? tokenProvider = null,
-        string responsesPath = "v1/responses",
-        TimeSpan? stageTimeout = null)
+    /// <summary>构造客户端；端点与相对路径都会做规范化校验，默认单阶段超时 45 秒。</summary>
+    public ResponsesCompatibilityClient(HttpClient httpClient, Uri endpoint, Func<string?>? tokenProvider = null, string responsesPath = "v1/responses", TimeSpan? stageTimeout = null)
     {
         this.httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         this.endpoint = NormalizeEndpoint(endpoint);
@@ -34,21 +35,13 @@ public sealed class ResponsesCompatibilityClient
         }
     }
 
-    public async Task<CompatibilityReport> TestAsync(
-        ProviderKind provider,
-        string model,
-        bool testReasoning,
-        CancellationToken cancellationToken = default)
+    /// <summary>执行完整兼容性测试并汇总为报告（阶段顺序与失败短路规则见类说明）。</summary>
+    public async Task<CompatibilityReport> TestAsync(ProviderKind provider, string model, bool testReasoning, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(model);
         List<CompatibilityResult> results = [];
         DateTimeOffset now = DateTimeOffset.Now;
-        var hierarchyProbe = new CodexInstructionHierarchyProbe(
-            httpClient,
-            endpoint,
-            tokenProvider,
-            responsesPath,
-            stageTimeout);
+        var hierarchyProbe = new CodexInstructionHierarchyProbe(httpClient, endpoint, tokenProvider, responsesPath, stageTimeout);
         CodexInstructionHierarchyProbeResult hierarchy = await hierarchyProbe.ProbeAsync(model, cancellationToken).ConfigureAwait(false);
         Upsert(results, new CompatibilityResult(
             "Responses",
@@ -71,6 +64,7 @@ public sealed class ResponsesCompatibilityClient
 
         if (!hierarchy.IsCompatible)
         {
+            // 层级未通过：模板类失败不再重复请求，其余能力标记 Untested 后提前结束
             bool templateFailure = hierarchy.FailureCode is CompatibilityFailureCodes.LmStudioChatTemplateSystemOrder or
                 CompatibilityFailureCodes.LmStudioChatTemplateDeveloperRole or
                 CompatibilityFailureCodes.LmStudioChatTemplateContinuationInstructionOrder;
@@ -116,6 +110,7 @@ public sealed class ResponsesCompatibilityClient
         return Complete(provider, model, results, now);
     }
 
+    /// <summary>Streaming 阶段：发送 stream=true 请求，判定是否收到有效 SSE 事件。</summary>
     private async Task<CompatibilityResult> RunStreamingStageAsync(string model, CancellationToken cancellationToken)
     {
         DateTimeOffset checkedAt = DateTimeOffset.Now;
@@ -130,10 +125,7 @@ public sealed class ResponsesCompatibilityClient
                 max_output_tokens = 32,
                 stream = true,
             });
-            using HttpResponseMessage response = await httpClient.SendAsync(
-                request,
-                HttpCompletionOption.ResponseHeadersRead,
-                timeout.Token).ConfigureAwait(false);
+            using HttpResponseMessage response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
             bool hasData = response.IsSuccessStatusCode &&
                 await HasSseDataEventAsync(response.Content, timeout.Token).ConfigureAwait(false);
             return new CompatibilityResult(
@@ -152,6 +144,7 @@ public sealed class ResponsesCompatibilityClient
         }
     }
 
+    /// <summary>Tool Calling 阶段：强制调用 cmm_echo 函数，判定响应是否含合法 function_call 与预期参数。</summary>
     private async Task<CompatibilityResult> RunToolStageAsync(string model, CancellationToken cancellationToken)
     {
         DateTimeOffset checkedAt = DateTimeOffset.Now;
@@ -183,10 +176,7 @@ public sealed class ResponsesCompatibilityClient
                 },
                 tool_choice = "required",
             });
-            using HttpResponseMessage response = await httpClient.SendAsync(
-                request,
-                HttpCompletionOption.ResponseHeadersRead,
-                timeout.Token).ConfigureAwait(false);
+            using HttpResponseMessage response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
             string body = await ReadLimitedUtf8BodyAsync(response.Content, MaximumJsonBodyBytes, timeout.Token).ConfigureAwait(false);
             bool valid = response.IsSuccessStatusCode && HasValidToolCall(body);
             return new CompatibilityResult(
@@ -205,6 +195,7 @@ public sealed class ResponsesCompatibilityClient
         }
     }
 
+    /// <summary>Reasoning 阶段：判定响应是否含结构化 reasoning artifact；成功但无 artifact 记为 LikelySupported。</summary>
     private async Task<CompatibilityResult> RunReasoningStageAsync(string model, CancellationToken cancellationToken)
     {
         DateTimeOffset checkedAt = DateTimeOffset.Now;
@@ -219,10 +210,7 @@ public sealed class ResponsesCompatibilityClient
                 max_output_tokens = 256,
                 stream = false,
             });
-            using HttpResponseMessage response = await httpClient.SendAsync(
-                request,
-                HttpCompletionOption.ResponseHeadersRead,
-                timeout.Token).ConfigureAwait(false);
+            using HttpResponseMessage response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
             string body = await ReadLimitedUtf8BodyAsync(response.Content, MaximumJsonBodyBytes, timeout.Token).ConfigureAwait(false);
             bool artifact = false;
             bool validShape = response.IsSuccessStatusCode && TryGetReasoningArtifact(body, out artifact);
@@ -248,6 +236,7 @@ public sealed class ResponsesCompatibilityClient
         }
     }
 
+    /// <summary>创建带单阶段超时的链接取消令牌。</summary>
     private CancellationTokenSource CreateStageTimeout(CancellationToken cancellationToken)
     {
         var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -255,6 +244,7 @@ public sealed class ResponsesCompatibilityClient
         return timeout;
     }
 
+    /// <summary>构造 Responses 请求（JSON 内容 + Bearer token + Accept 头）。</summary>
     private HttpRequestMessage CreateRequest<T>(T body)
     {
         var request = new HttpRequestMessage(HttpMethod.Post, new Uri(endpoint, responsesPath))
@@ -271,22 +261,22 @@ public sealed class ResponsesCompatibilityClient
         return request;
     }
 
+    /// <summary>读取响应流并判定是否含有效 SSE 事件。</summary>
     private static async Task<bool> HasSseDataEventAsync(HttpContent content, CancellationToken cancellationToken)
     {
         await using Stream stream = await content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
         return await ResponsesSseParser.HasValidEventAsync(stream, MaximumStreamingBodyBytes, cancellationToken).ConfigureAwait(false);
     }
 
-    private static async Task<string> ReadLimitedUtf8BodyAsync(
-        HttpContent content,
-        int maximumBytes,
-        CancellationToken cancellationToken)
+    /// <summary>限长读取响应体并严格 UTF-8 解码；超限或非法编码即抛异常。</summary>
+    private static async Task<string> ReadLimitedUtf8BodyAsync(HttpContent content, int maximumBytes, CancellationToken cancellationToken)
     {
         await using Stream stream = await content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
         using var buffer = new MemoryStream();
         byte[] chunk = new byte[8192];
         while (true)
         {
+            // +1 哨兵字节用于检测超限
             int remainingWithSentinel = maximumBytes + 1 - checked((int)buffer.Length);
             if (remainingWithSentinel <= 0)
             {
@@ -316,6 +306,7 @@ public sealed class ResponsesCompatibilityClient
         }
     }
 
+    /// <summary>收尾：为报告中缺失的能力补默认条目（多为 Untested / KnownLimitation）并组装报告。</summary>
     private static CompatibilityReport Complete(
         ProviderKind provider,
         string model,
@@ -337,12 +328,8 @@ public sealed class ResponsesCompatibilityClient
         return new CompatibilityReport(provider, model, results);
     }
 
-    private static void MarkUntested(
-        List<CompatibilityResult> results,
-        IEnumerable<string> capabilities,
-        string detail,
-        string? failureCode,
-        DateTimeOffset checkedAt)
+    /// <summary>把若干能力批量标记为 Untested（附原因与失败码）。</summary>
+    private static void MarkUntested(List<CompatibilityResult> results, IEnumerable<string> capabilities, string detail, string? failureCode, DateTimeOffset checkedAt)
     {
         foreach (string capability in capabilities)
         {
@@ -350,13 +337,8 @@ public sealed class ResponsesCompatibilityClient
         }
     }
 
-    private static void AddIfMissing(
-        List<CompatibilityResult> results,
-        string capability,
-        CompatibilityStatus status,
-        string detail,
-        DateTimeOffset now,
-        string? failureCode = null)
+    /// <summary>能力条目不存在时补默认值。</summary>
+    private static void AddIfMissing(List<CompatibilityResult> results, string capability, CompatibilityStatus status, string detail, DateTimeOffset now, string? failureCode = null)
     {
         if (!results.Any(item => item.Capability == capability))
         {
@@ -364,6 +346,7 @@ public sealed class ResponsesCompatibilityClient
         }
     }
 
+    /// <summary>按能力名插入或更新结果条目。</summary>
     private static void Upsert(List<CompatibilityResult> results, CompatibilityResult result)
     {
         int index = results.FindIndex(item => item.Capability.Equals(result.Capability, StringComparison.Ordinal));
@@ -377,12 +360,8 @@ public sealed class ResponsesCompatibilityClient
         }
     }
 
-    private static void AddProbeStep(
-        List<CompatibilityResult> results,
-        string capability,
-        CodexInstructionProbeStepResult step,
-        CodexInstructionHierarchyProbeResult hierarchy,
-        DateTimeOffset checkedAt)
+    /// <summary>把单个层级探测步骤汇入报告：通过 → Supported；未发送 → Untested；已发送失败 → Failed（附层级失败码）。</summary>
+    private static void AddProbeStep(List<CompatibilityResult> results, string capability, CodexInstructionProbeStepResult step, CodexInstructionHierarchyProbeResult hierarchy, DateTimeOffset checkedAt)
     {
         CompatibilityStatus status = step.Passed
             ? CompatibilityStatus.Supported
@@ -400,12 +379,14 @@ public sealed class ResponsesCompatibilityClient
             status == CompatibilityStatus.Failed ? hierarchy.FailureCode : null));
     }
 
+    /// <summary>构造 Codex 形态的消息输入（developer 约束 + 用户指令）。</summary>
     private static object[] CreateCodexShapedInput(string userText) =>
     [
         new { role = "developer", content = "Preserve the harmless CMM compatibility-test constraints." },
         new { role = "user", content = userText },
     ];
 
+    /// <summary>判定响应 JSON 是否包含对 cmm_echo 的合法 function_call 且参数含预期值。</summary>
     private static bool HasValidToolCall(string json)
     {
         try
@@ -441,6 +422,7 @@ public sealed class ResponsesCompatibilityClient
         return false;
     }
 
+    /// <summary>校验 function_call 参数（对象或 JSON 字符串形态）是否含预期值。</summary>
     private static bool ArgumentsContainExpectedValue(JsonElement arguments)
     {
         if (arguments.ValueKind == JsonValueKind.Object)
@@ -458,11 +440,16 @@ public sealed class ResponsesCompatibilityClient
         return parsedArguments.RootElement.ValueKind == JsonValueKind.Object && HasExpectedValue(parsedArguments.RootElement);
     }
 
+    /// <summary>判断参数对象是否含值为 CMM_TOOL_OK 的字符串字段 value。</summary>
     private static bool HasExpectedValue(JsonElement arguments) =>
         arguments.TryGetProperty("value", out JsonElement value) &&
         value.ValueKind == JsonValueKind.String &&
         value.GetString() == "CMM_TOOL_OK";
 
+    /// <summary>
+    /// 尝试从响应 JSON 中识别结构化 reasoning artifact（type 含 reasoning 的条目、
+    /// 非空 reasoning_content 或 content 数组中的 reasoning 分段）；返回结构可识别与否，artifact 表示是否实际出现。
+    /// </summary>
     private static bool TryGetReasoningArtifact(string json, out bool artifact)
     {
         artifact = false;
@@ -516,6 +503,7 @@ public sealed class ResponsesCompatibilityClient
         }
     }
 
+    /// <summary>规范化并校验端点：无凭据/query/fragment 的 HTTPS，或 loopback HTTP；补齐尾斜杠。</summary>
     private static Uri NormalizeEndpoint(Uri endpoint)
     {
         ArgumentNullException.ThrowIfNull(endpoint);
@@ -530,6 +518,7 @@ public sealed class ResponsesCompatibilityClient
         return endpoint.AbsoluteUri.EndsWith('/') ? endpoint : new Uri(endpoint.AbsoluteUri + "/");
     }
 
+    /// <summary>规范化并校验相对路径：去前导斜杠、不得是绝对/UNC 路径，且不得覆盖端点的 scheme/host/port。</summary>
     private static string NormalizeResponsesPath(Uri endpoint, string responsesPath)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(responsesPath);

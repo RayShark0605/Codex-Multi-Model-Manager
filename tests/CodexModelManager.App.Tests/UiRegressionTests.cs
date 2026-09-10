@@ -7,6 +7,7 @@ using CodexModelManager.Core.Security;
 
 namespace CodexModelManager.App.Tests;
 
+/// <summary>UiRegression 相关测试集。</summary>
 public sealed class UiRegressionTests
 {
     [Fact]
@@ -93,15 +94,9 @@ public sealed class UiRegressionTests
         Assert.Equal(Color.Firebrick, MainController.PersistenceStatusColor(LmStudioPersistenceStatus.UnsupportedLmStudioVersion));
         Assert.Equal(Color.Firebrick, MainController.PersistenceStatusColor(LmStudioPersistenceStatus.PersistenceStateAmbiguous));
 
-        Assert.Equal(
-            LmStudioPersistenceStatus.BuiltInNoOverride,
-            MainController.ClassifyMissingPersistentOverride(hasLegacyCompleted: false, hierarchyCompatible: null));
-        Assert.Equal(
-            LmStudioPersistenceStatus.LegacyRuntimeOnlyPatch,
-            MainController.ClassifyMissingPersistentOverride(hasLegacyCompleted: true, hierarchyCompatible: true));
-        Assert.Equal(
-            LmStudioPersistenceStatus.PersistentOverrideMissingAfterReload,
-            MainController.ClassifyMissingPersistentOverride(hasLegacyCompleted: true, hierarchyCompatible: false));
+        Assert.Equal(LmStudioPersistenceStatus.BuiltInNoOverride, MainController.ClassifyMissingPersistentOverride(hasLegacyCompleted: false, hierarchyCompatible: null));
+        Assert.Equal(LmStudioPersistenceStatus.LegacyRuntimeOnlyPatch, MainController.ClassifyMissingPersistentOverride(hasLegacyCompleted: true, hierarchyCompatible: true));
+        Assert.Equal(LmStudioPersistenceStatus.PersistentOverrideMissingAfterReload, MainController.ClassifyMissingPersistentOverride(hasLegacyCompleted: true, hierarchyCompatible: false));
     });
 
     [Fact]
@@ -241,9 +236,7 @@ public sealed class UiRegressionTests
         EventHandler handler = (_, _) => progressEvents++;
         resource.Progress += handler;
 
-        await Assert.ThrowsAsync<InvalidDataException>(() =>
-            MainController.TransferOwnershipOnSuccessAsync<EventResource, int>(
-                resource,
+        await Assert.ThrowsAsync<InvalidDataException>(() => MainController.TransferOwnershipOnSuccessAsync<EventResource, int>(resource,
                 _ => throw new InvalidDataException("injected planning failure"),
                 owned =>
                 {
@@ -295,11 +288,7 @@ public sealed class UiRegressionTests
     }
 
     private static ModelProfile CreateLoadedLmStudioModel() => new(
-        "qwen3.8-27b-nvfp4-mtp",
-        "Qwen3.8 27B NVFP4 MTP HIGHEST",
-        ProviderKind.LmStudio,
-        Quantization: null,
-        IsLoaded: true,
+        "qwen3.8-27b-nvfp4-mtp", "Qwen3.8 27B NVFP4 MTP HIGHEST", ProviderKind.LmStudio, Quantization: null, IsLoaded: true,
         MaxContextLength: 262_144,
         LoadedContextLength: 262_144,
         LoadedInstanceId: "qwen3.8-27b-nvfp4-mtp",

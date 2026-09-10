@@ -1,7 +1,12 @@
 namespace CodexModelManager.Core.Codex;
 
+/// <summary>
+/// 本管理器“纳管”的 Codex 配置键集合：根键、Provider 表与推理力度枚举。
+/// 切换/纳管逻辑只允许改写这些键，其余内容一律原样保留。
+/// </summary>
 public static class ManagedConfigKeys
 {
+    /// <summary>受支持的 model_reasoning_effort 取值（严格区分大小写）。</summary>
     public static IReadOnlySet<string> SupportedReasoningEfforts { get; } = new HashSet<string>(StringComparer.Ordinal)
     {
         "minimal",
@@ -9,11 +14,11 @@ public static class ManagedConfigKeys
         "medium",
         "high",
         "xhigh",
-        // Current Codex Desktop model catalogs expose max even though the public
-        // reference's compact enum table can lag model-specific capabilities.
+        // 当前 Codex Desktop 的模型目录已暴露 max，公共参考文档的精简枚举表可能滞后于具体模型能力
         "max",
     };
 
+    /// <summary>纳管的根级键。</summary>
     public static IReadOnlySet<string> Root { get; } = new HashSet<string>(StringComparer.Ordinal)
     {
         "model",
@@ -29,6 +34,7 @@ public static class ManagedConfigKeys
         "openai_base_url",
     };
 
+    /// <summary>纳管的 Provider 表（含其子表路径）。</summary>
     public static IReadOnlySet<string> ProviderTables { get; } = new HashSet<string>(StringComparer.Ordinal)
     {
         "model_providers.deepseek",
@@ -36,8 +42,6 @@ public static class ManagedConfigKeys
         "model_providers.ZAI",
     };
 
-    public static bool IsManagedTable(string tablePath) =>
-        ProviderTables.Any(path =>
-            tablePath.Equals(path, StringComparison.Ordinal) ||
-            tablePath.StartsWith(path + ".", StringComparison.Ordinal));
+    /// <summary>判断给定表路径是否属于纳管的 Provider 表或其子表。</summary>
+    public static bool IsManagedTable(string tablePath) => ProviderTables.Any(path => tablePath.Equals(path, StringComparison.Ordinal) || tablePath.StartsWith(path + ".", StringComparison.Ordinal));
 }

@@ -7,6 +7,7 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>AtomicAndBackup 相关测试集。</summary>
 public sealed class AtomicAndBackupTests
 {
     [Fact]
@@ -36,7 +37,10 @@ public sealed class AtomicAndBackupTests
         var change = new PlannedFileChange(path, fingerprint, Encoding.UTF8.GetBytes("model = \"candidate\"\n"), [], _ =>
         {
             validations++;
-            if (validations == 2) throw new InvalidDataException("injected post-commit validation failure");
+            if (validations == 2)
+            {
+                throw new InvalidDataException("injected post-commit validation failure");
+            }
             return ValueTask.CompletedTask;
         });
 
@@ -118,7 +122,10 @@ public sealed class AtomicAndBackupTests
     [Fact]
     public async Task LockedConfigCannotBeOverwritten()
     {
-        if (!OperatingSystem.IsWindows()) return;
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
         using var root = new TemporaryDirectory();
         string path = Path.Combine(root.Path, "config.toml");
         await File.WriteAllTextAsync(path, "model = \"original\"\n");
@@ -162,7 +169,10 @@ public sealed class AtomicAndBackupTests
             new(external, await FileFingerprintService.CaptureAsync(external), Encoding.UTF8.GetBytes("model = \"external-new\"\n"), []),
             new(config, await FileFingerprintService.CaptureAsync(config), Encoding.UTF8.GetBytes("model = \"config-new\"\n"), [], _ =>
             {
-                if (++configValidations == 2) throw new InvalidDataException("injected final validation failure");
+                if (++configValidations == 2)
+                {
+                    throw new InvalidDataException("injected final validation failure");
+                }
                 return ValueTask.CompletedTask;
             }),
         ];

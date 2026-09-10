@@ -6,6 +6,7 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>PromptTemplateRepair 相关测试集。</summary>
 public sealed class PromptTemplateRepairTests
 {
     [Theory]
@@ -134,8 +135,7 @@ public sealed class PromptTemplateRepairTests
         PromptTemplateRepairPreview generated = service.CreatePreview(Analysis(SupportedTemplate));
 
         PromptTemplateRepairPreview known = service.CreatePreview(Analysis(generated.PatchedTemplate!));
-        PromptTemplateRepairPreview markerOnly = service.CreatePreview(Analysis(
-            "{# CMM-CODEX-INSTRUCTION-HIERARCHY qwen-leading-instructions-v2 #}\n{{ messages }}"));
+        PromptTemplateRepairPreview markerOnly = service.CreatePreview(Analysis("{# CMM-CODEX-INSTRUCTION-HIERARCHY qwen-leading-instructions-v2 #}\n{{ messages }}"));
 
         Assert.Equal(PromptTemplateRepairStatus.AlreadyCompatible, known.Status);
         Assert.Equal(PromptTemplateRepairStatus.Unsupported, markerOnly.Status);
@@ -150,10 +150,7 @@ public sealed class PromptTemplateRepairTests
         string v2Sha = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(v2)));
 
         PromptTemplateRepairPreview upgraded = service.CreatePreview(Analysis(v2));
-        string recreated = service.RecreateKnownTemplate(
-            Analysis(SupportedTemplate),
-            PromptTemplateRepairService.LegacyLeadingRuleVersion,
-            v2Sha);
+        string recreated = service.RecreateKnownTemplate(Analysis(SupportedTemplate), PromptTemplateRepairService.LegacyLeadingRuleVersion, v2Sha);
 
         Assert.Equal(PromptTemplateRepairStatus.UpgradeRequired, upgraded.Status);
         Assert.Equal(PromptTemplateRepairService.CurrentRuleVersion, upgraded.RuleVersion);
@@ -367,7 +364,10 @@ public sealed class PromptTemplateRepairTests
         PromptTemplateRepairPreview preview = service.CreatePreview(analysis);
 
         string? expectedSha = Environment.GetEnvironmentVariable("CMM_LIVE_GGUF_TEMPLATE_SHA");
-        if (!string.IsNullOrWhiteSpace(expectedSha)) Assert.Equal(expectedSha, analysis.TemplateSha256, ignoreCase: true);
+        if (!string.IsNullOrWhiteSpace(expectedSha))
+        {
+            Assert.Equal(expectedSha, analysis.TemplateSha256, ignoreCase: true);
+        }
         Assert.True(
             preview.Status == PromptTemplateRepairStatus.Supported,
             $"Template SHA {analysis.TemplateSha256} was {preview.Status}: {preview.Detail}");

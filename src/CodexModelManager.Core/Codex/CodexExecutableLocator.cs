@@ -2,11 +2,15 @@ using System.Diagnostics;
 
 namespace CodexModelManager.Core.Codex;
 
+/// <summary>
+/// Codex CLI 启动命令：可执行文件、前置参数（如 npm 入口脚本）与定位来源说明。
+/// </summary>
 public sealed record CodexLaunchCommand(
     string FileName,
     IReadOnlyList<string> PrefixArguments,
     string Source)
 {
+    /// <summary>基于启动命令构造子进程启动信息（隐藏窗口、组合前置参数与业务参数）。</summary>
     public ProcessStartInfo CreateStartInfo(IEnumerable<string> arguments)
     {
         var startInfo = new ProcessStartInfo
@@ -24,16 +28,24 @@ public sealed record CodexLaunchCommand(
     }
 }
 
+/// <summary>
+/// Codex CLI 可执行定位器，按优先级依次探测：
+/// CMM_CODEX_EXE 环境变量 → 用户目录安装（.codex/.sandbox-bin、plugins/.plugin-appserver）
+/// → 运行中的 codex 进程 → PATH 直接命中 → PATH 上的 npm 垫片（codex.cmd/ps1）→ WindowsApps 别名。
+/// </summary>
 public static class CodexExecutableLocator
 {
+    /// <summary>仅当定位结果不含前置参数（真正的 codex.exe）时返回其路径，否则 null。</summary>
     public static string? Find()
     {
         CodexLaunchCommand? invocation = FindInvocation();
         return invocation is { PrefixArguments.Count: 0 } ? invocation.FileName : null;
     }
 
+    /// <summary>定位 Codex CLI 启动命令（自动枚举运行中的 codex 进程）。</summary>
     public static CodexLaunchCommand? FindInvocation() => FindInvocation(null);
 
+    /// <summary>定位启动命令；<paramref name="runningExecutablePaths"/> 提供已知运行中进程路径（测试注入用，null 则现场枚举）。</summary>
     internal static CodexLaunchCommand? FindInvocation(IEnumerable<string?>? runningExecutablePaths)
     {
         string? configured = Environment.GetEnvironmentVariable("CMM_CODEX_EXE");
@@ -43,11 +55,20 @@ public static class CodexExecutableLocator
             return configuredCommand;
         }
 
+        // 用户目录可能来自 USERPROFILE 环境变量或已知文件夹 API，两者都尝试
         var profileRoots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         string? profileEnvironment = Environment.GetEnvironmentVariable("USERPROFILE");
-        if (!string.IsNullOrWhiteSpace(profileEnvironment)) profileRoots.Add(profileEnvironment);
+        if (!string.IsNullOrWhiteSpace(profileEnvironment))
+        {
+            profileRoots.Add(profileEnvironment);
+        }
+
         string profileKnownFolder = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        if (!string.IsNullOrWhiteSpace(profileKnownFolder)) profileRoots.Add(profileKnownFolder);
+        if (!string.IsNullOrWhiteSpace(profileKnownFolder))
+        {
+            profileRoots.Add(profileKnownFolder);
+        }
+
         foreach (string profileRoot in profileRoots)
         {
             string[] userInstallCandidates =
@@ -107,6 +128,7 @@ public static class CodexExecutableLocator
         foreach (string directory in pathDirectories)
         {
             string direct = Path.Combine(directory, OperatingSystem.IsWindows() ? "codex.exe" : "codex");
+            // WindowsApps 里的 codex.exe 是应用执行别名，交给末尾的别名分支统一处理
             if (IsWindowsAppsAlias(direct))
             {
                 continue;
@@ -119,6 +141,7 @@ public static class CodexExecutableLocator
             }
         }
 
+        // Windows 上 npm 全局安装是 .cmd/.ps1 垫片，需要解析出 node + 入口脚本
         if (OperatingSystem.IsWindows())
         {
             foreach (string directory in pathDirectories)
@@ -135,14 +158,11 @@ public static class CodexExecutableLocator
             }
         }
 
-        string alias = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "Microsoft",
-            "WindowsApps",
-            "codex.exe");
+        string alias = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Microsoft", "WindowsApps", "codex.exe");
         return TryCreateInvocation(alias, "WindowsApps alias");
     }
 
+    /// <summary>尝试把路径包装为启动命令：去引号、取全路径并确认存在；Windows 上的非 .exe 转按 npm 垫片处理。</summary>
     private static CodexLaunchCommand? TryCreateInvocation(string? path, string source)
     {
         if (string.IsNullOrWhiteSpace(path))
@@ -171,6 +191,10 @@ public static class CodexExecutableLocator
         }
     }
 
+    /// <summary>
+    /// 解析 npm 垫片为“node + codex.js 入口”：垫片同目录须存在
+    /// node_modules/@openai/codex/bin/codex.js，node 取垫片目录或 PATH 上的 node.exe。
+    /// </summary>
     internal static CodexLaunchCommand? TryCreateNpmInvocation(string shimPath, IReadOnlyList<string> pathDirectories)
     {
         if (!OperatingSystem.IsWindows() || !File.Exists(shimPath))
@@ -196,11 +220,10 @@ public static class CodexExecutableLocator
             .. pathDirectories.Select(directory => Path.Combine(directory, "node.exe")),
         ];
         string? node = nodeCandidates.FirstOrDefault(File.Exists);
-        return node is null
-            ? null
-            : new CodexLaunchCommand(Path.GetFullPath(node), [Path.GetFullPath(entryPoint)], "verified npm shim");
+        return node is null ? null : new CodexLaunchCommand(Path.GetFullPath(node), [Path.GetFullPath(entryPoint)], "verified npm shim");
     }
 
+    /// <summary>读取 PATH 环境变量并解析为去重后的目录列表（非法条目跳过）。</summary>
     private static string[] ReadPathDirectories()
     {
         List<string> directories = [];
@@ -219,14 +242,10 @@ public static class CodexExecutableLocator
         return directories.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
     }
 
+    /// <summary>判断路径是否位于 WindowsApps 应用执行别名目录下。</summary>
     private static bool IsWindowsAppsAlias(string path)
     {
-        string windowsApps = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "Microsoft",
-            "WindowsApps");
-        return Path.GetFullPath(path).StartsWith(
-            Path.GetFullPath(windowsApps).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar,
-            StringComparison.OrdinalIgnoreCase);
+        string windowsApps = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Microsoft", "WindowsApps");
+        return Path.GetFullPath(path).StartsWith(Path.GetFullPath(windowsApps).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
     }
 }

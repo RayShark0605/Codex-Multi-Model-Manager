@@ -4,6 +4,7 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>AppSettingsMigration 相关测试集。</summary>
 public sealed class AppSettingsMigrationTests
 {
     [Fact]

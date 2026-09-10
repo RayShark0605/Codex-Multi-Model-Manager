@@ -1,5 +1,6 @@
 namespace CodexModelManager.App.Tests;
 
+/// <summary>StaTest。</summary>
 internal static class StaTest
 {
     public static Task RunAsync(Action action)

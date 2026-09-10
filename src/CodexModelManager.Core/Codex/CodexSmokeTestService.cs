@@ -8,22 +8,40 @@ using CodexModelManager.Core.Security;
 
 namespace CodexModelManager.Core.Codex;
 
+/// <summary>
+/// Codex Level 3 冒烟测试服务：在完全隔离的临时 CODEX_HOME + 工作区里，
+/// 以免审批、仅工作区可写的沙箱模式真实运行一次 Codex CLI，
+/// 验证 Shell 执行、文件写入、apply_patch 与 MCP 工具调用四类能力。
+/// </summary>
 public sealed class CodexSmokeTestService
 {
     private readonly string credentialHelperPath;
     private readonly string mcpServerPath;
 
+    /// <summary>以凭据助手与临时 MCP 测试服务器的路径构造服务。</summary>
     public CodexSmokeTestService(string credentialHelperPath, string mcpServerPath)
     {
         this.credentialHelperPath = credentialHelperPath;
         this.mcpServerPath = mcpServerPath;
     }
 
+    /// <summary>
+    /// 按切换请求生成隔离环境与 config.toml，运行 Codex CLI 并汇总证据：
+    /// 通过条件为退出码 0 且 shell/文件/补丁/MCP 四类证据齐全且 result.txt 内容正确。
+    /// </summary>
     public async Task<SmokeTestResult> RunAsync(SwitchRequest request, CancellationToken cancellationToken = default)
     {
         CodexLaunchCommand? codex = CodexExecutableLocator.FindInvocation();
-        if (codex is null) throw new InvalidOperationException("未找到可安全启动的 Codex CLI。");
-        if (!File.Exists(mcpServerPath)) throw new FileNotFoundException("临时 MCP 测试服务器不存在。", mcpServerPath);
+        if (codex is null)
+        {
+            throw new InvalidOperationException("未找到可安全启动的 Codex CLI。");
+        }
+
+        if (!File.Exists(mcpServerPath))
+        {
+            throw new FileNotFoundException("临时 MCP 测试服务器不存在。", mcpServerPath);
+        }
+
         if (request.TargetProvider == ProviderKind.OpenAI)
         {
             throw new InvalidOperationException("OpenAI Level 3 需要账户凭据；测试不会复制或读取 auth.json。请在 Codex 原生客户端验证。");
@@ -37,6 +55,7 @@ public sealed class CodexSmokeTestService
         await File.WriteAllTextAsync(Path.Combine(workspace, "input.txt"), "CMM_INPUT_OK\n", new UTF8Encoding(false), cancellationToken).ConfigureAwait(false);
         await File.WriteAllTextAsync(Path.Combine(home, "config.toml"), BuildConfig(request), new UTF8Encoding(false), cancellationToken).ConfigureAwait(false);
 
+        // 提示词刻意要求全部四类动作，并限制在当前工作区内
         string prompt = "This is a harmless compatibility test in an isolated temporary directory. Read input.txt. Use the shell tool to run PowerShell Get-Content on input.txt. Call MCP tool cmm_ping. Use apply_patch to create result.txt containing exactly CMM_SMOKE_OK and a newline. Do not access paths outside the current workspace.";
         ProcessStartInfo start = codex.CreateStartInfo([]);
         start.RedirectStandardOutput = true;
@@ -62,9 +81,7 @@ public sealed class CodexSmokeTestService
         BoundedProcessResult execution;
         try
         {
-            execution = await BoundedProcessRunner.RunAsync(
-                start, TimeSpan.FromMinutes(5), BoundedProcessRunner.CatalogOutputLimit, BoundedProcessRunner.SmokeErrorOutputLimit,
-                cancellationToken, evidence.AcceptLine).ConfigureAwait(false);
+            execution = await BoundedProcessRunner.RunAsync(start, TimeSpan.FromMinutes(5), BoundedProcessRunner.CatalogOutputLimit, BoundedProcessRunner.SmokeErrorOutputLimit, cancellationToken, evidence.AcceptLine).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -96,6 +113,7 @@ public sealed class CodexSmokeTestService
         return new SmokeTestResult(passed, root, execution.ExitCode, results, summary);
     }
 
+    /// <summary>按目标 Provider 生成本次测试专用的 config.toml（模型、Provider 表、认证与 cmm_test MCP 服务器）。</summary>
     private string BuildConfig(SwitchRequest request)
     {
         var builder = new StringBuilder();
@@ -104,8 +122,16 @@ public sealed class CodexSmokeTestService
         {
             builder.AppendLine("model_provider = \"deepseek\"");
             builder.AppendLine("forced_login_method = \"api\"");
-            if (!string.IsNullOrWhiteSpace(request.DeepSeekCatalogPath)) builder.Append("model_catalog_json = ").AppendLine(JsonSerializer.Serialize(Path.GetFullPath(request.DeepSeekCatalogPath)));
-            if (!string.IsNullOrWhiteSpace(request.ReasoningEffort)) builder.Append("model_reasoning_effort = ").AppendLine(JsonSerializer.Serialize(request.ReasoningEffort));
+            if (!string.IsNullOrWhiteSpace(request.DeepSeekCatalogPath))
+            {
+                builder.Append("model_catalog_json = ").AppendLine(JsonSerializer.Serialize(Path.GetFullPath(request.DeepSeekCatalogPath)));
+            }
+
+            if (!string.IsNullOrWhiteSpace(request.ReasoningEffort))
+            {
+                builder.Append("model_reasoning_effort = ").AppendLine(JsonSerializer.Serialize(request.ReasoningEffort));
+            }
+
             builder.AppendLine().AppendLine("[model_providers.deepseek]").AppendLine("name = \"deepseek\"").AppendLine("base_url = \"https://api.deepseek.com/\"").AppendLine("wire_api = \"responses\"");
             builder.AppendLine().AppendLine("[model_providers.deepseek.auth]").Append("command = ").AppendLine(JsonSerializer.Serialize(Path.GetFullPath(credentialHelperPath))).Append("args = [").Append(JsonSerializer.Serialize(CredentialNames.DeepSeek)).AppendLine("]");
         }
@@ -113,23 +139,52 @@ public sealed class CodexSmokeTestService
         {
             GlmPlatform platform = request.GlmPlatform ?? throw new InvalidOperationException("GLM Level 3 测试缺少平台选择。");
             builder.Append("model_provider = ").AppendLine(JsonSerializer.Serialize(GlmPlatforms.ProviderId));
-            if (!string.IsNullOrWhiteSpace(request.GlmCatalogPath)) builder.Append("model_catalog_json = ").AppendLine(JsonSerializer.Serialize(Path.GetFullPath(request.GlmCatalogPath)));
-            if (!string.IsNullOrWhiteSpace(request.ReasoningEffort)) builder.Append("model_reasoning_effort = ").AppendLine(JsonSerializer.Serialize(request.ReasoningEffort));
+            if (!string.IsNullOrWhiteSpace(request.GlmCatalogPath))
+            {
+                builder.Append("model_catalog_json = ").AppendLine(JsonSerializer.Serialize(Path.GetFullPath(request.GlmCatalogPath)));
+            }
+
+            if (!string.IsNullOrWhiteSpace(request.ReasoningEffort))
+            {
+                builder.Append("model_reasoning_effort = ").AppendLine(JsonSerializer.Serialize(request.ReasoningEffort));
+            }
+
             builder.AppendLine().Append('[').Append(GlmPlatforms.ProviderTableName).AppendLine("]").Append("name = ").AppendLine(JsonSerializer.Serialize(GlmPlatforms.ProviderId)).Append("base_url = ").AppendLine(JsonSerializer.Serialize(GlmPlatforms.BaseUrl(platform))).AppendLine("wire_api = \"responses\"");
             builder.AppendLine().Append('[').Append(GlmPlatforms.ProviderTableName).AppendLine(".auth]").Append("command = ").AppendLine(JsonSerializer.Serialize(Path.GetFullPath(credentialHelperPath))).Append("args = [").Append(JsonSerializer.Serialize(CredentialNames.Glm)).AppendLine("]");
         }
         else
         {
+            // LM Studio：provider 固定为 lmstudio 时不写表（CLI 内建），否则写入显式表
             string provider = request.LmStudioProviderId ?? "lmstudio";
             builder.Append("model_provider = ").AppendLine(JsonSerializer.Serialize(provider));
-            if (request.ContextWindow is int context) builder.Append("model_context_window = ").AppendLine(context.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            if (request.AutoCompactTokenLimit is int compact) builder.Append("model_auto_compact_token_limit = ").AppendLine(compact.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            if (request.AutoCompactTokenLimit is not null) builder.AppendLine("model_auto_compact_token_limit_scope = \"total\"");
-            if (request.ToolOutputTokenLimit is int toolOutput) builder.Append("tool_output_token_limit = ").AppendLine(toolOutput.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            if (request.ContextWindow is int context)
+            {
+                builder.Append("model_context_window = ").AppendLine(context.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            }
+
+            if (request.AutoCompactTokenLimit is int compact)
+            {
+                builder.Append("model_auto_compact_token_limit = ").AppendLine(compact.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            }
+
+            if (request.AutoCompactTokenLimit is not null)
+            {
+                builder.AppendLine("model_auto_compact_token_limit_scope = \"total\"");
+            }
+
+            if (request.ToolOutputTokenLimit is int toolOutput)
+            {
+                builder.Append("tool_output_token_limit = ").AppendLine(toolOutput.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            }
+
             if (provider != "lmstudio")
             {
                 Uri endpoint = request.LmStudioEndpoint ?? new Uri("http://127.0.0.1:1234");
-                if (!endpoint.AbsoluteUri.EndsWith('/')) endpoint = new Uri(endpoint.AbsoluteUri + "/");
+                if (!endpoint.AbsoluteUri.EndsWith('/'))
+                {
+                    endpoint = new Uri(endpoint.AbsoluteUri + "/");
+                }
+
                 string table = "model_providers." + provider;
                 builder.AppendLine().Append('[').Append(table).AppendLine("]").AppendLine("name = \"LM Studio Local\"").Append("base_url = ").AppendLine(JsonSerializer.Serialize(new Uri(endpoint, "v1").AbsoluteUri.TrimEnd('/'))).AppendLine("wire_api = \"responses\"");
                 if (request.LmStudioRequiresAuthentication)
@@ -143,6 +198,7 @@ public sealed class CodexSmokeTestService
         return builder.ToString();
     }
 
+    /// <summary>组装“全部失败”的冒烟结果（用于超时或输出超限等无法执行完的场景）。</summary>
     private static SmokeTestResult FailedExecution(string root, string reason)
     {
         DateTimeOffset stoppedAt = DateTimeOffset.Now;
@@ -159,25 +215,46 @@ public sealed class CodexSmokeTestService
         return new SmokeTestResult(false, root, -1, results, reason);
     }
 
+    /// <summary>校验 result.txt 的内容（去空白后）恰为 CMM_SMOKE_OK；文件超限视为失败。</summary>
     private static async Task<bool> HasExpectedResultFileAsync(string path, CancellationToken cancellationToken)
     {
-        if (!File.Exists(path)) return false;
+        if (!File.Exists(path))
+        {
+            return false;
+        }
+
         try
         {
             await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
             var reader = new BoundedUtf8LineReader(stream, new ProcessOutputBudget(1024));
             return (await reader.ReadToEndAsync(cancellationToken).ConfigureAwait(false)).Trim() == "CMM_SMOKE_OK";
         }
-        catch (ProcessOutputLimitException) { return false; }
+        catch (ProcessOutputLimitException)
+        {
+            return false;
+        }
     }
 
+    /// <summary>把 stderr 文本粗分为模板错误 / 认证错误 / 超时 / 运行时错误 / 无输出五类。</summary>
     private static string ClassifyError(string value)
     {
-        if (value.Contains("System message must be at the beginning", StringComparison.OrdinalIgnoreCase)) return "lmstudio-chat-template";
+        if (value.Contains("System message must be at the beginning", StringComparison.OrdinalIgnoreCase))
+        {
+            return "lmstudio-chat-template";
+        }
+
         if (value.Contains("HTTP 401", StringComparison.OrdinalIgnoreCase) ||
             value.Contains("status 401", StringComparison.OrdinalIgnoreCase) ||
-            value.Contains("401 Unauthorized", StringComparison.OrdinalIgnoreCase)) return "authentication";
-        if (value.Contains("timeout", StringComparison.OrdinalIgnoreCase)) return "timeout";
+            value.Contains("401 Unauthorized", StringComparison.OrdinalIgnoreCase))
+        {
+            return "authentication";
+        }
+
+        if (value.Contains("timeout", StringComparison.OrdinalIgnoreCase))
+        {
+            return "timeout";
+        }
+
         return string.IsNullOrWhiteSpace(value) ? "none" : "runtime";
     }
 }

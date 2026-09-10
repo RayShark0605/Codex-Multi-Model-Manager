@@ -2,8 +2,10 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.App.UI;
 
+/// <summary>LM Studio 页控件：端点/模型信息、上下文配置、指令层级检测与模板修复操作。</summary>
 public sealed class LmStudioControl : UserControl
 {
+    /// <summary>构造控件并布置全部信息行、模板操作与页级按钮。</summary>
     public LmStudioControl()
     {
         Dock = DockStyle.Fill;
@@ -99,40 +101,111 @@ public sealed class LmStudioControl : UserControl
         Controls.Add(buttons);
     }
 
+    /// <summary>端点输入框。</summary>
     public TextBox EndpointText { get; }
+
+    /// <summary>Server 状态标签。</summary>
     public Label ServerStatusValue { get; }
+
+    /// <summary>LM Studio 版本标签。</summary>
     public Label VersionValue { get; }
+
+    /// <summary>模型下拉框。</summary>
     public ComboBox ModelCombo { get; }
+
+    /// <summary>加载状态标签。</summary>
     public Label LoadedValue { get; }
+
+    /// <summary>类型/量化/参数标签。</summary>
     public Label QuantValue { get; }
+
+    /// <summary>Tool Use 能力标签。</summary>
     public Label ToolUseValue { get; }
+
+    /// <summary>Reasoning 能力标签。</summary>
     public Label ReasoningValue { get; }
+
+    /// <summary>模型最大上下文标签。</summary>
     public Label MaxContextValue { get; }
+
+    /// <summary>已加载上下文标签。</summary>
     public Label LoadedContextValue { get; }
+
+    /// <summary>Codex 有效上下文标签。</summary>
     public Label EffectiveContextValue { get; }
+
+    /// <summary>Codex 配置上下文输入框。</summary>
     public NumericUpDown CodexContextInput { get; }
+
+    /// <summary>自动压缩阈值输入框。</summary>
     public NumericUpDown AutoCompactInput { get; }
+
+    /// <summary>自动压缩“自动建议”复选框。</summary>
     public CheckBox AutoCompactAutomaticCheckBox { get; }
+
+    /// <summary>恢复自动压缩建议值按钮。</summary>
     public Button ResetAutoCompactButton { get; }
+
+    /// <summary>工具输出上限标签。</summary>
     public Label ToolOutputLimitValue { get; }
+
+    /// <summary>上下文检查警告标签。</summary>
     public Label ContextWarningValue { get; }
+
+    /// <summary>模型发现来源标签。</summary>
     public Label DiscoverySourceValue { get; }
+
+    /// <summary>指令层级总状态标签。</summary>
     public Label HierarchyStatusValue { get; }
+
+    /// <summary>Basic Control 步骤标签。</summary>
     public Label BasicControlValue { get; }
+
+    /// <summary>Leading Developer 步骤标签。</summary>
     public Label LeadingDeveloperValue { get; }
+
+    /// <summary>Conversation Control 步骤标签。</summary>
     public Label ConversationControlValue { get; }
+
+    /// <summary>Continuation Developer 步骤标签。</summary>
     public Label ContinuationDeveloperValue { get; }
+
+    /// <summary>层级检测详情标签。</summary>
     public Label HierarchyDetailValue { get; }
+
+    /// <summary>GGUF 路径输入框（只读分析用）。</summary>
     public TextBox GgufPathText { get; }
+
+    /// <summary>Prompt Template 状态标签。</summary>
     public Label TemplateStatusValue { get; }
+
+    /// <summary>持久化模板状态标签。</summary>
     public Label PersistenceStatusValue { get; }
+
+    /// <summary>运行时修复事务状态标签。</summary>
     public Label RuntimeRepairStatusValue { get; }
+
+    /// <summary>检测 Server 按钮。</summary>
     public Button DetectButton { get; }
+
+    /// <summary>刷新模型按钮。</summary>
     public Button RefreshModelsButton { get; }
+
+    /// <summary>检查/恢复未完成事务按钮。</summary>
     public Button RecoverTransactionButton { get; }
+
+    /// <summary>选择 GGUF 按钮。</summary>
     public Button BrowseGgufButton { get; }
+
+    /// <summary>分析 Prompt Template 按钮。</summary>
     public Button AnalyzeTemplateButton { get; }
+
+    /// <summary>导出兼容模板按钮。</summary>
     public Button ExportTemplateButton { get; }
+
+    /// <summary>复制兼容模板按钮。</summary>
     public Button CopyTemplateButton { get; }
+
+    /// <summary>重新检测 Codex 指令层级按钮。</summary>
     public Button RecheckHierarchyButton { get; }
 }

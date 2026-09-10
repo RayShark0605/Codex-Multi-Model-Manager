@@ -2,6 +2,7 @@ using CodexModelManager.Core.Security;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>RedactionAudit 相关测试集。</summary>
 public sealed class RedactionAuditTests
 {
     [Theory]

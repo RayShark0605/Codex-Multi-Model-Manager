@@ -9,6 +9,7 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>TemplateStorageRemediation 相关测试集。</summary>
 public sealed class TemplateStorageRemediationTests
 {
     [Fact]
@@ -46,12 +47,8 @@ public sealed class TemplateStorageRemediationTests
     {
         using var temporary = new TemporaryDirectory();
         var store = new LmStudioTemplateTransactionStore(temporary.Path);
-        string stale = Path.Combine(
-            temporary.Path,
-            Guid.NewGuid().ToString("N") + ".json.tmp-" + Guid.NewGuid().ToString("N"));
-        string fresh = Path.Combine(
-            temporary.Path,
-            Guid.NewGuid().ToString("N") + ".json.tmp-" + Guid.NewGuid().ToString("N"));
+        string stale = Path.Combine(temporary.Path, Guid.NewGuid().ToString("N") + ".json.tmp-" + Guid.NewGuid().ToString("N"));
+        string fresh = Path.Combine(temporary.Path, Guid.NewGuid().ToString("N") + ".json.tmp-" + Guid.NewGuid().ToString("N"));
         string unknown = Path.Combine(temporary.Path, "notes.json.tmp-" + Guid.NewGuid().ToString("N"));
         await File.WriteAllTextAsync(stale, "stale");
         await File.WriteAllTextAsync(fresh, "fresh");
@@ -112,9 +109,7 @@ public sealed class TemplateStorageRemediationTests
         var service = new PromptTemplateRepairService(new FixedTemplateReader(analysis));
         string output = Path.Combine(temporary.Path, "exports");
 
-        PromptTemplateRepairArtifact[] artifacts = await Task.WhenAll(
-            service.ExportAsync(analysis, "qwen/model", output),
-            service.ExportAsync(analysis, "qwen/model", output));
+        PromptTemplateRepairArtifact[] artifacts = await Task.WhenAll(service.ExportAsync(analysis, "qwen/model", output), service.ExportAsync(analysis, "qwen/model", output));
 
         Assert.NotEqual(artifacts[0].Directory, artifacts[1].Directory);
         foreach (PromptTemplateRepairArtifact artifact in artifacts)
@@ -148,21 +143,13 @@ public sealed class TemplateStorageRemediationTests
         using var temporary = new TemporaryDirectory();
         string settingsDirectory = Path.Combine(temporary.Path, ".lmstudio");
         Directory.CreateDirectory(settingsDirectory);
-        await File.WriteAllTextAsync(
-            Path.Combine(settingsDirectory, "settings.json"),
-            "{\"downloadsFolder\":\"models\"}");
+        await File.WriteAllTextAsync(Path.Combine(settingsDirectory, "settings.json"), "{\"downloadsFolder\":\"models\"}");
         var runner = new CountingLmsRunner();
         var locator = new LmStudioModelFileLocator(runner, () => temporary.Path);
         ModelProfile model = CreateLoadedModel();
 
-        LmStudioModelFileResolutionAttempt asyncAttempt = await locator.ResolveAsync(
-            model,
-            new Uri("http://127.0.0.1:1234"));
-        LmStudioModelFileResolutionAttempt psAttempt = LmStudioModelFileLocator.ResolvePsFromJson(
-            model,
-            "[]",
-            "{\"downloadsFolder\":\"models\"}",
-            temporary.Path);
+        LmStudioModelFileResolutionAttempt asyncAttempt = await locator.ResolveAsync(model, new Uri("http://127.0.0.1:1234"));
+        LmStudioModelFileResolutionAttempt psAttempt = LmStudioModelFileLocator.ResolvePsFromJson(model, "[]", "{\"downloadsFolder\":\"models\"}", temporary.Path);
 
         Assert.Equal(LmStudioModelFileResolutionStatus.InvalidSettings, asyncAttempt.Status);
         Assert.Equal(LmStudioModelFileResolutionStatus.InvalidSettings, psAttempt.Status);

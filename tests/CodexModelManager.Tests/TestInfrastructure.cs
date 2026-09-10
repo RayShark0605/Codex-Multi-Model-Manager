@@ -9,6 +9,7 @@ using CodexModelManager.Core.Security;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>TemporaryDirectory。</summary>
 internal sealed class TemporaryDirectory : IDisposable
 {
     public TemporaryDirectory()
@@ -21,7 +22,10 @@ internal sealed class TemporaryDirectory : IDisposable
 
     public void Dispose()
     {
-        if (Directory.Exists(Path)) Directory.Delete(Path, true);
+        if (Directory.Exists(Path))
+        {
+            Directory.Delete(Path, true);
+        }
     }
 }
 
@@ -105,9 +109,7 @@ internal sealed class StubHttpHandler(Func<HttpRequestMessage, HttpResponseMessa
 internal sealed class AsyncStubHttpHandler(
     Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> responseFactory) : HttpMessageHandler
 {
-    protected override Task<HttpResponseMessage> SendAsync(
-        HttpRequestMessage request,
-        CancellationToken cancellationToken) => responseFactory(request, cancellationToken);
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => responseFactory(request, cancellationToken);
 }
 
 internal sealed class FakeLmStudioSwitchPreflight : ILmStudioSwitchPreflight
