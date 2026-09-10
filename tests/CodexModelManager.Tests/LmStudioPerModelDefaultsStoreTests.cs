@@ -8,6 +8,7 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>LmStudioPerModelDefaultsStore 相关测试集。</summary>
 public sealed class LmStudioPerModelDefaultsStoreTests
 {
     [Theory]
@@ -18,6 +19,11 @@ public sealed class LmStudioPerModelDefaultsStoreTests
     [InlineData("0.4.23.0")]
     [InlineData("0.4.23+1")]
     [InlineData("0.4.23.0+1")]
+    [InlineData("0.4.24")]
+    [InlineData("0.4.24.0")]
+    [InlineData("0.4.24+1")]
+    [InlineData("0.4.25.0")]
+    [InlineData("0.5.0")]
     public async Task VerifiedVersionFamiliesCreateReadOnlyPlans(string version)
     {
         using var fixture = CreateFixture();
@@ -38,9 +44,8 @@ public sealed class LmStudioPerModelDefaultsStoreTests
     [InlineData("0.4.23+build")]
     [InlineData("0.4.23+1+2")]
     [InlineData("0.4.20.0")]
-    [InlineData("0.4.22.0")]
-    [InlineData("0.4.24.0")]
-    [InlineData("0.5.0")]
+    [InlineData("0.4.20+9")]
+    [InlineData("0.4.9")]
     public async Task UnverifiedVersionsAreRejectedBeforeAnyDefaultsMutation(string? version)
     {
         using var fixture = CreateFixture();
@@ -48,7 +53,7 @@ public sealed class LmStudioPerModelDefaultsStoreTests
 
         NotSupportedException exception = await Assert.ThrowsAsync<NotSupportedException>(() => fixture.CreatePlanAsync(version: version));
 
-        Assert.Contains("0.4.21.x / 0.4.23.x", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("0.4.21", exception.Message, StringComparison.Ordinal);
         Assert.Equal(original, await File.ReadAllBytesAsync(fixture.DefaultsPath));
     }
 
@@ -86,11 +91,7 @@ public sealed class LmStudioPerModelDefaultsStoreTests
         string v2 = PromptTemplateRepairService.PatchExactQwenTemplateV2(fixture.Analysis.ChatTemplate);
         string v2Sha = Sha(v2);
         WriteDefaults(fixture.DefaultsPath, v2);
-        var provenance = new LmStudioRuntimeTemplateProvenance(
-            LmStudioRuntimeTemplateMode.ManagerRule,
-            PromptTemplateRepairService.LegacyLeadingRuleVersion,
-            v2Sha,
-            Guid.NewGuid());
+        var provenance = new LmStudioRuntimeTemplateProvenance(LmStudioRuntimeTemplateMode.ManagerRule, PromptTemplateRepairService.LegacyLeadingRuleVersion, v2Sha, Guid.NewGuid());
 
         LmStudioPerModelDefaultsPlan upgrade = await fixture.CreatePlanAsync(provenance);
 
@@ -143,9 +144,15 @@ public sealed class LmStudioPerModelDefaultsStoreTests
         await Assert.ThrowsAsync<InvalidDataException>(() => fixture.CreatePlanAsync());
 
         var text = new StringBuilder("{\"preset\":\"\",\"operation\":{\"fields\":[]},\"load\":{\"fields\":[]},\"deep\":");
-        for (int index = 0; index < 40; index++) text.Append("{\"x\":");
+        for (int index = 0; index < 40; index++)
+        {
+            text.Append("{\"x\":");
+        }
         text.Append('0');
-        for (int index = 0; index < 40; index++) text.Append('}');
+        for (int index = 0; index < 40; index++)
+        {
+            text.Append('}');
+        }
         text.Append('}');
         await File.WriteAllTextAsync(fixture.DefaultsPath, text.ToString());
         await Assert.ThrowsAnyAsync<JsonException>(() => fixture.CreatePlanAsync());
@@ -169,7 +176,11 @@ public sealed class LmStudioPerModelDefaultsStoreTests
     [Fact]
     public void ExistingReparsePointAncestorIsRejected()
     {
-        if (!OperatingSystem.IsWindows()) return;
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
         using var temporary = new TemporaryDirectory();
         string target = Path.Combine(temporary.Path, "actual-defaults");
         string junction = Path.Combine(temporary.Path, "defaults-link");
@@ -187,7 +198,7 @@ public sealed class LmStudioPerModelDefaultsStoreTests
     {
         using var fixture = CreateFixture();
         await Assert.ThrowsAsync<InvalidOperationException>(() => fixture.CreatePlanAsync(endpoint: new Uri("https://example.invalid:1234")));
-        await Assert.ThrowsAsync<NotSupportedException>(() => fixture.CreatePlanAsync(version: "0.4.22.0"));
+        await Assert.ThrowsAsync<NotSupportedException>(() => fixture.CreatePlanAsync(version: "0.4.20.0"));
         await Assert.ThrowsAsync<InvalidDataException>(() => fixture.CreatePlanAsync(resolution: fixture.Resolution with { Source = "manual" }));
     }
 
@@ -266,7 +277,11 @@ public sealed class LmStudioPerModelDefaultsStoreTests
     [Fact]
     public void WindowsProtectorUsesCurrentUserDpapiRoundTrip()
     {
-        if (!OperatingSystem.IsWindows()) return;
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
         var protector = new WindowsCurrentUserDpapiProtector();
         byte[] plaintext = "per-model-defaults"u8.ToArray();
 
@@ -325,7 +340,10 @@ public sealed class LmStudioPerModelDefaultsStoreTests
             },
             ["unknownRoot"] = "preserve-me",
         };
-        if (promptTemplate is not null) GetFields(root).Add(CreatePromptField(promptTemplate));
+        if (promptTemplate is not null)
+        {
+            GetFields(root).Add(CreatePromptField(promptTemplate));
+        }
         return root;
     }
 
@@ -346,7 +364,10 @@ public sealed class LmStudioPerModelDefaultsStoreTests
         JsonArray fields = GetFields(root);
         for (int index = fields.Count - 1; index >= 0; index--)
         {
-            if (fields[index]!["key"]!.GetValue<string>() == LmStudioPerModelDefaultsStore.PromptTemplateKey) fields.RemoveAt(index);
+            if (fields[index]!["key"]!.GetValue<string>() == LmStudioPerModelDefaultsStore.PromptTemplateKey)
+            {
+                fields.RemoveAt(index);
+            }
         }
     }
 
@@ -400,11 +421,7 @@ public sealed class LmStudioPerModelDefaultsStoreTests
         GgufChatTemplateAnalysis Analysis,
         PromptTemplateRepairPreview Preview) : IDisposable
     {
-        public Task<LmStudioPerModelDefaultsPlan> CreatePlanAsync(
-            LmStudioRuntimeTemplateProvenance? provenance = null,
-            Uri? endpoint = null,
-            string? version = "0.4.21.0",
-            LmStudioModelFileResolution? resolution = null) =>
+        public Task<LmStudioPerModelDefaultsPlan> CreatePlanAsync(LmStudioRuntimeTemplateProvenance? provenance = null, Uri? endpoint = null, string? version = "0.4.21.0", LmStudioModelFileResolution? resolution = null) =>
             Store.CreatePlanAsync(
                 endpoint ?? new Uri("http://127.0.0.1:1234"),
                 version,

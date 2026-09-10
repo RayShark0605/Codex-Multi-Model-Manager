@@ -1,6 +1,43 @@
 # Final Verification
 
-主验证日期：2026-08-22；最新增量验证：2026-09-09（Asia/Shanghai）。
+主验证日期：2026-08-22；最新增量验证：2026-09-10（Asia/Shanghai）。
+
+## 2026-09-10：LM Studio per-model defaults 版本门改为下限 + 结构校验兜底
+
+### 本轮范围与结论
+
+起因：用户本机 LM Studio 升级到 `0.4.24.0` 后，切换 Qwen3.8 27B 时被 `NotSupportedException`（"per-model defaults 格式未经验证"）阻断。排查确认 `LmStudioPerModelDefaultsCompatibility` 原为写死版本族白名单（仅 `0.4.21.x / 0.4.23.x`），而 0.4.24 在本机 `~/.lmstudio/.internal/user-concrete-model-default-config` 下实际生成的 11 个 per-model defaults JSON（含 `esatapedico/Qwen3.8-27B-NVFP4-MTP-GGUF` 等）与 `LmStudioPerModelDefaultsStore` 校验的 schema（`preset` 字符串、`operation/load.fields` 数组、`llm.load.promptTemplate` 的 `{type:"jinja", jinjaPromptTemplate:{template}}` 形状）**逐文件一致**——纯属白名单未跟上版本，非格式变化。
+
+按用户要求**不再写死版本号**：版本门改为最低版本下限 `0.4.21`（per-model defaults 格式引入版本），更高版本（含未来升级）一律放行；实际兼容性由 defaults 文件既有的严格结构校验兜底——结构不符时在任何写入和 unload 前安全阻断（fail closed 不变）。预发布后缀（`-alpha`）、非法构建元数据（非纯数字、多次 `+`）与空白版本仍拒绝。`CreatePlanAsync` 报错文案、schema-v4 journal 校验（`RestoreFromTransactionAsync` / `ValidV4Persistence`）随判定语义同步。本轮**没有写入真实 per-model defaults、没有执行真实 unload/load 或切换**；live LM Studio 集成测试仍为 opt-in SKIP。
+
+顺带修复：`LiveLmStudioIntegrationTests.cs` 第 145 行两处多余空格（前一工作区遗留，导致 `dotnet format` 门禁失败），纯空白修正。
+
+工作区说明：本轮发布工件还包含此前会话遗留的未提交中文 XML 注档注释改动（约百个 src/tests 文件）；该改动通过 SourceIdentity 的 `.content-` 哈希在 `source-manifest.json` 留痕，与本次版本门修复相互独立。
+
+### 自动化验证
+
+| 检查 | 结果 |
+|---|---|
+| Core Release 全量（publish.ps1 内） | **506 PASS / 0 FAIL / 8 现场 opt-in SKIP**（相对 2026-09-09 基线 +6：版本族判定用例重排，新增 `0.4.24`/`0.4.24.0`/`0.4.24+1`/`0.4.25.0`/`0.5.0` 支持用例与 `0.4.20+9`/`0.4.9` 拒绝用例） |
+| App Release 隔离 STA（publish.ps1 内） | **27 PASS / 0 FAIL / 0 SKIP** |
+| Debug / Release build | **均 PASS，0 warning / 0 error** |
+| `dotnet format --verify-no-changes --no-restore` | **PASS** |
+| `git diff --check` | **PASS** |
+
+### 发布工件
+
+ProductVersion/SourceIdentity：`d6faeb15519ac433c5d14c5020f2836b442f8a81.content-14204e46de95da640b138812c8eac2771abea453a2427cef8787f48aa2c6ca6e`（完整值见 `source-manifest.json`；旧版保留为 `artifacts/publish/win-x64.previous-e46cc06045a84aa79346c6e8711b2aa7`）。
+
+| 文件（相对仓库根目录） | Bytes | SHA-256 |
+|---|---:|---|
+| `artifacts/publish/win-x64/CodexModelManager.exe` | 72,072,385 | `612D321A55080E597C89213FC18353DCDFDB66061DADFA5F1A95FA1CCC89A479` |
+| `artifacts/publish/win-x64/helpers/credential/CodexModelManager.CredentialHelper.exe` | 35,508,507 | `57C095CC76AD775F3E8EAA88C0271205CA03B0165696B91C8BE57A370DAEA324` |
+| `artifacts/publish/win-x64/helpers/mcp/CodexModelManager.TestMcpServer.exe` | 35,096,753 | `D3FADB67E00FD06CFCD4917FE8659ECAC46723C473EE16573FF5C9B080FC943B` |
+
+### 未验证边界
+
+- 未在 0.4.24 上执行真实 per-model defaults 持久化写入、unload/load 重载与四阶段探针（Level 3 / live 集成测试仍 opt-in SKIP）；0.4.24 的结构一致性仅由本机磁盘文件静态比对证明。用户下一次真实切换即是对 0.4.24 链路的首次端到端验证。
+- `0.4.25+`、`0.5.0` 等未来版本的放行依赖结构校验兜底，未逐版本实测。
 
 ## 2026-09-09：新增 GLM Provider（智谱 GLM Coding Plan）
 

@@ -5,6 +5,7 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>LiveLmStudioIntegration 相关测试集。</summary>
 public sealed class LiveLmStudioIntegrationTests
 {
     [Fact]
@@ -38,15 +39,7 @@ public sealed class LiveLmStudioIntegrationTests
         var runtime = new CodexRuntimeProbe(home, new TomlConfigPatchEngine());
         var reader = new GgufChatTemplateReader();
         var repair = new PromptTemplateRepairService(reader);
-        using var controller = new LmStudioInstanceController(
-            transaction.OriginalInstance.Endpoint,
-            false,
-            http,
-            null,
-            runtime,
-            reader,
-            repair,
-            transactions,
+        using var controller = new LmStudioInstanceController(transaction.OriginalInstance.Endpoint, false, http, null, runtime, reader, repair, transactions,
             new FakeLogger());
 
         LmStudioRecoveryAssessment assessment = await controller.AssessRecoveryAsync(transaction, TestContext.Current.CancellationToken);
@@ -57,9 +50,7 @@ public sealed class LiveLmStudioIntegrationTests
             .OrderBy(value => value, StringComparer.Ordinal)
             .ToArray();
         Assert.Equal(beforeIds, afterIds);
-        if (transaction.SchemaVersion == 1 &&
-            transaction.State == LmStudioTemplateTransactionState.RollbackFailed &&
-            assessment.Candidates.Count == 1 &&
+        if (transaction.SchemaVersion == 1 && transaction.State == LmStudioTemplateTransactionState.RollbackFailed && assessment.Candidates.Count == 1 &&
             assessment.Candidates[0].Snapshot.InstanceId.Equals(transaction.OriginalInstance.InstanceId, StringComparison.Ordinal) &&
             assessment.Candidates[0].MatchesOriginalSnapshot &&
             assessment.Candidates[0].ReproducesOriginalFailure)
@@ -78,16 +69,11 @@ public sealed class LiveLmStudioIntegrationTests
         Assert.SkipUnless(string.Equals(Environment.GetEnvironmentVariable("CMM_RUN_LIVE_LM"), "1", StringComparison.Ordinal), "Set CMM_RUN_LIVE_LM=1 to run the live LM Studio test.");
         using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(3) };
         var client = new LmStudioClient(new Uri("http://127.0.0.1:1234"), null, http);
-        ModelProfile loaded = Assert.Single(
-            await client.DiscoverNativeModelsAsync(TestContext.Current.CancellationToken),
-            model => model.IsLoaded == true &&
-                model.ModelType == "llm" &&
+        ModelProfile loaded = Assert.Single(await client.DiscoverNativeModelsAsync(TestContext.Current.CancellationToken), model => model.IsLoaded == true && model.ModelType == "llm" &&
                 string.Equals(model.SourceModelKey, expectedSourceModelKey, StringComparison.OrdinalIgnoreCase));
 
         var locator = new LmStudioModelFileLocator();
-        LmStudioModelFileResolutionAttempt attempt = await locator.ResolveAsync(
-            loaded,
-            new Uri("http://127.0.0.1:1234"),
+        LmStudioModelFileResolutionAttempt attempt = await locator.ResolveAsync(loaded, new Uri("http://127.0.0.1:1234"),
             TestContext.Current.CancellationToken);
 
         Assert.True(attempt.Succeeded, attempt.Diagnostic);
@@ -117,8 +103,7 @@ public sealed class LiveLmStudioIntegrationTests
         Uri endpoint = new("http://127.0.0.1:1234");
         using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(3) };
         var client = new LmStudioClient(endpoint, null, http);
-        ModelProfile loaded = Assert.Single(
-            await client.DiscoverNativeModelsAsync(TestContext.Current.CancellationToken),
+        ModelProfile loaded = Assert.Single(await client.DiscoverNativeModelsAsync(TestContext.Current.CancellationToken),
             model => model.IsLoaded == true && model.ModelType == "llm");
         var locator = new LmStudioModelFileLocator();
         LmStudioModelFileResolutionAttempt resolutionAttempt = await locator.ResolveAsync(loaded, endpoint, TestContext.Current.CancellationToken);
@@ -144,26 +129,9 @@ public sealed class LiveLmStudioIntegrationTests
             .ToArray();
         var transactions = new LmStudioTemplateTransactionStore(new AppPaths());
         var runtime = new CodexRuntimeProbe(new DefaultCodexHomeProvider(), new TomlConfigPatchEngine());
-        using var controller = new LmStudioInstanceController(
-            endpoint,
-            false,
-            http,
-            null,
-            runtime,
-            reader,
-            repair,
-            transactions,
-            new FakeLogger(),
-            defaultsStore,
-            LmStudioLocalVersionDetector.Detect,
+        using var controller = new LmStudioInstanceController(endpoint, false, http, null, runtime, reader, repair, transactions, new FakeLogger(), defaultsStore, LmStudioLocalVersionDetector.Detect,
             locator);
-        var planner = new LmStudioTemplateRepairPlanner(
-            controller,
-            reader,
-            repair,
-            transactions,
-            locator,
-            defaultsStore,
+        var planner = new LmStudioTemplateRepairPlanner(controller, reader, repair, transactions, locator, defaultsStore,
             LmStudioLocalVersionDetector.Detect);
 
         LmStudioTemplateRepairPlan plan = await planner.CreatePlanAsync(loaded, originalProbe, TestContext.Current.CancellationToken);
@@ -174,9 +142,7 @@ public sealed class LiveLmStudioIntegrationTests
         Assert.Equal("12827F24B742EA4E80CDC12DBCF9622227056B9F797252A3149263D4F9AAADCE", plan.GgufAnalysis.TemplateSha256, ignoreCase: true);
         Assert.Equal("9DC0DA000D1DF280BE9F6F64D314EB52879C0DF5C3C951F74105964136592F85", persistent.TargetTemplateSha256, ignoreCase: true);
         Assert.Equal(defaultsBefore, await FileFingerprintService.CaptureAsync(defaultsPath, TestContext.Current.CancellationToken));
-        Assert.Equal(instanceIdsBefore, (await client.DiscoverNativeModelsAsync(TestContext.Current.CancellationToken))
-            .Where(model => model.IsLoaded == true)
-            .Select(model => model.Id)
+        Assert.Equal(instanceIdsBefore, (await client.DiscoverNativeModelsAsync(TestContext.Current.CancellationToken)).Where(model => model.IsLoaded == true).Select(model => model.Id)
             .OrderBy(value => value, StringComparer.Ordinal)
             .ToArray());
         Assert.False(File.Exists(transactions.GetPath(plan.TransactionId)));

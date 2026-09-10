@@ -10,8 +10,15 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Core.LmStudio;
 
+/// <summary>
+/// LM Studio「每模型默认值」存储：以 DPAPI 加密备份 + 字段级精确改写的方式，
+/// 把管理器 v3 Prompt Template 持久化到 LM Studio 的 user-concrete-model-default-config 目录。
+/// 全程施加安全边界：仅 loopback、仅受验证的 LM Studio 版本、标识与路径防穿越、
+/// 禁止 reparse point、候选只允许改 promptTemplate 一个字段。
+/// </summary>
 public sealed class LmStudioPerModelDefaultsStore
 {
+    /// <summary>持久化目标字段：llm.load.promptTemplate。</summary>
     public const string PromptTemplateKey = "llm.load.promptTemplate";
     private const int MaximumFileBytes = 2 * 1024 * 1024;
     private const int MaximumJsonDepth = 32;
@@ -22,18 +29,14 @@ public sealed class LmStudioPerModelDefaultsStore
     private readonly ILmStudioDefaultsProtector protector;
     private readonly string rootDirectory;
 
-    public LmStudioPerModelDefaultsStore(
-        IPromptTemplateRepairService templateRepair,
-        IAtomicBatchWriter atomicWriter)
+    /// <summary>默认构造：Windows DPAPI 保护器与 LM Studio 默认根目录。</summary>
+    public LmStudioPerModelDefaultsStore(IPromptTemplateRepairService templateRepair, IAtomicBatchWriter atomicWriter)
         : this(templateRepair, atomicWriter, new WindowsCurrentUserDpapiProtector(), ResolveDefaultRoot())
     {
     }
 
-    internal LmStudioPerModelDefaultsStore(
-        IPromptTemplateRepairService templateRepair,
-        IAtomicBatchWriter atomicWriter,
-        ILmStudioDefaultsProtector protector,
-        string rootDirectory)
+    /// <summary>测试用构造：可注入保护器与根目录。</summary>
+    internal LmStudioPerModelDefaultsStore(IPromptTemplateRepairService templateRepair, IAtomicBatchWriter atomicWriter, ILmStudioDefaultsProtector protector, string rootDirectory)
     {
         this.templateRepair = templateRepair ?? throw new ArgumentNullException(nameof(templateRepair));
         this.atomicWriter = atomicWriter ?? throw new ArgumentNullException(nameof(atomicWriter));
@@ -42,8 +45,10 @@ public sealed class LmStudioPerModelDefaultsStore
         this.rootDirectory = Path.GetFullPath(rootDirectory);
     }
 
+    /// <summary>持久化根目录。</summary>
     public string RootDirectory => rootDirectory;
 
+    /// <summary>按 concrete model identifier 推导 defaults 文件全路径（带防穿越与 reparse point 校验）。</summary>
     public string GetDefaultsPath(string concreteModelIdentifier)
     {
         string[] segments = ValidateConcreteIdentifier(concreteModelIdentifier);
@@ -64,6 +69,10 @@ public sealed class LmStudioPerModelDefaultsStore
         return fullPath;
     }
 
+    /// <summary>
+    /// 创建持久化计划：校验环境/标识/目标模板可确定性重建，读取稳定的 defaults 快照，
+    /// 分类原 promptTemplate 字段（Missing/v2/v3），生成只改该字段的候选并复核。
+    /// </summary>
     public async Task<LmStudioPerModelDefaultsPlan> CreatePlanAsync(
         Uri endpoint,
         string? lmStudioVersion,
@@ -153,10 +162,11 @@ public sealed class LmStudioPerModelDefaultsStore
             candidateBytes);
     }
 
-    public async Task<LmStudioDefaultsBackupArtifact> CreateVerifiedBackupAsync(
-        LmStudioPerModelDefaultsPlan plan,
-        string backupPath,
-        CancellationToken cancellationToken = default)
+    /// <summary>
+    /// 创建并核验加密备份：确认 defaults 未变后，把原始字节 DPAPI 加密落盘，
+    /// 再解密读回复核哈希与字节；任何失败都会删除半成品备份文件。
+    /// </summary>
+    public async Task<LmStudioDefaultsBackupArtifact> CreateVerifiedBackupAsync(LmStudioPerModelDefaultsPlan plan, string backupPath, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentException.ThrowIfNullOrWhiteSpace(backupPath);
@@ -221,9 +231,8 @@ public sealed class LmStudioPerModelDefaultsStore
         }
     }
 
-    public async Task ApplyAsync(
-        LmStudioPerModelDefaultsPlan plan,
-        CancellationToken cancellationToken = default)
+    /// <summary>应用持久化计划：NoOp 只复核；否则以原子批量写入候选（附提交后校验）并复核落地结果。</summary>
+    public async Task ApplyAsync(LmStudioPerModelDefaultsPlan plan, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(plan);
         EnsureNoReparsePoints(plan.FilePath);
@@ -252,9 +261,8 @@ public sealed class LmStudioPerModelDefaultsStore
         await VerifyAppliedAsync(plan, cancellationToken).ConfigureAwait(false);
     }
 
-    public static async Task<FileFingerprint> VerifyAppliedAsync(
-        LmStudioPerModelDefaultsPlan plan,
-        CancellationToken cancellationToken = default)
+    /// <summary>复核已应用的计划：稳定读取当前文件，校验目标模板哈希与候选 SHA 一致。</summary>
+    public static async Task<FileFingerprint> VerifyAppliedAsync(LmStudioPerModelDefaultsPlan plan, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(plan);
         EnsureNoReparsePoints(plan.FilePath);
@@ -268,10 +276,12 @@ public sealed class LmStudioPerModelDefaultsStore
         return snapshot.Fingerprint;
     }
 
-    public async Task<LmStudioDefaultsRestoreResult> RestoreAsync(
-        LmStudioPerModelDefaultsPlan plan,
-        LmStudioDefaultsBackupArtifact backup,
-        CancellationToken cancellationToken = default)
+    /// <summary>
+    /// 从加密备份恢复：核验备份（哈希 + 解密 + 与原始字节一致）；
+    /// 当前已是原始状态则跳过；否则优先整文件精确恢复，不能精确恢复时执行
+    /// 字段级恢复（仅当 promptTemplate 仍归管理器所有，保留其他字段的并发变化）。
+    /// </summary>
+    public async Task<LmStudioDefaultsRestoreResult> RestoreAsync(LmStudioPerModelDefaultsPlan plan, LmStudioDefaultsBackupArtifact backup, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentNullException.ThrowIfNull(backup);
@@ -332,6 +342,7 @@ public sealed class LmStudioPerModelDefaultsStore
                     return new LmStudioDefaultsRestoreResult(true, false, "管理器拥有的 Prompt Template 字段已经处于事务前状态；保留其他并发字段变化。", current.Fingerprint);
                 }
 
+                // 字段被外部改成未知内容时绝不覆盖用户配置
                 if (currentPrompt.Template is null ||
                     !ComputeTemplateSha(currentPrompt.Template).Equals(plan.TargetTemplateSha256, StringComparison.OrdinalIgnoreCase))
                 {
@@ -369,10 +380,11 @@ public sealed class LmStudioPerModelDefaultsStore
         }
     }
 
-    public async Task<LmStudioDefaultsRestoreResult> RestoreFromTransactionAsync(
-        LmStudioTemplateTransactionRecord record,
-        GgufChatTemplateAnalysis analysis,
-        CancellationToken cancellationToken = default)
+    /// <summary>
+    /// 从 schema-v4 事务记录恢复持久化 defaults：核验记录证据齐全、路径与 concrete identity 一致、
+    /// DPAPI 备份可用且哈希匹配，再确定性重建候选并转入 <see cref="RestoreAsync"/>。
+    /// </summary>
+    public async Task<LmStudioDefaultsRestoreResult> RestoreFromTransactionAsync(LmStudioTemplateTransactionRecord record, GgufChatTemplateAnalysis analysis, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(record);
         ArgumentNullException.ThrowIfNull(analysis);
@@ -476,9 +488,8 @@ public sealed class LmStudioPerModelDefaultsStore
         return await RestoreAsync(plan, backup, cancellationToken).ConfigureAwait(false);
     }
 
-    public static async Task<FileFingerprint> VerifyTransactionTargetAsync(
-        LmStudioTemplateTransactionRecord record,
-        CancellationToken cancellationToken = default)
+    /// <summary>核验事务目标：稳定读取当前 defaults，确认目标模板哈希与候选 SHA 均与记录一致。</summary>
+    public static async Task<FileFingerprint> VerifyTransactionTargetAsync(LmStudioTemplateTransactionRecord record, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(record);
         if (record.SchemaVersion < 4 || string.IsNullOrWhiteSpace(record.PerModelDefaultsPath) ||
@@ -497,11 +508,11 @@ public sealed class LmStudioPerModelDefaultsStore
         return snapshot.Fingerprint;
     }
 
-    private (LmStudioPersistentTemplateFieldState State, string? RuleVersion, string? TemplateSha256) ClassifyOriginalField(
-        PromptField field,
-        GgufChatTemplateAnalysis analysis,
-        PromptTemplateRepairPreview targetPreview,
-        LmStudioRuntimeTemplateProvenance runtimeProvenance)
+    /// <summary>
+    /// 分类原 promptTemplate 字段：缺失 → Missing；与可重建 v3 一致 → ManagerV3；
+    /// 与可重建 v2 一致且有 completed 事务佐证 → ManagerV2；其余（用户自定义）一律拒绝覆盖。
+    /// </summary>
+    private (LmStudioPersistentTemplateFieldState State, string? RuleVersion, string? TemplateSha256) ClassifyOriginalField(PromptField field, GgufChatTemplateAnalysis analysis, PromptTemplateRepairPreview targetPreview, LmStudioRuntimeTemplateProvenance runtimeProvenance)
     {
         if (field.Template is null)
         {
@@ -537,6 +548,7 @@ public sealed class LmStudioPerModelDefaultsStore
         throw new InvalidDataException("检测到未知或用户自定义的 llm.load.promptTemplate；自动持久化不会覆盖该字段。");
     }
 
+    /// <summary>解析并校验 defaults 文件：大小/深度限制、根结构（preset 字符串）、operation/load 容器与 promptTemplate 字段形状。</summary>
     private static JsonObject ParseAndValidateRoot(byte[] bytes)
     {
         if (bytes.Length is 0 or > MaximumFileBytes)
@@ -544,10 +556,7 @@ public sealed class LmStudioPerModelDefaultsStore
             throw new InvalidDataException($"LM Studio per-model defaults 文件大小必须在 1 到 {MaximumFileBytes:N0} 字节之间。");
         }
 
-        JsonNode? node = JsonNode.Parse(
-            bytes,
-            nodeOptions: null,
-            documentOptions: new JsonDocumentOptions { AllowTrailingCommas = false, CommentHandling = JsonCommentHandling.Disallow, MaxDepth = MaximumJsonDepth });
+        JsonNode? node = JsonNode.Parse(bytes, nodeOptions: null, documentOptions: new JsonDocumentOptions { AllowTrailingCommas = false, CommentHandling = JsonCommentHandling.Disallow, MaxDepth = MaximumJsonDepth });
         if (node is not JsonObject root || root["preset"] is not JsonValue preset || !preset.TryGetValue(out string? _))
         {
             throw new InvalidDataException("LM Studio per-model defaults 根必须是 object，且 preset 必须是 string。");
@@ -559,6 +568,7 @@ public sealed class LmStudioPerModelDefaultsStore
         return root;
     }
 
+    /// <summary>校验指定容器（operation/load）的 fields 数组：每个条目必须有非空字符串 key 与 value。</summary>
     private static void ValidateFieldsContainer(JsonObject root, string name)
     {
         if (root[name] is not JsonObject container || container["fields"] is not JsonArray fields)
@@ -575,6 +585,7 @@ public sealed class LmStudioPerModelDefaultsStore
         }
     }
 
+    /// <summary>读取 promptTemplate 字段：定位（要求唯一）、校验精确 Jinja 结构，返回索引、深拷贝节点与模板文本。</summary>
     private static PromptField ReadPromptField(JsonObject root)
     {
         JsonArray fields = GetLoadFields(root);
@@ -609,6 +620,7 @@ public sealed class LmStudioPerModelDefaultsStore
         return new PromptField(matches[0].Index, (JsonObject)fieldObject.DeepClone(), template);
     }
 
+    /// <summary>构造目标 promptTemplate 字段节点（jinja 类型 + 模板正文）。</summary>
     private static JsonObject CreateTargetPromptField(string template) => new()
     {
         ["key"] = PromptTemplateKey,
@@ -619,10 +631,12 @@ public sealed class LmStudioPerModelDefaultsStore
         },
     };
 
+    /// <summary>比较两个字段是否等值（同为缺失，或模板文本与节点结构都一致）。</summary>
     private static bool PromptFieldsEqual(PromptField left, PromptField right) =>
         left.Template is null && right.Template is null ||
         left.Template is not null && right.Template is not null && left.Template.Equals(right.Template, StringComparison.Ordinal) && JsonNode.DeepEquals(left.Field, right.Field);
 
+    /// <summary>替换 promptTemplate 字段：缺失则追加，存在则原位替换。</summary>
     private static void ReplacePromptField(JsonObject root, JsonObject targetField)
     {
         JsonArray fields = GetLoadFields(root);
@@ -637,6 +651,7 @@ public sealed class LmStudioPerModelDefaultsStore
         }
     }
 
+    /// <summary>把 promptTemplate 字段恢复为原始形态（原始缺失则移除当前字段）。</summary>
     private static void RestorePromptField(JsonObject root, PromptField original)
     {
         JsonArray fields = GetLoadFields(root);
@@ -656,9 +671,11 @@ public sealed class LmStudioPerModelDefaultsStore
         }
     }
 
+    /// <summary>取 load.fields 数组（结构已经过校验）。</summary>
     private static JsonArray GetLoadFields(JsonObject root) =>
         (JsonArray)((JsonObject)root["load"]!)["fields"]!;
 
+    /// <summary>确保候选相对原始只有 promptTemplate 字段变化（去掉该字段后整体深度相等）。</summary>
     private static void EnsureOnlyPromptFieldChanged(JsonObject original, JsonObject candidate)
     {
         JsonObject originalWithoutPrompt = (JsonObject)original.DeepClone();
@@ -671,6 +688,7 @@ public sealed class LmStudioPerModelDefaultsStore
         }
     }
 
+    /// <summary>移除全部 promptTemplate 字段（倒序遍历避免索引漂移）。</summary>
     private static void RemovePromptField(JsonObject root)
     {
         JsonArray fields = GetLoadFields(root);
@@ -683,6 +701,7 @@ public sealed class LmStudioPerModelDefaultsStore
         }
     }
 
+    /// <summary>校验候选：结构合法且 promptTemplate 的哈希恰为期望的目标模板哈希。</summary>
     private static void ValidateTargetCandidate(byte[] bytes, string expectedTemplateSha256)
     {
         JsonObject root = ParseAndValidateRoot(bytes);
@@ -693,13 +712,17 @@ public sealed class LmStudioPerModelDefaultsStore
         }
     }
 
+    /// <summary>序列化为缩进 JSON（UTF-8 无 BOM，末尾补系统换行）。</summary>
     private static byte[] Serialize(JsonObject root) => Utf8NoBom.GetBytes(root.ToJsonString(WriteOptions) + Environment.NewLine);
 
+    /// <summary>为候选字节生成指纹（存在 + 长度 + SHA）。</summary>
     private static FileFingerprint FingerprintCandidate(byte[] bytes) =>
         new(true, bytes.LongLength, null, Convert.ToHexString(SHA256.HashData(bytes)));
 
+    /// <summary>计算模板文本的 SHA-256。</summary>
     private static string ComputeTemplateSha(string template) => Convert.ToHexString(SHA256.HashData(Utf8NoBom.GetBytes(template)));
 
+    /// <summary>稳定读取文件：前后指纹一致且字节哈希吻合，确保读到的是未被并发修改的完整内容。</summary>
     private static async Task<StableFileSnapshot> ReadStableSnapshotAsync(string path, CancellationToken cancellationToken)
     {
         FileFingerprint before = await FileFingerprintService.CaptureAsync(path, cancellationToken).ConfigureAwait(false);
@@ -724,6 +747,7 @@ public sealed class LmStudioPerModelDefaultsStore
         return new StableFileSnapshot(bytes, after);
     }
 
+    /// <summary>环境校验：端点合法且为 loopback，LM Studio 版本落在受验证版本族内。</summary>
     private static void ValidateSupportedEnvironment(Uri endpoint, string? lmStudioVersion)
     {
         ArgumentNullException.ThrowIfNull(endpoint);
@@ -735,10 +759,11 @@ public sealed class LmStudioPerModelDefaultsStore
 
         if (!LmStudioPerModelDefaultsCompatibility.IsSupportedVersion(lmStudioVersion))
         {
-            throw new NotSupportedException($"LM Studio {lmStudioVersion ?? "unknown"} 的 per-model defaults 格式未经验证；当前仅支持 {LmStudioPerModelDefaultsCompatibility.SupportedVersionFamilies}。");
+            throw new NotSupportedException($"LM Studio {lmStudioVersion ?? "unknown"} 低于 per-model defaults 受支持的最低版本 {LmStudioPerModelDefaultsCompatibility.MinimumSupportedVersion}；更高版本是否兼容由 defaults 文件结构校验决定。");
         }
     }
 
+    /// <summary>校验 concrete model identifier：相对路径、段合法（无 ./.. 与非法字符）、末段以 .gguf 结尾。</summary>
     private static string[] ValidateConcreteIdentifier(string value)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(value);
@@ -758,14 +783,17 @@ public sealed class LmStudioPerModelDefaultsStore
         return segments;
     }
 
+    /// <summary>归一化 concrete model identifier（反斜杠统一为正斜杠）。</summary>
     private static string NormalizeConcreteIdentifier(string value) => string.Join('/', ValidateConcreteIdentifier(value));
 
+    /// <summary>判断路径是否位于根目录之下（忽略大小写）。</summary>
     private static bool IsUnderRoot(string path, string root)
     {
         string fullRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
         return path.StartsWith(fullRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>确保目标路径的现有祖先不含 reparse point/junction，防止写入被重定向。</summary>
     private static void EnsureNoReparsePoints(string targetPath)
     {
         string fullPath = Path.GetFullPath(targetPath);
@@ -792,6 +820,7 @@ public sealed class LmStudioPerModelDefaultsStore
         }
     }
 
+    /// <summary>尝试把 JSON 节点读为非 null 字符串。</summary>
     private static bool TryGetString(JsonNode? node, out string value)
     {
         if (node is JsonValue jsonValue && jsonValue.TryGetValue(out string? result) && result is not null)
@@ -804,30 +833,42 @@ public sealed class LmStudioPerModelDefaultsStore
         return false;
     }
 
+    /// <summary>解析 LM Studio 默认根目录：~/.lmstudio/.internal/user-concrete-model-default-config。</summary>
     private static string ResolveDefaultRoot()
     {
         string profile = Environment.GetEnvironmentVariable("USERPROFILE") ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         return Path.Combine(Path.GetFullPath(profile), ".lmstudio", ".internal", "user-concrete-model-default-config");
     }
 
+    /// <summary>稳定读取的文件快照（字节 + 指纹）。</summary>
     private sealed record StableFileSnapshot(byte[] Bytes, FileFingerprint Fingerprint);
+
+    /// <summary>promptTemplate 字段定位结果：索引、节点深拷贝与模板文本。</summary>
     private sealed record PromptField(int Index, JsonObject? Field, string? Template);
 }
 
+/// <summary>备份字节保护器抽象（加密/解密）。</summary>
 internal interface ILmStudioDefaultsProtector
 {
+    /// <summary>加密明文字节。</summary>
     byte[] Protect(byte[] plaintext);
+
+    /// <summary>解密密文字节。</summary>
     byte[] Unprotect(byte[] ciphertext);
 }
 
+/// <summary>基于 Windows CurrentUser DPAPI 的备份保护器；非缓冲内存用完即清零。</summary>
 internal sealed class WindowsCurrentUserDpapiProtector : ILmStudioDefaultsProtector
 {
     private const int CryptProtectUiForbidden = 0x1;
 
+    /// <summary>DPAPI 加密。</summary>
     public byte[] Protect(byte[] plaintext) => Transform(plaintext, protect: true);
 
+    /// <summary>DPAPI 解密。</summary>
     public byte[] Unprotect(byte[] ciphertext) => Transform(ciphertext, protect: false);
 
+    /// <summary>DPAPI 加解密核心：非托管内存搬运，输出复制后立即释放，输入缓冲用完清零。</summary>
     private static byte[] Transform(byte[] input, bool protect)
     {
         ArgumentNullException.ThrowIfNull(input);
@@ -865,6 +906,7 @@ internal sealed class WindowsCurrentUserDpapiProtector : ILmStudioDefaultsProtec
         }
         finally
         {
+            // 输入缓冲清零后释放，避免明文残留
             if (input.Length > 0)
             {
                 byte[] zeros = new byte[input.Length];
@@ -875,6 +917,7 @@ internal sealed class WindowsCurrentUserDpapiProtector : ILmStudioDefaultsProtec
         }
     }
 
+    /// <summary>CRYPTOAPI_BLOB 的托管映射。</summary>
     [StructLayout(LayoutKind.Sequential)]
     private readonly struct DataBlob(int length, IntPtr data)
     {

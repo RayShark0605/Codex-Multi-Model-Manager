@@ -11,6 +11,7 @@ using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Tests;
 
+/// <summary>LM Studio 实例控制器的事务生命周期测试：持久化备份失败、失败证据、恢复评估与重试和解等场景。</summary>
 public sealed class LmStudioInstanceControllerTests
 {
     [Fact]
@@ -46,7 +47,11 @@ public sealed class LmStudioInstanceControllerTests
                 throw new TaskCanceledException("evidence internal timeout");
             }
             HttpResponseMessage response = await send();
-            if (request.RequestUri!.AbsolutePath.EndsWith("/load", StringComparison.Ordinal) && !response.IsSuccessStatusCode) failNextModels = true;
+            if (request.RequestUri!.AbsolutePath.EndsWith("/load", StringComparison.Ordinal) && !response.IsSuccessStatusCode)
+            {
+                failNextModels = true;
+            }
+
             return response;
         }), new ThrowingLifecycleLogger());
         LmStudioLoadedInstanceSnapshot original = await fixture.Controller.CaptureAsync(ControllerFixture.OriginalInstanceId);
@@ -77,7 +82,11 @@ public sealed class LmStudioInstanceControllerTests
                 return StubHttpHandler.Json("{}", HttpStatusCode.ServiceUnavailable);
             }
             HttpResponseMessage response = await send();
-            if (path.EndsWith("/load", StringComparison.Ordinal) && ++loads == 2) failOriginalProbe = true;
+            if (path.EndsWith("/load", StringComparison.Ordinal) && ++loads == 2)
+            {
+                failOriginalProbe = true;
+            }
+
             return response;
         }));
         LmStudioLoadedInstanceSnapshot original = await fixture.Controller.CaptureAsync(ControllerFixture.OriginalInstanceId);
@@ -146,7 +155,11 @@ public sealed class LmStudioInstanceControllerTests
         {
             if (request.RequestUri!.AbsolutePath.EndsWith("/unload", StringComparison.Ordinal) && ++unloadRequests == 1)
             {
-                if (responseLostAfterSuccess) (await send()).Dispose();
+                if (responseLostAfterSuccess)
+                {
+                    (await send()).Dispose();
+                }
+
                 return StubHttpHandler.Json("{}", HttpStatusCode.ServiceUnavailable);
             }
             return await send();
@@ -281,11 +294,7 @@ public sealed class LmStudioInstanceControllerTests
         LmStudioTemplateRepairPlan plan = fixture.CreatePlan(original) with
         {
             FailureCode = CompatibilityFailureCodes.LmStudioChatTemplateContinuationInstructionOrder,
-            OriginalRuntimeTemplate = new LmStudioRuntimeTemplateProvenance(
-                LmStudioRuntimeTemplateMode.ManagerRule,
-                PromptTemplateRepairService.LegacyLeadingRuleVersion,
-                ControllerFixture.HashTemplate(ControllerFixture.LegacyV2Template),
-                Guid.NewGuid()),
+            OriginalRuntimeTemplate = new LmStudioRuntimeTemplateProvenance(LmStudioRuntimeTemplateMode.ManagerRule, PromptTemplateRepairService.LegacyLeadingRuleVersion, ControllerFixture.HashTemplate(ControllerFixture.LegacyV2Template), Guid.NewGuid()),
             OriginalHierarchyProbe = ControllerFixture.V2FailureProbe(),
             OriginalRuntimeTemplateText = ControllerFixture.LegacyV2Template,
         };
@@ -952,6 +961,9 @@ public sealed class LmStudioInstanceControllerTests
     [InlineData("0.4.23")]
     [InlineData("0.4.23.0")]
     [InlineData("0.4.23+1")]
+    [InlineData("0.4.24.0")]
+    [InlineData("0.4.25.0")]
+    [InlineData("0.5.0")]
     public async Task SchemaV4SupportedVersionsJournalRoundTripAndComplete(string version)
     {
         using var fixture = new ControllerFixture(hierarchyPasses: true, lmStudioVersion: version);
@@ -976,10 +988,9 @@ public sealed class LmStudioInstanceControllerTests
     }
 
     [Theory]
-    [InlineData("0.4.22.0")]
+    [InlineData("0.4.20.0")]
+    [InlineData("0.4.9")]
     [InlineData("0.4.23-alpha")]
-    [InlineData("0.4.24.0")]
-    [InlineData("0.5.0")]
     public async Task UnsupportedPersistenceVersionsLeaveDefaultsJournalsAndLoadedStateUntouched(string version)
     {
         using var fixture = new ControllerFixture(hierarchyPasses: true, lmStudioVersion: version);
@@ -1523,6 +1534,7 @@ public sealed class LmStudioInstanceControllerTests
         }
     }
 
+    /// <summary>LM Studio 生命周期 HTTP 桩：模拟 models/unload/load/responses 接口，支持多种失败与回显形态。</summary>
     private sealed class LifecycleHandler(
         bool hierarchyPasses,
         bool firstLoadOmitsConfig,
