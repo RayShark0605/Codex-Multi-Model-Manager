@@ -94,7 +94,7 @@ public sealed class SwitchMatrixTests
         SwitchPlan localPlan = await harness.Service.CreatePlanAsync(harness.Request(ProviderKind.LmStudio));
         string localCandidate = Encoding.UTF8.GetString(Assert.Single(localPlan.Files).CandidateBytes!).Replace("\r\n", "\n", StringComparison.Ordinal);
         Assert.Contains(providerTable, localCandidate, StringComparison.Ordinal);
-        Assert.Contains("model_provider = \"lmstudio\"", localCandidate, StringComparison.Ordinal);
+        Assert.Contains("model_provider = \"lmstudio_local_cmm\"", localCandidate, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -369,7 +369,7 @@ public sealed class SwitchMatrixTests
 
         Assert.Equal(2, harness.Preflight.CallCount);
         Assert.True(Directory.Exists(harness.Backups.BackupRoot));
-        Assert.Contains("model_provider = \"lmstudio\"", harness.ReadConfig(), StringComparison.Ordinal);
+        Assert.Contains("model_provider = \"lmstudio_local_cmm\"", harness.ReadConfig(), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -407,6 +407,71 @@ public sealed class SwitchMatrixTests
         Assert.Contains("[model_providers.lmstudio_local_cmm.auth]", candidate, StringComparison.Ordinal);
         Assert.DoesNotContain("[model_providers.lmstudio]", candidate, StringComparison.Ordinal);
         Assert.DoesNotContain("lm-test", candidate, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DefaultLoopbackLmStudioAlwaysUsesCustomProviderTableWithStreamResilienceKeys()
+    {
+        using var harness = new SwitchHarness(SwitchHarness.BaseConfig);
+        SwitchPlan plan = await harness.Service.CreatePlanAsync(harness.Request(ProviderKind.LmStudio));
+        string candidate = Encoding.UTF8.GetString(plan.Files.Single().CandidateBytes!).Replace("\r\n", "\n", StringComparison.Ordinal);
+        Assert.Contains("model_provider = \"lmstudio_local_cmm\"", candidate, StringComparison.Ordinal);
+        Assert.Contains("[model_providers.lmstudio_local_cmm]", candidate, StringComparison.Ordinal);
+        Assert.Contains("name = \"LM Studio Local\"", candidate, StringComparison.Ordinal);
+        Assert.Contains("base_url = \"http://127.0.0.1:1234/v1\"", candidate, StringComparison.Ordinal);
+        Assert.Contains("wire_api = \"responses\"", candidate, StringComparison.Ordinal);
+        Assert.Contains(LmStudioStreamResilience.TableBody, candidate, StringComparison.Ordinal);
+        Assert.DoesNotContain("[model_providers.lmstudio]", candidate, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task BuiltinLmStudioProviderIdIsRejectedBecauseItCannotBeOverridden()
+    {
+        using var harness = new SwitchHarness(SwitchHarness.BaseConfig);
+        SwitchRequest request = harness.Request(ProviderKind.LmStudio) with { LmStudioProviderId = "lmstudio" };
+
+        InvalidOperationException error = await Assert.ThrowsAsync<InvalidOperationException>(() => harness.Service.CreatePlanAsync(request));
+        Assert.Contains("无法被 config.toml 覆盖", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void LmStudioStreamResilienceTableBodyMatchesConstants()
+    {
+        Assert.Equal(
+            LmStudioStreamResilience.TableBody,
+            $"stream_idle_timeout_ms = {LmStudioStreamResilience.StreamIdleTimeoutMs}\nstream_max_retries = {LmStudioStreamResilience.StreamMaxRetries}\nrequest_max_retries = {LmStudioStreamResilience.RequestMaxRetries}");
+    }
+
+    [Fact]
+    public async Task AuthenticatedCustomLmStudioPlacesStreamKeysBeforeAuthSubtable()
+    {
+        using var harness = new SwitchHarness(SwitchHarness.BaseConfig);
+        SwitchRequest request = harness.Request(ProviderKind.LmStudio) with
+        {
+            LmStudioEndpoint = new Uri("http://127.0.0.1:5678"),
+            LmStudioRequiresAuthentication = true,
+        };
+
+        SwitchPlan plan = await harness.Service.CreatePlanAsync(request);
+        string candidate = Encoding.UTF8.GetString(plan.Files.Single().CandidateBytes!).Replace("\r\n", "\n", StringComparison.Ordinal);
+        int authIndex = candidate.IndexOf("[model_providers.lmstudio_local_cmm.auth]", StringComparison.Ordinal);
+        int keysIndex = candidate.IndexOf(LmStudioStreamResilience.TableBody, StringComparison.Ordinal);
+        Assert.True(authIndex > keysIndex && keysIndex >= 0, "流韧性键必须位于 auth 子表之前的主表键区。");
+    }
+
+    [Fact]
+    public async Task SwitchingAwayFromLmStudioRemovesProviderTableAndStreamKeys()
+    {
+        using var harness = new SwitchHarness(SwitchHarness.BaseConfig);
+        SwitchPlan localPlan = await harness.Service.CreatePlanAsync(harness.Request(ProviderKind.LmStudio));
+        await harness.Service.CommitAsync(localPlan);
+
+        SwitchPlan openAiPlan = await harness.Service.CreatePlanAsync(harness.Request(ProviderKind.OpenAI));
+        string candidate = Encoding.UTF8.GetString(openAiPlan.Files.Single().CandidateBytes!);
+        Assert.DoesNotContain("[model_providers.lmstudio_local_cmm]", candidate, StringComparison.Ordinal);
+        Assert.DoesNotContain("stream_idle_timeout_ms", candidate, StringComparison.Ordinal);
+        Assert.DoesNotContain("stream_max_retries", candidate, StringComparison.Ordinal);
+        Assert.DoesNotContain("request_max_retries", candidate, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -530,7 +595,7 @@ public sealed class SwitchMatrixTests
         {
             ProviderKind.OpenAI => root,
             ProviderKind.DeepSeek => root.Replace("model = \"gpt-old\"", "model = \"deepseek-v4-pro\"\nmodel_provider = \"deepseek\"", StringComparison.Ordinal) + "\n[model_providers.deepseek]\nname = \"deepseek\"\nbase_url = \"https://api.deepseek.com/\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"sk-fixture-secret\"\n",
-            ProviderKind.LmStudio => root.Replace("model = \"gpt-old\"", "model = \"qwen/local@q6\"\nmodel_provider = \"lmstudio\"\nmodel_context_window = 65536\nmodel_auto_compact_token_limit = 57344", StringComparison.Ordinal),
+            ProviderKind.LmStudio => root.Replace("model = \"gpt-old\"", "model = \"qwen/local@q6\"\nmodel_provider = \"lmstudio_local_cmm\"\nmodel_context_window = 65536\nmodel_auto_compact_token_limit = 57344", StringComparison.Ordinal),
             ProviderKind.GLM => root.Replace("model = \"gpt-old\"", "model = \"glm-5.3\"\nmodel_provider = \"ZAI\"", StringComparison.Ordinal) + "\n[model_providers.ZAI]\nname = \"ZAI\"\nbase_url = \"https://open.bigmodel.cn/api/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"glm-fixture-secret\"\n",
             _ => root,
         };
@@ -540,7 +605,7 @@ public sealed class SwitchMatrixTests
     {
         ProviderKind.OpenAI => "openai",
         ProviderKind.DeepSeek => "deepseek",
-        ProviderKind.LmStudio => "lmstudio",
+        ProviderKind.LmStudio => "lmstudio_local_cmm",
         ProviderKind.GLM => "ZAI",
         _ => "unknown",
     };

@@ -94,6 +94,7 @@ public sealed class TomlConfigPatchEngine : IConfigPatchEngine
         }
 
         IReadOnlyList<string>[] removalSegments = tablesToRemove.Select(TomlDottedKey.ParseSegments).ToArray();
+        bool removedTrailingTable = false;
         foreach (TomlSourceTable table in parsed.Tables)
         {
             if (!removalSegments.Any(segments => TomlSourceDocument.IsSameOrDescendant(table.Segments, segments)))
@@ -102,6 +103,10 @@ public sealed class TomlConfigPatchEngine : IConfigPatchEngine
             }
 
             edits.Add(new TextEdit(table.Start, table.Length, string.Empty));
+            if (string.IsNullOrWhiteSpace(originalText[(table.Start + table.Length)..]))
+            {
+                removedTrailingTable = true;
+            }
         }
 
         List<string> tableInsertions = [];
@@ -112,7 +117,7 @@ public sealed class TomlConfigPatchEngine : IConfigPatchEngine
             {
                 if (oldBody is not null)
                 {
-                    mutations.Add(new ConfigMutation($"[{table}]", ConfigMutationKind.Remove, "<managed table>", null, ContainsSecret(oldBody)));
+                    mutations.Add(new ConfigMutation($"[{table}]", ConfigMutationKind.Remove, DisplayTableBody(oldBody), null, ContainsSecret(oldBody)));
                 }
 
                 continue;
@@ -123,11 +128,20 @@ public sealed class TomlConfigPatchEngine : IConfigPatchEngine
             ConfigMutationKind kind = oldBody is null ? ConfigMutationKind.Add : ConfigMutationKind.Change;
             if (oldBody is null || NormalizeBody(oldBody, "\n") != NormalizeBody(body, "\n"))
             {
-                mutations.Add(new ConfigMutation($"[{table}]", kind, oldBody is null ? null : "<managed table>", "<managed table>", ContainsSecret(body)));
+                mutations.Add(new ConfigMutation($"[{table}]", kind, oldBody is null ? null : DisplayTableBody(oldBody), DisplayTableBody(body), ContainsSecret(body)));
             }
         }
 
         string candidate = ApplyEdits(originalText, edits);
+        // 末尾表被删除后收敛尾部空行，避免残留追加表时使用的分隔空行
+        if (removedTrailingTable)
+        {
+            candidate = candidate.TrimEnd('\r', '\n');
+            if (parsed.HasTrailingNewLine)
+            {
+                candidate += newLine;
+            }
+        }
         // 表插入统一追加在文末，保证与现有内容之间隔一个空行，末尾换行与原文风格一致
         if (tableInsertions.Count > 0)
         {
@@ -212,6 +226,9 @@ public sealed class TomlConfigPatchEngine : IConfigPatchEngine
 
         return builder.ToString();
     }
+
+    /// <summary>变更明细里的表体展示值：敏感表体掩码，其余直出真实键值（换行归一为 \n）。</summary>
+    private static string DisplayTableBody(string body) => ContainsSecret(body) ? "<managed table>" : NormalizeBody(body, "\n");
 
     /// <summary>把表体换行统一为目标风格（先全部归一为 \n，去首尾空行，再替换）。</summary>
     private static string NormalizeBody(string body, string newLine)

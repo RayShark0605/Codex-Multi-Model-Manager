@@ -2380,8 +2380,9 @@ internal sealed class MainController : IDisposable
                 ? ConfigurationSwitchService.SuggestAutoCompact(context.Value)
                 : (int)form.LmStudio.AutoCompactInput.Value;
             toolOutput = ConfigurationSwitchService.SuggestToolOutputLimit(context.Value);
-            bool redirected = Environment.GetEnvironmentVariables().Keys.Cast<object>().Select(key => key.ToString()).Any(key => key?.StartsWith("CODEX_OSS_", StringComparison.OrdinalIgnoreCase) == true);
-            lmProvider = endpoint.IsLoopback && endpoint.Port == 1234 && !lmRequiresAuthentication && !redirected ? "lmstudio" : "lmstudio_local_cmm";
+            // 内置 lmstudio ID 无法被 config.toml 覆盖（Codex 源码对非 Bedrock 内置 ID 一律 or_insert），
+            // 流韧性键只能写入自建表，因此 LM Studio 一律使用 lmstudio_local_cmm。
+            lmProvider = "lmstudio_local_cmm";
         }
         else if (provider == ProviderKind.OpenAI)
         {

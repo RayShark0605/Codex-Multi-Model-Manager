@@ -154,8 +154,12 @@ public sealed class CodexSmokeTestService
         }
         else
         {
-            // LM Studio：provider 固定为 lmstudio 时不写表（CLI 内建），否则写入显式表
-            string provider = request.LmStudioProviderId ?? "lmstudio";
+            // LM Studio：一律使用 lmstudio_local_cmm（内置 ID 不可被 config.toml 覆盖），按需带凭据命令
+            string provider = request.LmStudioProviderId ?? "lmstudio_local_cmm";
+            if (provider == "lmstudio")
+            {
+                throw new InvalidOperationException("Codex 内置 lmstudio Provider 无法被 config.toml 覆盖；冒烟测试必须使用 lmstudio_local_cmm。");
+            }
             builder.Append("model_provider = ").AppendLine(JsonSerializer.Serialize(provider));
             if (request.ContextWindow is int context)
             {
@@ -177,20 +181,17 @@ public sealed class CodexSmokeTestService
                 builder.Append("tool_output_token_limit = ").AppendLine(toolOutput.ToString(System.Globalization.CultureInfo.InvariantCulture));
             }
 
-            if (provider != "lmstudio")
+            Uri endpoint = request.LmStudioEndpoint ?? new Uri("http://127.0.0.1:1234");
+            if (!endpoint.AbsoluteUri.EndsWith('/'))
             {
-                Uri endpoint = request.LmStudioEndpoint ?? new Uri("http://127.0.0.1:1234");
-                if (!endpoint.AbsoluteUri.EndsWith('/'))
-                {
-                    endpoint = new Uri(endpoint.AbsoluteUri + "/");
-                }
+                endpoint = new Uri(endpoint.AbsoluteUri + "/");
+            }
 
-                string table = "model_providers." + provider;
-                builder.AppendLine().Append('[').Append(table).AppendLine("]").AppendLine("name = \"LM Studio Local\"").Append("base_url = ").AppendLine(JsonSerializer.Serialize(new Uri(endpoint, "v1").AbsoluteUri.TrimEnd('/'))).AppendLine("wire_api = \"responses\"");
-                if (request.LmStudioRequiresAuthentication)
-                {
-                    builder.AppendLine().Append('[').Append(table).AppendLine(".auth]").Append("command = ").AppendLine(JsonSerializer.Serialize(Path.GetFullPath(credentialHelperPath))).Append("args = [").Append(JsonSerializer.Serialize(CredentialNames.LmStudio)).AppendLine("]");
-                }
+            string table = "model_providers." + provider;
+            builder.AppendLine().Append('[').Append(table).AppendLine("]").AppendLine("name = \"LM Studio Local\"").Append("base_url = ").AppendLine(JsonSerializer.Serialize(new Uri(endpoint, "v1").AbsoluteUri.TrimEnd('/'))).AppendLine("wire_api = \"responses\"").AppendLine(LmStudioStreamResilience.TableBody.Replace("\n", Environment.NewLine, StringComparison.Ordinal));
+            if (request.LmStudioRequiresAuthentication)
+            {
+                builder.AppendLine().Append('[').Append(table).AppendLine(".auth]").Append("command = ").AppendLine(JsonSerializer.Serialize(Path.GetFullPath(credentialHelperPath))).Append("args = [").Append(JsonSerializer.Serialize(CredentialNames.LmStudio)).AppendLine("]");
             }
         }
 

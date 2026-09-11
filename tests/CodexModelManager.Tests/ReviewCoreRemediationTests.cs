@@ -330,6 +330,6 @@ public sealed class ReviewCoreRemediationTests
         ProviderKind.LmStudio,
         "fixture@loaded",
         ContextWindow: context,
-        LmStudioProviderId: "lmstudio",
+        LmStudioProviderId: "lmstudio_local_cmm",
         LmStudioEndpoint: new Uri("http://127.0.0.1:1234"));
 }

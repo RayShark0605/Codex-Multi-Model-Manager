@@ -196,7 +196,7 @@ internal sealed class SwitchHarness : IDisposable
         ProviderKind.OpenAI => new SwitchRequest(provider, "gpt-5.6-sol", "max"),
         ProviderKind.DeepSeek => new SwitchRequest(provider, "deepseek-v4-pro", "high", CredentialHelperPath: HelperPath, DeepSeekCatalogPath: CatalogPath),
         ProviderKind.GLM => new SwitchRequest(provider, "glm-5.3", null, CredentialHelperPath: HelperPath, GlmPlatform: GlmPlatform.BigModel, GlmCatalogPath: GlmCatalogPath),
-        ProviderKind.LmStudio => new SwitchRequest(provider, "qwen/local@q6", null, 65_536, ConfigurationSwitchService.SuggestAutoCompact(65_536), LmStudioProviderId: "lmstudio", LmStudioEndpoint: new Uri("http://127.0.0.1:1234"), CredentialHelperPath: HelperPath, ToolOutputTokenLimit: ConfigurationSwitchService.SuggestToolOutputLimit(65_536), AutoCompactMode: AutoCompactMode.Automatic),
+        ProviderKind.LmStudio => new SwitchRequest(provider, "qwen/local@q6", null, 65_536, ConfigurationSwitchService.SuggestAutoCompact(65_536), LmStudioProviderId: "lmstudio_local_cmm", LmStudioEndpoint: new Uri("http://127.0.0.1:1234"), CredentialHelperPath: HelperPath, ToolOutputTokenLimit: ConfigurationSwitchService.SuggestToolOutputLimit(65_536), AutoCompactMode: AutoCompactMode.Automatic),
         _ => throw new ArgumentOutOfRangeException(nameof(provider)),
     };
 

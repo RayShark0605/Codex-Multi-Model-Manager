@@ -2,6 +2,7 @@ using System.Text;
 using CodexModelManager.Core.Abstractions;
 using CodexModelManager.Core.Codex;
 using CodexModelManager.Core.Infrastructure;
+using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Tests;
 
@@ -57,6 +58,35 @@ public sealed class ConfigPatchEngineTests
         ConfigPatchResult result = engine.Apply(string.Empty, new ConfigPatchRequest(new Dictionary<string, string?> { ["model"] = "\"gpt-5.6-sol\"" }, new Dictionary<string, string?>()));
         engine.Validate(result.Text);
         Assert.Contains("model = \"gpt-5.6-sol\"", result.Text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void NonSecretProviderTableMutationShowsRealBody()
+    {
+        string body = "name = \"LM Studio Local\"\nbase_url = \"http://127.0.0.1:1234/v1\"\nwire_api = \"responses\"\n" + LmStudioStreamResilience.TableBody;
+        ConfigPatchResult result = engine.Apply("model = \"old\"\n", new ConfigPatchRequest(
+            new Dictionary<string, string?>(),
+            new Dictionary<string, string?> { ["model_providers.lmstudio_local_cmm"] = body }));
+
+        ConfigMutation mutation = Assert.Single(result.Mutations);
+        Assert.Equal("[model_providers.lmstudio_local_cmm]", mutation.KeyPath);
+        Assert.Null(mutation.OldValue);
+        Assert.Equal(body, mutation.NewValue);
+        Assert.False(mutation.IsSecret);
+    }
+
+    [Fact]
+    public void SecretProviderTableMutationStaysMasked()
+    {
+        const string secretBody = "name = \"ZAI\"\nbase_url = \"https://open.bigmodel.cn/api/v1\"\nexperimental_bearer_token = \"sk-fixture-secret\"";
+        ConfigPatchResult result = engine.Apply("model = \"old\"\n", new ConfigPatchRequest(
+            new Dictionary<string, string?>(),
+            new Dictionary<string, string?> { ["model_providers.ZAI"] = secretBody }));
+
+        ConfigMutation mutation = Assert.Single(result.Mutations);
+        Assert.Equal("<managed table>", mutation.NewValue);
+        Assert.True(mutation.IsSecret);
+        Assert.DoesNotContain("sk-fixture-secret", mutation.NewValue, StringComparison.Ordinal);
     }
 
     [Fact]

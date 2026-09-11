@@ -1,6 +1,45 @@
 # Final Verification
 
-主验证日期：2026-08-22；最新增量验证：2026-09-10（Asia/Shanghai）。
+主验证日期：2026-08-22；最新增量验证：2026-09-11（Asia/Shanghai）。
+
+## 2026-09-11：LM Studio 流韧性键（一律 lmstudio_local_cmm + 三键注入）
+
+### 本轮范围与结论
+
+起因：用户把 Codex 模型切换到 LM Studio 本地模型后，自动压缩上下文时反复出现"重新连接"——本地大模型长 prefill 期间无 SSE 事件，超过 Codex 默认 `stream_idle_timeout_ms = 300000`（5 分钟）被判流失活并重发 sampling request。
+
+依据链（一手来源）：官方 Configuration Reference 与 `codex-rs/core/config.schema.json` 确认 `request_max_retries` / `stream_idle_timeout_ms` / `stream_max_retries` 只存在于 `ModelProviderInfo`（provider 表内，无顶层形式），官方默认 4 / 300000 / 5；codex-rs 源码 `merge_configured_model_providers` 对非 Bedrock 内置 ID（openai/ollama/lmstudio）一律 `or_insert` 且文档注释明言 "Built-in providers are not generally overridable"——用户写入的 `[model_providers.lmstudio]` 被静默忽略。内置 lmstudio 定义（`http://localhost:1234/v1` + Responses + 无认证 + 重试/超时全默认）与自建表内容等价，改走 custom provider 无功能损失。
+
+实现：LM Studio 切换一律使用 `lmstudio_local_cmm`（含默认 1234、无认证场景；MainController 不再按端口/认证/CODEX_OSS 选择内置 ID，`ConfigureLmStudio` 与 Level 3 冒烟入口对内置 ID 直接抛错），表内固定写入 `stream_idle_timeout_ms = 2000000`、`stream_max_retries = 2`、`request_max_retries = 2`（集中在 `LmStudioStreamResilience`，`TableBody` 与常量有同步测试锁定）；带认证时三键位于 `.auth` 子表之前的主表键区；切离 LM Studio 随 Provider 表清理。撤销了对 `model_providers.lmstudio` 表的纳管（永不写入）；用户手写的该表对 Codex 无效，管理器原样保留不清理。
+
+附带修复：Preview/semantic diff 对非敏感 Provider 表体直出真实键值（含 token/secret 的表体继续 `<managed table>` 掩码，`IsSecret` 走 `<redacted>`），三键在预览中可见；TOML 补丁引擎删除位于文件末尾的纳管表时收敛残留分隔空行并保持原文换行风格（多表连续删除、表+同批插入、无尾换行等边界经测试覆盖）。
+
+本轮**没有写入真实 `~/.codex/config.toml`**，没有执行真实模型重载/推理，没有执行真实 Codex CLI 请求；live LM Studio 集成测试仍 opt-in SKIP。
+
+### 自动化验证
+
+| 检查 | 结果 |
+|---|---|
+| Core Release 全量（publish.ps1 内） | **513 PASS / 0 FAIL / 8 现场 opt-in SKIP**（相对 2026-09-10 基线 +7：新增默认端口无认证走自建表、内置 ID 拒绝、TableBody 常量同步、流键位于 auth 子表前、切离清理、非敏感表体直出、敏感表体掩码） |
+| App Release 隔离 STA（publish.ps1 内） | **27 PASS / 0 FAIL / 0 SKIP** |
+| Debug / Release build | **均 PASS，0 warning / 0 error** |
+| `dotnet format --verify-no-changes --no-restore` | **PASS** |
+| `git diff --check` | **PASS** |
+
+### 发布工件
+
+ProductVersion/SourceIdentity：`2037d379da33192e0c428885a2321213c0b785ff.content-648149716310ecb2bff0ad6e4c5896b515eceb6a0f04471a4c6b71469f6f9426`（完整值见 `source-manifest.json`；旧版保留为 `artifacts/publish/win-x64.previous-192439b40f8c40619a5d41aa1f2e457f`）。
+
+| 文件（相对仓库根目录） | Bytes | SHA-256 |
+|---|---:|---|
+| `artifacts/publish/win-x64/CodexModelManager.exe` | 72,072,435 | `0CABCDCD4810FF47F569B2DCD5C6B89171F87ADFC368E4DE4358C88F488ED023` |
+| `artifacts/publish/win-x64/helpers/credential/CodexModelManager.CredentialHelper.exe` | 35,508,903 | `EE660139D7B62CDB1FA88BA8BF38D9797F2D5938F2EA60929E0E5877710127A5` |
+| `artifacts/publish/win-x64/helpers/mcp/CodexModelManager.TestMcpServer.exe` | 35,096,757 | `B6F1AEC42F2EB4E1A77E1B77F8EB96FD1FCABB98C9CE288C0688AE64881B4916` |
+
+### 未验证边界
+
+- 真实 Codex CLI/Desktop 对自建 `lmstudio_local_cmm` 表 + 三键的端到端行为未实测（单测只验证管理器写入的内容与语义）；建议用户下次切换后执行一次 Level 3 冒烟测试确认，异常时可用 Initial Snapshot/History 完全回退。
+- `stream_idle_timeout_ms = 2000000` / `stream_max_retries = 2` / `request_max_retries = 2` 的取值为用户确认值，未针对不同模型规模做参数化实测。
 
 ## 2026-09-10：LM Studio per-model defaults 版本门改为下限 + 结构校验兜底
 

@@ -631,8 +631,16 @@ public sealed class ConfigurationSwitchService
             warnings.Add($"手动 Auto Compact {compact:N0} 高于平衡策略建议值 {suggestedCompact:N0}；本次仍允许切换，但仅剩 {context - compact:N0} tokens 硬窗口余量。");
         }
 
-        string providerId = request.LmStudioProviderId ?? "lmstudio";
-        if (providerId is not ("lmstudio" or "lmstudio_local_cmm"))
+        // Codex 源码 merge_configured_model_providers 对非 Bedrock 内置 ID（openai/ollama/lmstudio）
+        // 一律 or_insert：用户定义的 [model_providers.lmstudio] 会被静默忽略，内置定义永远获胜，
+        // 因此流韧性键只能写入自建表，LM Studio 一律使用 lmstudio_local_cmm。
+        string providerId = request.LmStudioProviderId ?? "lmstudio_local_cmm";
+        if (providerId == "lmstudio")
+        {
+            throw new InvalidOperationException("Codex 内置 lmstudio Provider 无法被 config.toml 覆盖，流韧性键不会生效；LM Studio 必须使用 lmstudio_local_cmm。");
+        }
+
+        if (providerId != "lmstudio_local_cmm")
         {
             throw new InvalidOperationException("LM Studio provider ID 不受支持。");
         }
@@ -660,36 +668,32 @@ public sealed class ConfigurationSwitchService
         roots["forced_login_method"] = null;
         roots["preferred_auth_method"] = null;
         roots["openai_base_url"] = null;
-        string? lmStudioTablePath = providerId != "lmstudio" ? "model_providers." + providerId : null;
-        RemoveOrPreserveOfficialBearerTables(read, tables, removeTables, lmStudioTablePath is null ? [] : [lmStudioTablePath], warnings, "切换到 LM Studio 时");
+        string lmStudioTablePath = "model_providers." + providerId;
+        RemoveOrPreserveOfficialBearerTables(read, tables, removeTables, [lmStudioTablePath], warnings, "切换到 LM Studio 时");
 
-        // provider 固定为 lmstudio 时无需显式表（CLI 内建），否则写入本地表（按需带凭据命令）
-        if (providerId != "lmstudio")
+        // 流韧性键只能放在 model_providers 表内才会生效，否则长 prefill 会被默认 5 分钟空闲超时判死并重试。
+        Uri endpoint = request.LmStudioEndpoint.AbsoluteUri.EndsWith('/') ? request.LmStudioEndpoint : new Uri(request.LmStudioEndpoint.AbsoluteUri + "/");
+        string baseUrl = new Uri(endpoint, "v1").AbsoluteUri.TrimEnd('/');
+        if (request.LmStudioRequiresAuthentication)
         {
-            string tablePath = "model_providers." + providerId;
-            Uri endpoint = request.LmStudioEndpoint.AbsoluteUri.EndsWith('/') ? request.LmStudioEndpoint : new Uri(request.LmStudioEndpoint.AbsoluteUri + "/");
-            string baseUrl = new Uri(endpoint, "v1").AbsoluteUri.TrimEnd('/');
-            if (request.LmStudioRequiresAuthentication)
+            if (string.IsNullOrWhiteSpace(request.CredentialHelperPath) || !File.Exists(request.CredentialHelperPath))
             {
-                if (string.IsNullOrWhiteSpace(request.CredentialHelperPath) || !File.Exists(request.CredentialHelperPath))
-                {
-                    throw new InvalidOperationException("Credential Helper 尚未安装。");
-                }
-
-                if (!secretStore.Exists(CredentialNames.LmStudio))
-                {
-                    throw new InvalidOperationException("LM Studio 返回 401，但尚未保存 Token。");
-                }
-
-                tables[tablePath] = BuildCommandProviderBody(tablePath, "LM Studio Local", baseUrl, request.CredentialHelperPath, CredentialNames.LmStudio);
-            }
-            else
-            {
-                tables[tablePath] = $"name = {Quote("LM Studio Local")}\nbase_url = {Quote(baseUrl)}\nwire_api = \"responses\"";
+                throw new InvalidOperationException("Credential Helper 尚未安装。");
             }
 
-            removeTables.RemoveAll(table => table == tablePath);
+            if (!secretStore.Exists(CredentialNames.LmStudio))
+            {
+                throw new InvalidOperationException("LM Studio 返回 401，但尚未保存 Token。");
+            }
+
+            tables[lmStudioTablePath] = BuildCommandProviderBody(lmStudioTablePath, "LM Studio Local", baseUrl, request.CredentialHelperPath, CredentialNames.LmStudio, LmStudioStreamResilience.TableBody);
         }
+        else
+        {
+            tables[lmStudioTablePath] = $"name = {Quote("LM Studio Local")}\nbase_url = {Quote(baseUrl)}\nwire_api = \"responses\"\n" + LmStudioStreamResilience.TableBody;
+        }
+
+        removeTables.RemoveAll(table => table == lmStudioTablePath);
 
         warnings.Add("本地模型未生成或复制 GPT/DeepSeek metadata；未被实测的 Plan/Goal/MCP 等能力保持 Untested。Auto Compact 为管理器安全建议值。");
         if (request.TargetSupportsToolUse == false)
@@ -960,7 +964,7 @@ public sealed class ConfigurationSwitchService
         {
             ProviderKind.OpenAI => "openai",
             ProviderKind.DeepSeek => "deepseek",
-            ProviderKind.LmStudio => request.LmStudioProviderId ?? "lmstudio",
+            ProviderKind.LmStudio => request.LmStudioProviderId ?? "lmstudio_local_cmm",
             ProviderKind.GLM => GlmPlatforms.ProviderId,
             _ => throw new InvalidOperationException("unknown provider"),
         };
@@ -1080,9 +1084,17 @@ public sealed class ConfigurationSwitchService
         return parts.Count == 0 ? null : string.Join("\n\n", parts);
     }
 
-    /// <summary>生成“凭据命令”式 Provider 表体：auth 子表调用凭据助手按名取 token。</summary>
-    private static string BuildCommandProviderBody(string tablePath, string name, string baseUrl, string helperPath, string credentialName) =>
-        $"name = {Quote(name)}\nbase_url = {Quote(baseUrl)}\nwire_api = \"responses\"\n\n[{tablePath}.auth]\ncommand = {Quote(Path.GetFullPath(helperPath))}\nargs = [{Quote(credentialName)}]\ntimeout_ms = 5000\nrefresh_interval_ms = 0";
+    /// <summary>生成“凭据命令”式 Provider 表体：auth 子表调用凭据助手按名取 token；extraBodyLines 插在主表键与 auth 子表之间。</summary>
+    private static string BuildCommandProviderBody(string tablePath, string name, string baseUrl, string helperPath, string credentialName, string? extraBodyLines = null)
+    {
+        string body = $"name = {Quote(name)}\nbase_url = {Quote(baseUrl)}\nwire_api = \"responses\"";
+        if (!string.IsNullOrEmpty(extraBodyLines))
+        {
+            body += "\n" + extraBodyLines;
+        }
+
+        return body + $"\n\n[{tablePath}.auth]\ncommand = {Quote(Path.GetFullPath(helperPath))}\nargs = [{Quote(credentialName)}]\ntimeout_ms = 5000\nrefresh_interval_ms = 0";
+    }
 
     /// <summary>读取模型 metadata 里的 supported_reasoning_levels 集合；缺失返回空集。</summary>
     private static HashSet<string> GetReasoningLevels(JsonElement model)
