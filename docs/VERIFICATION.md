@@ -2,6 +2,67 @@
 
 主验证日期：2026-08-22；最新增量验证：2026-09-22（Asia/Shanghai）。
 
+## 2026-09-22：GLM 双平台 catalog provenance 隔离修复
+
+### 本轮范围与结论
+
+再次沿 GLM 平台选择 → catalog → `model_catalog_json` 数据流审阅时发现，共享 `~/.codex/models.json` 只有模型 slug 和 metadata，没有国内 BigModel / 国际 Z.ai 的平台标识；原实现却在两个平台无条件复用它。由于内嵌官方快照当前已存在平台差异（国内包含 `glm-5-turbo`，国际不包含），这会让选择 Z.ai 时展示并提交国内目录中的模型，切换后可能命中错误 endpoint 或返回模型不存在。
+
+现在共享 home catalog 只有在相邻 `<models>.provenance.json` 同时满足以下条件时才复用：`source` 精确等于所选平台官方 Codex 指南 URL，且 `catalogSha256` 与本次读取的 catalog 字节 SHA-256 相等。缺失、损坏、来源跨平台或 SHA 漂移时 fail closed，改用所选平台的专用缓存/在线指南/内嵌快照；不会覆盖用户原始 `models.json`。
+
+本轮未写入真实 Codex 配置、凭据或用户目录，未调用真实 GLM API、LM Studio 生命周期或可见 GUI。
+
+### 自动化验证
+
+| 检查 | 结果 |
+|---|---|
+| 定向 provenance 回归 | **2 PASS / 0 FAIL** |
+| Core/App 全量（当前 HEAD） | **Core 528 PASS / App 28 PASS / 0 FAIL** |
+
+新增回归：`ExistingOfficialGlmModelsJsonIsReusedWithoutRewrite` 现在带匹配 provenance 才复用；`UnprovenSharedGlmCatalogIsNotReusedAcrossPlatforms` 证明无 provenance 的共享目录不会跨平台复用。实现通过 `HasMatchingPlatformProvenanceAsync` 对来源与 catalog SHA 做双重确认。
+
+## 2026-09-22：可选 reasoning metadata 与未来目录切换兼容性修复
+
+### 本轮范围与结论
+
+在上一轮未来 slug 修复基础上继续沿数据流审阅，发现 DeepSeek/GLM 的严格 catalog 校验允许 `supported_reasoning_levels` 缺失或为 `null`，但来源识别仍把“必须是 array”当作官方目录锚点，切换计划的 `GetReasoningLevels` 也会对 `null` 直接调用 `JsonElement.EnumerateArray()`。这会让未来官方模型目录在没有 reasoning 能力声明时被错误回退，或在切换阶段抛出 `InvalidOperationException`。
+
+修复保持安全边界不变：根对象、`models` 数组、非空唯一 slug、DeepSeek/GLM 命名空间、正数 context、版本字段与 `freeform`/`shell_command` 工具 metadata 仍严格校验；只有 reasoning metadata 按既有可选语义处理，缺失/`null` 映射为空集合并不写入 `model_reasoning_effort`，不伪造 Codex effort。新增回归同时覆盖官方目录复用与从目录生成 GLM 切换计划的端到端路径。
+
+本轮未写入真实 Codex 配置、凭据或用户目录，未执行真实 Provider API、LM Studio `/load`/`/unload` 或可见 GUI；真实未来目录的在线内容仍需现场验证。
+
+### 自动化验证
+
+| 检查 | 结果 |
+|---|---|
+| Core Release 全量 | **527 PASS / 0 FAIL / 8 现场 opt-in SKIP** |
+| App Release 隔离 STA | **28 PASS / 0 FAIL / 0 SKIP** |
+| Debug / Release build | **均 PASS，0 warning / 0 error** |
+| `dotnet format --verify-no-changes --no-restore` | **PASS** |
+| `git diff --check` | **PASS** |
+
+新增回归：`FutureDeepSeekCatalogWithoutReasoningMetadataIsReused`、`FutureGlmCatalogWithoutReasoningMetadataIsReused`、`FutureGlmWithoutReasoningMetadataLeavesReasoningUnset`；三项均先以旧实现复现 RED，再由最小实现修复为 GREEN。
+
+## 2026-09-22：未来模型目录与 OpenAI 非传统 slug 兼容性修复
+
+### 本轮范围与结论
+
+本轮在阅读全部项目文档、当前 HEAD 实现与既有测试后，复现并修复三条会阻断未来模型发现的路径：OpenAI fallback 专用 `models_cache.json` 原先只保留 `gpt-` slug；DeepSeek 官方 `models.json` 复用原先要求两个历史 V4 slug；GLM 官方 `models.json` 复用原先要求 `glm-5.3`。现在 OpenAI 专用缓存接受所有结构合法的非空 slug，通用 `models.json` 仍保留 `gpt-` 过滤以避免误把 DeepSeek/GLM catalog 当成 OpenAI；DeepSeek/GLM 则分别要求对应 `deepseek-`/`glm-` 命名空间、`freeform` patch metadata 与 `shell_command` metadata，reasoning 数组仅在字段存在时按严格可选结构校验，不再绑定历史模型名。严格 catalog JSON shape、context、版本与重复 slug 校验保持不变。
+
+本轮未写入真实 Codex 配置、凭据或用户目录，未执行真实 Provider API、LM Studio `/load`/`/unload` 或可见 GUI；未来版本的真实官方 catalog 端到端发布内容仍需现场验证。
+
+### 自动化验证
+
+| 检查 | 结果 |
+|---|---|
+| Core Release 全量 | **524 PASS / 0 FAIL / 8 现场 opt-in SKIP** |
+| App Release 隔离 STA | **28 PASS / 0 FAIL / 0 SKIP** |
+| Debug / Release build | **均 PASS，0 warning / 0 error** |
+| `dotnet format --verify-no-changes --no-restore` | **PASS** |
+| `git diff --check` | **PASS** |
+
+新增回归：`OpenAiCacheRetainsFutureNonGptModelSlugs`、`FutureDeepSeekCatalogWithoutHistoricalSlugsIsReused`、`FutureGlmCatalogWithoutHistoricalSlugsIsReused`；三项均先以旧实现复现 RED，再由最小实现修复为 GREEN。
+
 ## 2026-09-22：二次全量复核、原子写清理、catalog 读集与 GLM 平台边界
 
 ### 本轮范围与结论

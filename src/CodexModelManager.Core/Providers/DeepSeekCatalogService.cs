@@ -22,7 +22,6 @@ public sealed partial class DeepSeekCatalogService : IModelCatalogService
     private const string SnapshotResourceSuffix = "Catalogs.deepseek-models.official-snapshot.json";
     private const string SnapshotProvenanceResourceSuffix = "Catalogs.deepseek-models.official-snapshot.provenance.json";
     private static readonly JsonSerializerOptions IndentedJson = new() { WriteIndented = true };
-    private static readonly string[] OfficialSlugs = ["deepseek-v4-flash", "deepseek-v4-pro"];
 
     private readonly ICodexHomeProvider homeProvider;
     private readonly AppPaths appPaths;
@@ -182,24 +181,16 @@ public sealed partial class DeepSeekCatalogService : IModelCatalogService
         model.TryGetProperty("apply_patch_tool_type", out JsonElement patch) && patch.ValueKind == JsonValueKind.String &&
         model.TryGetProperty("shell_type", out JsonElement shell) && shell.ValueKind == JsonValueKind.String;
 
-    /// <summary>判断 catalog 是否包含全部官方模型且其工具/推理 metadata 完整。</summary>
+    /// <summary>判断 catalog 是否包含至少一个未来版本仍可识别的 DeepSeek 模型及完整工具 metadata。</summary>
     private static bool ContainsOfficialModels(JsonElement root)
     {
-        Dictionary<string, JsonElement> models = root.GetProperty("models").EnumerateArray()
-            .Where(model => model.TryGetProperty("slug", out JsonElement slug) && slug.ValueKind == JsonValueKind.String)
-            .ToDictionary(model => model.GetProperty("slug").GetString()!, model => model, StringComparer.Ordinal);
-        foreach (string slug in OfficialSlugs)
-        {
-            if (!models.TryGetValue(slug, out JsonElement model) ||
-                !model.TryGetProperty("apply_patch_tool_type", out JsonElement patch) || patch.GetString() != "freeform" ||
-                !model.TryGetProperty("shell_type", out JsonElement shell) || shell.GetString() != "shell_command" ||
-                !model.TryGetProperty("supported_reasoning_levels", out JsonElement reasoning) || reasoning.ValueKind != JsonValueKind.Array)
-            {
-                return false;
-            }
-        }
-
-        return true;
+        return root.GetProperty("models").EnumerateArray().Any(model =>
+            model.ValueKind == JsonValueKind.Object &&
+            model.TryGetProperty("slug", out JsonElement slug) &&
+            slug.ValueKind == JsonValueKind.String &&
+            slug.GetString()!.StartsWith("deepseek-", StringComparison.OrdinalIgnoreCase) &&
+            model.TryGetProperty("apply_patch_tool_type", out JsonElement patch) && patch.ValueKind == JsonValueKind.String && patch.GetString() == "freeform" &&
+            model.TryGetProperty("shell_type", out JsonElement shell) && shell.ValueKind == JsonValueKind.String && shell.GetString() == "shell_command");
     }
 
     /// <summary>离线恢复：缓存可用则用缓存，否则落盘内嵌官方快照（含 provenance）。</summary>

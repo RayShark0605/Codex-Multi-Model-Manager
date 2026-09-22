@@ -3,12 +3,27 @@ using System.Text;
 using System.Text.Json;
 using CodexModelManager.Core.Codex;
 using CodexModelManager.Core.Infrastructure;
+using CodexModelManager.Core.Models;
 
 namespace CodexModelManager.Tests;
 
 /// <summary>ProcessAndProtocolRemediation 相关测试集。</summary>
 public sealed class ProcessAndProtocolRemediationTests
 {
+    [Fact]
+    public async Task OpenAiCacheRetainsFutureNonGptModelSlugs()
+    {
+        using var temporary = new TemporaryDirectory();
+        await File.WriteAllTextAsync(
+            Path.Combine(temporary.Path, "models_cache.json"),
+            "{\"models\":[{\"slug\":\"codex-next\",\"display_name\":\"Codex Next\",\"context_window\":100}]}");
+        var client = new CodexAppServerClient(temporary.Path, launchCommand: null);
+
+        IReadOnlyList<ModelProfile> models = await client.ListModelsAsync();
+
+        Assert.Contains(models, model => model.Id == "codex-next");
+    }
+
     [Theory]
     [InlineData("1", 1, true)]
     [InlineData("\"1\"", 1, true)]

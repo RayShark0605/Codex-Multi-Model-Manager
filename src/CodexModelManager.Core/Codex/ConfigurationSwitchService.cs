@@ -1163,7 +1163,7 @@ public sealed class ConfigurationSwitchService
     /// <summary>读取模型 metadata 里的 supported_reasoning_levels 集合；缺失返回空集。</summary>
     private static HashSet<string> GetReasoningLevels(JsonElement model)
     {
-        if (!model.TryGetProperty("supported_reasoning_levels", out JsonElement levels))
+        if (!model.TryGetProperty("supported_reasoning_levels", out JsonElement levels) || levels.ValueKind != JsonValueKind.Array)
         {
             return [];
         }

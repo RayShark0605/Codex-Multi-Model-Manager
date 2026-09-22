@@ -1,4 +1,5 @@
 using System.Net;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using CodexModelManager.Core.Codex;
@@ -46,6 +47,78 @@ public sealed class CatalogTests
         var service = new DeepSeekCatalogService(home, new AppPaths(Path.Combine(root.Path, "local")), new HttpClient(new StubHttpHandler(_ => StubHttpHandler.Json("", HttpStatusCode.InternalServerError))));
         Assert.Equal(models, await service.EnsureDeepSeekCatalogAsync());
         Assert.Equal(before, File.GetLastWriteTimeUtc(models));
+    }
+
+    [Fact]
+    public async Task FutureDeepSeekCatalogWithoutHistoricalSlugsIsReused()
+    {
+        using var root = new TemporaryDirectory();
+        var home = new TestCodexHomeProvider(Path.Combine(root.Path, "home"));
+        string models = Path.Combine(home.Home, "models.json");
+        const string json = "{\"models\":[{\"slug\":\"deepseek-v5-next\",\"context_window\":100,\"minimal_client_version\":\"0.155.0\",\"apply_patch_tool_type\":\"freeform\",\"shell_type\":\"shell_command\",\"supported_reasoning_levels\":[]}]}";
+        await File.WriteAllTextAsync(models, json, new UTF8Encoding(false));
+        using var http = new HttpClient(new StubHttpHandler(_ => StubHttpHandler.Json("", HttpStatusCode.InternalServerError)));
+        var service = new DeepSeekCatalogService(home, new AppPaths(Path.Combine(root.Path, "local")), http);
+
+        Assert.Equal(models, await service.EnsureDeepSeekCatalogAsync());
+        Assert.Contains(await service.GetDeepSeekModelsAsync(), model => model.Id == "deepseek-v5-next");
+    }
+
+    [Fact]
+    public async Task FutureDeepSeekCatalogWithoutReasoningMetadataIsReused()
+    {
+        using var root = new TemporaryDirectory();
+        var home = new TestCodexHomeProvider(Path.Combine(root.Path, "home"));
+        string models = Path.Combine(home.Home, "models.json");
+        const string json = "{\"models\":[{\"slug\":\"deepseek-v5-fast\",\"context_window\":100,\"minimal_client_version\":\"0.155.0\",\"apply_patch_tool_type\":\"freeform\",\"shell_type\":\"shell_command\",\"supported_reasoning_levels\":null}]}";
+        await File.WriteAllTextAsync(models, json, new UTF8Encoding(false));
+        using var http = new HttpClient(new StubHttpHandler(_ => StubHttpHandler.Json("", HttpStatusCode.InternalServerError)));
+        var service = new DeepSeekCatalogService(home, new AppPaths(Path.Combine(root.Path, "local")), http);
+
+        Assert.Equal(models, await service.EnsureDeepSeekCatalogAsync());
+        Assert.Contains(await service.GetDeepSeekModelsAsync(), model => model.Id == "deepseek-v5-fast" && model.ReasoningOptions is { Count: 0 });
+    }
+
+    [Fact]
+    public async Task FutureGlmCatalogWithoutHistoricalSlugsIsReused()
+    {
+        using var root = new TemporaryDirectory();
+        var home = new TestCodexHomeProvider(Path.Combine(root.Path, "home"));
+        string models = Path.Combine(home.Home, "models.json");
+        const string json = "{\"models\":[{\"slug\":\"glm-6-next\",\"context_window\":100,\"apply_patch_tool_type\":\"freeform\",\"shell_type\":\"shell_command\",\"supported_reasoning_levels\":[]}]}";
+        byte[] catalogBytes = new UTF8Encoding(false).GetBytes(json);
+        await File.WriteAllBytesAsync(models, catalogBytes);
+        await File.WriteAllTextAsync(models + ".provenance.json", JsonSerializer.Serialize(new
+        {
+            source = GlmPlatforms.OfficialDocsUrl(GlmPlatform.BigModel),
+            catalogSha256 = Convert.ToHexString(SHA256.HashData(catalogBytes)),
+        }));
+        using var http = new HttpClient(new StubHttpHandler(_ => StubHttpHandler.Json("", HttpStatusCode.InternalServerError)));
+        var service = new GlmCatalogService(home, new AppPaths(Path.Combine(root.Path, "local")), http);
+
+        Assert.Equal(models, await service.EnsureGlmCatalogAsync(GlmPlatform.BigModel));
+        Assert.Contains(await service.GetGlmModelsAsync(GlmPlatform.BigModel), model => model.Id == "glm-6-next");
+    }
+
+    [Fact]
+    public async Task FutureGlmCatalogWithoutReasoningMetadataIsReused()
+    {
+        using var root = new TemporaryDirectory();
+        var home = new TestCodexHomeProvider(Path.Combine(root.Path, "home"));
+        string models = Path.Combine(home.Home, "models.json");
+        const string json = "{\"models\":[{\"slug\":\"glm-6-fast\",\"context_window\":100,\"apply_patch_tool_type\":\"freeform\",\"shell_type\":\"shell_command\",\"supported_reasoning_levels\":null}]}";
+        byte[] catalogBytes = new UTF8Encoding(false).GetBytes(json);
+        await File.WriteAllBytesAsync(models, catalogBytes);
+        await File.WriteAllTextAsync(models + ".provenance.json", JsonSerializer.Serialize(new
+        {
+            source = GlmPlatforms.OfficialDocsUrl(GlmPlatform.BigModel),
+            catalogSha256 = Convert.ToHexString(SHA256.HashData(catalogBytes)),
+        }));
+        using var http = new HttpClient(new StubHttpHandler(_ => StubHttpHandler.Json("", HttpStatusCode.InternalServerError)));
+        var service = new GlmCatalogService(home, new AppPaths(Path.Combine(root.Path, "local")), http);
+
+        Assert.Equal(models, await service.EnsureGlmCatalogAsync(GlmPlatform.BigModel));
+        Assert.Contains(await service.GetGlmModelsAsync(GlmPlatform.BigModel), model => model.Id == "glm-6-fast" && model.ReasoningOptions is { Count: 0 });
     }
 
     [Fact]

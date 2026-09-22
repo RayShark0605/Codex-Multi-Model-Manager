@@ -6,6 +6,7 @@
 
 ## 当前交付状态
 
+- 2026-09-22 再次全量审阅：修复 GLM 共享 `models.json` 无平台 provenance 时跨 BigModel/Z.ai 复用的缺陷；同时保留未来 slug 与可选 reasoning metadata 兼容修复。隔离回归 **Core 528 PASS / App 28 PASS / 0 FAIL / 8 现场 opt-in SKIP**；真实 Provider/LM Studio 生命周期仍未执行。
 - 2026-09-22 再次全量复核：修复设置、DeepSeek/GLM catalog cache/provenance、备份 manifest 与 WinForms helper copy 在原子 promotion 失败时遗留 `.tmp-*` 的资源清理缺陷；把 DeepSeek/GLM catalog 纳入 Preview/Commit 读集，拒绝跨平台复用错误的 GLM 官方 bearer endpoint，并冻结 GLM 平台选择控件参与事务确认；同步 LM Studio `>=0.4.21 + 严格 defaults 结构校验` 的兼容性文档。隔离回归 **Core 521 PASS / App 28 PASS / 0 FAIL / 8 现场 opt-in SKIP**；真实 Provider/LM Studio 生命周期仍未执行。
 - 2026-09-11 LM Studio 流韧性键：切换到 LM Studio 时一律使用 `lmstudio_local_cmm` custom provider（含默认 1234、无认证场景），表内固定写入 `stream_idle_timeout_ms = 2000000`、`stream_max_retries = 2`、`request_max_retries = 2`——修复本地大模型长 prefill（如自动压缩）超过 Codex 默认 5 分钟 SSE 空闲超时被断流并重发 sampling request 的问题。依据：官方配置参考确认三键只在 `[model_providers.*]` 表内生效，而 Codex 源码 `merge_configured_model_providers` 对非 Bedrock 内置 ID 一律 `or_insert`（用户写入的 `[model_providers.lmstudio]` 被静默忽略），因此放弃内置路由。附带：Preview/semantic diff 对非敏感 Provider 表体直出真实键值（含 token 的表体继续掩码）；删除位于文件末尾的纳管表时收敛残留分隔空行。隔离回归 **Core 513 PASS / App 27 PASS / 0 FAIL / 8 现场 opt-in SKIP**。
 - 2026-09-10 LM Studio 版本门修复：per-model defaults 持久化的版本兼容从写死版本族（`0.4.21.x / 0.4.23.x`）改为**最低版本下限 `0.4.21` + defaults 文件结构校验兜底**——起因是 LM Studio `0.4.24.0` 被旧白名单误拦（`NotSupportedException`），而其本机实际生成的 per-model defaults JSON 与受校验 schema 完全一致。此后任何 ≥ 0.4.21 的版本（含未来升级）默认放行；若某版本真的改动格式，仍在任何写入前被结构校验安全阻断。隔离回归 **Core 506 PASS / App 27 PASS / 0 FAIL / 8 现场 opt-in SKIP**。
@@ -13,7 +14,7 @@
 - 2026-09-08 成功率修复：已实现配置 source-span 保留、可靠恢复、一次合并确认与共享有界重试、双页面选择一致性、有界进程、真实协议证据、坏备份隔离和可回退发布；隔离回归 **Core 476 PASS / App 26 PASS / 0 FAIL / 8 现场 opt-in SKIP**。没有写真实配置或执行真实模型重载/推理；问题矩阵见 [`docs/REMEDIATION-2026-09-08.md`](docs/REMEDIATION-2026-09-08.md)，验证和工件记录见 [`docs/VERIFICATION.md`](docs/VERIFICATION.md)。
 - OpenAI：从 Codex App Server 动态获取账户可见模型；App Server 不可用时才读取并标记可能过期的 `models_cache.json`。
 - DeepSeek：识别官方 `models.json`；否则下载并只解析官方 PowerShell setup script，离线时使用随发行版附带、带来源哈希的官方 catalog 快照。
-- GLM：识别含官方 GLM 模型的 `models.json`；否则从官方 GLM Coding Plan Codex 指南 markdown 提取 models.json 并缓存，离线时使用随发行版附带、带来源哈希的官方快照（国内/国际各一份）。
+- GLM：仅在共享 `models.json` 附带与所选国内/国际平台一致的 provenance 且 catalog SHA-256 匹配时复用；否则从所选官方 GLM Coding Plan Codex 指南 markdown 提取 models.json 并缓存，离线时使用随发行版附带、带来源哈希的官方快照（国内/国际各一份），避免把一个平台的模型目录发送到另一个平台的 endpoint。
 - LM Studio：优先调用 `/api/v1/models`，回退 `/api/v0/models`、`/v1/models`；一条 loaded instance 对应一个可查看项。native `type` 会被保留，embedding 等已知非 LLM instance 不会进入 Codex 切换列表，核心层也会再次拒绝。GGUF 自动定位保留 Hub `lms ls --json --variants`，并新增 endpoint-aware `lms ps --json --host/--port` loaded-instance 证据；native loaded state 始终是权威面。
 - 配置安全：TOML 精确文本补丁、语法/语义校验、预览指纹、命名同步锁、同目录临时文件、flush、原子替换、重读校验和自动回滚。
 - 可逆备份：不可覆盖的 Initial Snapshot、显式修改外部 override 文件前的 supplemental baseline、每次切换/恢复前的 History、SHA-256 manifest。
@@ -63,7 +64,7 @@ Codex 可能在运行期间缓存配置、更新模型 cache 或自行写回 `co
 
 - 走 GLM Coding Plan 官方 Codex 链路：`wire_api = "responses"` + 官方模型元数据 `models.json`；provider 表 ID 使用官方写法 `ZAI`（[官方接入文档](https://docs.bigmodel.cn/cn/coding-plan/tool/codex)、[国际 Z.ai 文档](https://docs.z.ai/devpack/tool/codex)）。
 - 双平台支持：智谱国内 `https://open.bigmodel.cn/api/v1` 与国际 Z.ai `https://api.z.ai/api/v1`，在“当前与切换”页选择，选择持久化到应用设置；切换时 base_url 与平台 catalog 同步。
-- 模型目录优先复用已包含官方 GLM 模型的 `~/.codex/models.json`；否则从官方 Codex 指南 markdown 提取 models.json 并缓存到本工具目录，离线时回退到随发行版附带、带来源哈希的官方快照（国内含 `glm-5.3`（1M 上下文）与 `glm-5-turbo`；国际含 `glm-5.3`）。官方 GLM models.json 不携带 `minimal_client_version`，管理器仅在其声明时执行 Codex CLI 版本门禁。
+- 模型目录仅在 `~/.codex/models.json` 相邻 provenance 明确匹配所选平台且 catalog SHA-256 未漂移时复用；否则从对应官方 Codex 指南 markdown 提取 models.json 并缓存到本工具目录，离线时回退到随发行版附带、带来源哈希的官方快照（国内含 `glm-5.3`（1M 上下文）与 `glm-5-turbo`；国际含 `glm-5.3`）。官方 GLM models.json 不携带 `minimal_client_version`，管理器仅在其声明时执行 Codex CLI 版本门禁。
 - reasoning effort 从官方 catalog 解析（glm-5.3 为 low/high/max，默认 max）；请求值不在官方支持列表时拒绝切换；`glm-5-turbo` 未声明档位时沿用其 catalog 默认值。
 - 新配置使用 `[model_providers.ZAI.auth]` command-backed auth，Token 存 Windows Credential Manager（`CodexModelManager/GLM`），不进入 TOML、日志或 manifest；若检测到官方指南/助手写入的 `experimental_bearer_token` 明文表，则原样复用，不迁移、不复制、不显示 Token，切换到其他 Provider 时整段保留为 dormant 配置。
 - 在线 Validate 会发送少量 GLM Coding Plan API 请求（消耗套餐额度），UI 会先请求确认；Level 3 smoke test 同样支持 GLM。

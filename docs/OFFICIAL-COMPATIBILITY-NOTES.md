@@ -56,6 +56,12 @@
 - [DeepSeek Integrate with Codex](https://api-docs.deepseek.com/quick_start/agent_integrations/codex)
 - [Official setup PowerShell](https://cdn.deepseek.com/api-docs/codex-deepseek-setup-en.ps1)
 
+## GLM Coding Plan catalog platform boundary
+
+- 国内 BigModel 与国际 Z.ai 共用 Provider ID `ZAI`，但官方模型目录和 endpoint 是平台选择的一部分；不能仅凭 `glm-` slug 判断一个共享 `~/.codex/models.json` 属于哪个平台。
+- 管理器只复用带相邻 provenance 的 home catalog：`source` 必须精确匹配所选官方 Codex 指南 URL，`catalogSha256` 必须匹配本次读取的字节；无 provenance、跨平台来源或 SHA 漂移均切换到平台专用缓存/在线指南/内嵌快照。
+- 该门禁避免把 BigModel-only 模型（例如当前国内快照中的 `glm-5-turbo`）展示给 Z.ai endpoint；它不修改用户的 `models.json`，也不把 catalog provenance 写入真实 Codex home。
+
 ## LM Studio
 
 - native `/api/v1/models` 返回 `key`、display name、quantization object、size、architecture、max context、capabilities 与 loaded instances。

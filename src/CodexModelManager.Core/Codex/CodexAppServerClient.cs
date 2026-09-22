@@ -261,6 +261,7 @@ public sealed class CodexAppServerClient
                 }
 
                 List<ModelProfile> result = [];
+                bool restrictToGptPrefix = name.Equals("models.json", StringComparison.OrdinalIgnoreCase);
                 foreach (JsonElement model in models.EnumerateArray())
                 {
                     if (model.ValueKind != JsonValueKind.Object)
@@ -269,7 +270,7 @@ public sealed class CodexAppServerClient
                     }
 
                     string? id = GetString(model, "slug");
-                    if (string.IsNullOrWhiteSpace(id) || !id.StartsWith("gpt-", StringComparison.OrdinalIgnoreCase))
+                    if (string.IsNullOrWhiteSpace(id) || restrictToGptPrefix && !id.StartsWith("gpt-", StringComparison.OrdinalIgnoreCase))
                     {
                         continue;
                     }

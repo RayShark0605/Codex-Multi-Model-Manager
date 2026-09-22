@@ -1,4 +1,5 @@
 using System.Net;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using CodexModelManager.Core.Codex;
@@ -260,7 +261,13 @@ public sealed class GlmProviderTests
         using var root = new TemporaryDirectory();
         var home = new TestCodexHomeProvider(Path.Combine(root.Path, "home"));
         string models = Path.Combine(home.Home, "models.json");
-        await File.WriteAllTextAsync(models, SwitchHarness.TestGlmCatalog, new UTF8Encoding(false));
+        byte[] catalogBytes = new UTF8Encoding(false).GetBytes(SwitchHarness.TestGlmCatalog);
+        await File.WriteAllBytesAsync(models, catalogBytes);
+        await File.WriteAllTextAsync(models + ".provenance.json", JsonSerializer.Serialize(new
+        {
+            source = GlmPlatforms.OfficialDocsUrl(GlmPlatform.BigModel),
+            catalogSha256 = Convert.ToHexString(SHA256.HashData(catalogBytes)),
+        }));
         DateTime before = File.GetLastWriteTimeUtc(models);
         var paths = new AppPaths(Path.Combine(root.Path, "local"));
         using var http = new HttpClient(new StubHttpHandler(_ => throw new HttpRequestException("offline")));
@@ -268,6 +275,23 @@ public sealed class GlmProviderTests
 
         Assert.Equal(models, await service.EnsureGlmCatalogAsync(GlmPlatform.BigModel));
         Assert.Equal(before, File.GetLastWriteTimeUtc(models));
+    }
+
+    [Fact]
+    public async Task UnprovenSharedGlmCatalogIsNotReusedAcrossPlatforms()
+    {
+        using var root = new TemporaryDirectory();
+        var home = new TestCodexHomeProvider(Path.Combine(root.Path, "home"));
+        string models = Path.Combine(home.Home, "models.json");
+        await File.WriteAllTextAsync(models, SwitchHarness.TestGlmCatalog, new UTF8Encoding(false));
+        var paths = new AppPaths(Path.Combine(root.Path, "local"));
+        using var http = new HttpClient(new StubHttpHandler(_ => throw new HttpRequestException("offline")));
+        var service = new GlmCatalogService(home, paths, http);
+
+        string path = await service.EnsureGlmCatalogAsync(GlmPlatform.Zai);
+
+        Assert.NotEqual(models, path);
+        Assert.DoesNotContain(await service.GetGlmModelsAsync(GlmPlatform.Zai), model => model.Id == "glm-5-turbo");
     }
 
     [Fact]

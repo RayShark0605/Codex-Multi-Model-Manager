@@ -213,6 +213,21 @@ public sealed class SwitchMatrixTests
     }
 
     [Fact]
+    public async Task FutureGlmWithoutReasoningMetadataLeavesReasoningUnset()
+    {
+        using var harness = new SwitchHarness(SwitchHarness.BaseConfig);
+        const string catalog = "{\"models\":[{\"slug\":\"glm-6-fast\",\"context_window\":1048576,\"apply_patch_tool_type\":\"freeform\",\"shell_type\":\"shell_command\",\"supported_reasoning_levels\":null}]}";
+        await File.WriteAllTextAsync(harness.GlmCatalogPath, catalog, new UTF8Encoding(false));
+
+        SwitchPlan plan = await harness.Service.CreatePlanAsync(harness.Request(ProviderKind.GLM) with { TargetModel = "glm-6-fast" });
+        string text = Encoding.UTF8.GetString(Assert.Single(plan.Files).CandidateBytes!);
+
+        Assert.Contains("model = \"glm-6-fast\"", text, StringComparison.Ordinal);
+        Assert.Contains("model_provider = \"ZAI\"", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("model_reasoning_effort", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task StaleMediumReasoningIsRejectedWhenLmStudioOnlyReportsOnOff()
     {
         using var harness = new SwitchHarness(SwitchHarness.BaseConfig);

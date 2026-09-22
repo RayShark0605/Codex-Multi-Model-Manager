@@ -113,7 +113,7 @@ public sealed partial class GlmCatalogService : IGlmModelCatalogService
             {
                 byte[] bytes = await File.ReadAllBytesAsync(officialExisting, cancellationToken).ConfigureAwait(false);
                 using JsonDocument existing = ValidateCatalog(bytes);
-                if (ContainsOfficialModels(existing.RootElement))
+                if (ContainsOfficialModels(existing.RootElement) && await HasMatchingPlatformProvenanceAsync(officialExisting, platform, bytes, cancellationToken).ConfigureAwait(false))
                 {
                     return officialExisting;
                 }
@@ -252,22 +252,49 @@ public sealed partial class GlmCatalogService : IGlmModelCatalogService
         model.TryGetProperty("apply_patch_tool_type", out JsonElement patch) && patch.ValueKind == JsonValueKind.String &&
         model.TryGetProperty("shell_type", out JsonElement shell) && shell.ValueKind == JsonValueKind.String;
 
-    /// <summary>判断 catalog 是否包含官方锚点模型（glm-5.3）且其工具/推理 metadata 完整。</summary>
+    /// <summary>判断 catalog 是否包含至少一个未来版本仍可识别的 GLM 模型及完整工具 metadata。</summary>
     private static bool ContainsOfficialModels(JsonElement root)
     {
-        Dictionary<string, JsonElement> models = root.GetProperty("models").EnumerateArray()
-            .Where(model => model.TryGetProperty("slug", out JsonElement slug) && slug.ValueKind == JsonValueKind.String)
-            .ToDictionary(model => model.GetProperty("slug").GetString()!, model => model, StringComparer.Ordinal);
-        // glm-5.3 在两个平台的官方 Codex 指南中都有声明，用它锚定“是官方 catalog”的判定
-        if (!models.TryGetValue("glm-5.3", out JsonElement model) ||
-            !model.TryGetProperty("apply_patch_tool_type", out JsonElement patch) || patch.GetString() != "freeform" ||
-            !model.TryGetProperty("shell_type", out JsonElement shell) || shell.GetString() != "shell_command" ||
-            !model.TryGetProperty("supported_reasoning_levels", out JsonElement reasoning) || reasoning.ValueKind != JsonValueKind.Array)
+        return root.GetProperty("models").EnumerateArray().Any(model =>
+            model.ValueKind == JsonValueKind.Object &&
+            model.TryGetProperty("slug", out JsonElement slug) &&
+            slug.ValueKind == JsonValueKind.String &&
+            slug.GetString()!.StartsWith("glm-", StringComparison.OrdinalIgnoreCase) &&
+            model.TryGetProperty("apply_patch_tool_type", out JsonElement patch) && patch.ValueKind == JsonValueKind.String && patch.GetString() == "freeform" &&
+            model.TryGetProperty("shell_type", out JsonElement shell) && shell.ValueKind == JsonValueKind.String && shell.GetString() == "shell_command");
+    }
+
+    /// <summary>
+    /// 共享的 ~/.codex/models.json 不携带 GLM 国内/国际平台标识；只有相邻 provenance
+    /// 明确声明同一官方指南且 catalog SHA-256 匹配时才允许复用，避免把一个平台的模型目录
+    /// 发送到另一个平台的 endpoint。
+    /// </summary>
+    private static async Task<bool> HasMatchingPlatformProvenanceAsync(string catalogPath, GlmPlatform platform, byte[] catalogBytes, CancellationToken cancellationToken)
+    {
+        string provenancePath = catalogPath + ".provenance.json";
+        if (!File.Exists(provenancePath))
         {
             return false;
         }
 
-        return true;
+        try
+        {
+            using JsonDocument provenance = JsonDocument.Parse(await File.ReadAllBytesAsync(provenancePath, cancellationToken).ConfigureAwait(false));
+            JsonElement root = provenance.RootElement;
+            string? source = root.ValueKind == JsonValueKind.Object && root.TryGetProperty("source", out JsonElement sourceElement) && sourceElement.ValueKind == JsonValueKind.String
+                ? sourceElement.GetString()
+                : null;
+            string? catalogSha256 = root.ValueKind == JsonValueKind.Object && root.TryGetProperty("catalogSha256", out JsonElement hashElement) && hashElement.ValueKind == JsonValueKind.String
+                ? hashElement.GetString()
+                : null;
+            string actualSha256 = Convert.ToHexString(SHA256.HashData(catalogBytes));
+            return string.Equals(source, GlmPlatforms.OfficialDocsUrl(platform), StringComparison.Ordinal) &&
+                string.Equals(catalogSha256, actualSha256, StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception exception) when (exception is IOException or JsonException)
+        {
+            return false;
+        }
     }
 
     /// <summary>离线恢复：缓存可用则用缓存，否则落盘内嵌官方快照（含 provenance）。</summary>
