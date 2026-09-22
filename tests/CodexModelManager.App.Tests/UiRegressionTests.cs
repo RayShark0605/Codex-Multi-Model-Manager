@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Reflection;
 using CodexModelManager.App.UI;
 using CodexModelManager.Core.Abstractions;
 using CodexModelManager.Core.Infrastructure;
@@ -22,6 +23,22 @@ public sealed class UiRegressionTests
         Assert.Equal(AppComposition.ProviderRequestTimeout, composition.ProviderHttpClientTimeout);
         Assert.Equal(AppComposition.LmStudioLifecycleRequestTimeout, composition.LmStudioLifecycleHttpClientTimeout);
         Assert.Equal(AppComposition.LmStudioLifecycleRequestTimeout, controller.RequestTimeout);
+    }
+
+    [Fact]
+    public void HelperCopyLeavesNoTempFileWhenFinalMoveFails()
+    {
+        using var temporary = new TemporaryDirectory();
+        string source = Path.Combine(temporary.Path, "helper-source.exe");
+        string destination = Path.Combine(temporary.Path, "helper.exe");
+        File.WriteAllBytes(source, [1, 2, 3]);
+        Directory.CreateDirectory(destination);
+        MethodInfo method = typeof(MainController).GetMethod("CopyAtomically", BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        TargetInvocationException error = Assert.Throws<TargetInvocationException>(() => method.Invoke(null, [source, destination]));
+
+        Assert.IsType<IOException>(error.InnerException);
+        Assert.Empty(Directory.EnumerateFiles(temporary.Path, "helper.exe.tmp-*"));
     }
 
     [Fact]
@@ -60,12 +77,12 @@ public sealed class UiRegressionTests
         form.LmStudio.ModelCombo.SelectedItem = loadedModel;
         Assert.False(form.LmStudio.AnalyzeTemplateButton.Enabled);
 
-        form.LmStudio.GgufPathText.Text = @"J:\LM Studio Models\esatapedico\model.gguf";
+        form.LmStudio.GgufPathText.Text = @"models\esatapedico\model.gguf";
         Assert.True(form.LmStudio.AnalyzeTemplateButton.Enabled);
 
         form.LmStudio.GgufPathText.Clear();
         Assert.False(form.LmStudio.AnalyzeTemplateButton.Enabled);
-        form.LmStudio.GgufPathText.Text = @"J:\LM Studio Models\esatapedico\model.gguf";
+        form.LmStudio.GgufPathText.Text = @"models\esatapedico\model.gguf";
         form.LmStudio.ModelCombo.SelectedItem = null;
         Assert.False(form.LmStudio.AnalyzeTemplateButton.Enabled);
     });

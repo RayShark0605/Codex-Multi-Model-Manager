@@ -2771,14 +2771,33 @@ internal sealed class MainController : IDisposable
         }
 
         string temp = destination + ".tmp-" + Guid.NewGuid().ToString("N");
-        File.WriteAllBytes(temp, sourceBytes);
-        if (File.Exists(destination))
+        try
         {
-            File.Replace(temp, destination, null, true);
+            File.WriteAllBytes(temp, sourceBytes);
+            if (File.Exists(destination))
+            {
+                File.Replace(temp, destination, null, true);
+            }
+            else
+            {
+                File.Move(temp, destination);
+            }
         }
-        else
+        finally
         {
-            File.Move(temp, destination);
+            try
+            {
+                if (File.Exists(temp))
+                {
+                    File.Delete(temp);
+                }
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
         }
     }
 
@@ -2966,7 +2985,7 @@ internal sealed class MainController : IDisposable
     /// <summary>参与输入冻结的全部选择类控件。</summary>
     private Control[] SelectionInputs() =>
     [
-        form.Current.ProviderCombo, form.Current.ModelCombo, form.Current.ReasoningCombo,
+        form.Current.ProviderCombo, form.Current.ModelCombo, form.Current.ReasoningCombo, form.Current.GlmPlatformCombo,
         form.Current.SecondaryPolicyCombo, form.Current.SecondaryOverridesList,
         form.LmStudio.EndpointText, form.LmStudio.ModelCombo, form.LmStudio.CodexContextInput,
         form.LmStudio.AutoCompactInput, form.LmStudio.AutoCompactAutomaticCheckBox,

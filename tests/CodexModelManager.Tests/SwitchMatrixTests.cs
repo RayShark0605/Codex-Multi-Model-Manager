@@ -56,6 +56,19 @@ public sealed class SwitchMatrixTests
     }
 
     [Fact]
+    public async Task CatalogChangeAfterPreviewStopsCommitBeforeBackup()
+    {
+        using var harness = new SwitchHarness(SwitchHarness.BaseConfig);
+        SwitchPlan preview = await harness.Service.CreatePlanAsync(harness.Request(ProviderKind.DeepSeek));
+        await File.AppendAllTextAsync(harness.CatalogPath, "\n");
+
+        await Assert.ThrowsAsync<IOException>(() => harness.Service.CommitAsync(preview));
+
+        Assert.Empty(await harness.Backups.ListHistoryAsync());
+        Assert.Contains("model = \"gpt-old\"", harness.ReadConfig(), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task UnownedLmStudioLocalProviderTableIsPreserved()
     {
         const string custom = "model = \"qwen\"\nmodel_provider = \"lmstudio_local\"\n\n[model_providers.lmstudio_local]\nname = \"user owned\"\nbase_url = \"http://127.0.0.1:9999/v1\"\n";

@@ -84,12 +84,16 @@ public sealed class SelectionAuditTests
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         Task running = fixture.Controller.RunUiActionForTestAsync(() => release.Task, freezeInputs: true);
         Assert.False(fixture.Form.Current.ProviderCombo.Enabled);
+        Assert.False(fixture.Form.Current.GlmPlatformCombo.Enabled);
         Assert.False(fixture.Form.LmStudio.EndpointText.Enabled);
         fixture.Form.Current.ProviderCombo.Enabled = true;
         Assert.False(fixture.Form.Current.ProviderCombo.Enabled);
+        fixture.Form.Current.GlmPlatformCombo.Enabled = true;
+        Assert.False(fixture.Form.Current.GlmPlatformCombo.Enabled);
         release.SetResult();
         await running;
         Assert.True(fixture.Form.Current.ProviderCombo.Enabled);
+        Assert.True(fixture.Form.Current.GlmPlatformCombo.Enabled);
         Assert.True(fixture.Form.LmStudio.EndpointText.Enabled);
     });
 

@@ -63,4 +63,80 @@ public sealed class CatalogTests
         Assert.False(parsed.ImageGeneration);
         Assert.True(parsed.WebSearch);
     }
+
+    [Fact]
+    public async Task DeepSeekCatalogPromotionLeavesNoTempFileWhenCacheMoveFails()
+    {
+        using var root = new TemporaryDirectory();
+        var home = new TestCodexHomeProvider(Path.Combine(root.Path, "home"));
+        var paths = new AppPaths(Path.Combine(root.Path, "local"));
+        paths.EnsureDirectories();
+        string cachePath = Path.Combine(paths.CatalogDirectory, "deepseek-models.json");
+        Directory.CreateDirectory(cachePath);
+        string script = "@$ModelsJson = @'\n" +
+            "{\"models\":[{\"slug\":\"deepseek-v4-pro\",\"context_window\":128,\"minimal_client_version\":\"0.144.0\",\"supported_reasoning_levels\":[]}] }" +
+            "\n'@";
+        using var http = new HttpClient(new StubHttpHandler(_ => StubHttpHandler.Json(script, HttpStatusCode.OK)));
+        var service = new DeepSeekCatalogService(home, paths, http);
+
+        await Assert.ThrowsAsync<IOException>(() => service.EnsureDeepSeekCatalogAsync());
+
+        Assert.Empty(Directory.EnumerateFiles(paths.CatalogDirectory, "deepseek-models.json.tmp-*"));
+    }
+
+    [Fact]
+    public async Task DeepSeekCatalogPromotionLeavesNoTempFileWhenProvenanceMoveFails()
+    {
+        using var root = new TemporaryDirectory();
+        var home = new TestCodexHomeProvider(Path.Combine(root.Path, "home"));
+        var paths = new AppPaths(Path.Combine(root.Path, "local"));
+        paths.EnsureDirectories();
+        string provenancePath = Path.Combine(paths.CatalogDirectory, "deepseek-models.json.provenance.json");
+        Directory.CreateDirectory(provenancePath);
+        string script = "@$ModelsJson = @'\n" +
+            "{\"models\":[{\"slug\":\"deepseek-v4-pro\",\"context_window\":128,\"minimal_client_version\":\"0.144.0\",\"supported_reasoning_levels\":[]}] }" +
+            "\n'@";
+        using var http = new HttpClient(new StubHttpHandler(_ => StubHttpHandler.Json(script, HttpStatusCode.OK)));
+        var service = new DeepSeekCatalogService(home, paths, http);
+
+        await Assert.ThrowsAsync<IOException>(() => service.EnsureDeepSeekCatalogAsync());
+
+        Assert.Empty(Directory.EnumerateFiles(paths.CatalogDirectory, "deepseek-models.json.provenance.json.tmp-*"));
+    }
+
+    [Fact]
+    public async Task GlmCatalogPromotionLeavesNoTempFileWhenCacheMoveFails()
+    {
+        using var root = new TemporaryDirectory();
+        var home = new TestCodexHomeProvider(Path.Combine(root.Path, "home"));
+        var paths = new AppPaths(Path.Combine(root.Path, "local"));
+        paths.EnsureDirectories();
+        string cachePath = Path.Combine(paths.CatalogDirectory, GlmPlatforms.CacheFileName(GlmPlatform.BigModel));
+        Directory.CreateDirectory(cachePath);
+        string document = "```json\n" + SwitchHarness.TestGlmCatalog.TrimEnd() + "\n```";
+        using var http = new HttpClient(new StubHttpHandler(_ => StubHttpHandler.Json(document, HttpStatusCode.OK)));
+        var service = new GlmCatalogService(home, paths, http);
+
+        await Assert.ThrowsAsync<IOException>(() => service.EnsureGlmCatalogAsync(GlmPlatform.BigModel));
+
+        Assert.Empty(Directory.EnumerateFiles(paths.CatalogDirectory, "glm-bigmodel-models.json.tmp-*"));
+    }
+
+    [Fact]
+    public async Task GlmCatalogPromotionLeavesNoTempFileWhenProvenanceMoveFails()
+    {
+        using var root = new TemporaryDirectory();
+        var home = new TestCodexHomeProvider(Path.Combine(root.Path, "home"));
+        var paths = new AppPaths(Path.Combine(root.Path, "local"));
+        paths.EnsureDirectories();
+        string provenancePath = Path.Combine(paths.CatalogDirectory, "glm-bigmodel-models.json.provenance.json");
+        Directory.CreateDirectory(provenancePath);
+        string document = "```json\n" + SwitchHarness.TestGlmCatalog.TrimEnd() + "\n```";
+        using var http = new HttpClient(new StubHttpHandler(_ => StubHttpHandler.Json(document, HttpStatusCode.OK)));
+        var service = new GlmCatalogService(home, paths, http);
+
+        await Assert.ThrowsAsync<IOException>(() => service.EnsureGlmCatalogAsync(GlmPlatform.BigModel));
+
+        Assert.Empty(Directory.EnumerateFiles(paths.CatalogDirectory, "glm-bigmodel-models.json.provenance.json.tmp-*"));
+    }
 }

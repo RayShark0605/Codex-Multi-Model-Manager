@@ -119,4 +119,17 @@ public sealed class AppSettingsMigrationTests
         Assert.Equal(100_000, limit);
         Assert.Equal(AutoCompactMode.Manual, mode);
     }
+
+    [Fact]
+    public async Task AppSettingsRepositoryLeavesNoTempFileWhenFinalMoveFails()
+    {
+        using var root = new TemporaryDirectory();
+        var paths = new AppPaths(Path.Combine(root.Path, "local"));
+        Directory.CreateDirectory(paths.SettingsPath);
+        var repository = new AppSettingsRepository(paths);
+
+        await Assert.ThrowsAnyAsync<IOException>(() => repository.SaveAsync(new AppSettings()));
+
+        Assert.Empty(Directory.EnumerateFiles(paths.Root, "appsettings.json.tmp-*"));
+    }
 }

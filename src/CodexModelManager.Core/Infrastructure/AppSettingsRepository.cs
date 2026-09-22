@@ -233,21 +233,40 @@ public sealed class AppSettingsRepository
         paths.EnsureDirectories();
         var bytes = Serialize(settings);
         var tempPath = paths.SettingsPath + ".tmp-" + Guid.NewGuid().ToString("N");
-        await using (var stream = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough | FileOptions.Asynchronous))
+        try
         {
-            await stream.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
-            stream.Flush(true);
-        }
+            await using (var stream = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough | FileOptions.Asynchronous))
+            {
+                await stream.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
+                stream.Flush(true);
+            }
 
-        if (File.Exists(paths.SettingsPath))
-        {
-            var rollback = paths.SettingsPath + ".rollback-" + Guid.NewGuid().ToString("N");
-            File.Replace(tempPath, paths.SettingsPath, rollback, true);
-            File.Delete(rollback);
+            if (File.Exists(paths.SettingsPath))
+            {
+                var rollback = paths.SettingsPath + ".rollback-" + Guid.NewGuid().ToString("N");
+                File.Replace(tempPath, paths.SettingsPath, rollback, true);
+                File.Delete(rollback);
+            }
+            else
+            {
+                File.Move(tempPath, paths.SettingsPath);
+            }
         }
-        else
+        finally
         {
-            File.Move(tempPath, paths.SettingsPath);
+            try
+            {
+                if (File.Exists(tempPath))
+                {
+                    File.Delete(tempPath);
+                }
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
         }
     }
 }

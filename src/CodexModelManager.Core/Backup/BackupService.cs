@@ -560,13 +560,32 @@ public sealed class BackupService : IBackupService
     {
         byte[] manifestBytes = JsonSerializer.SerializeToUtf8Bytes(manifest, JsonOptions);
         string temp = Path.Combine(directory, ".manifest-" + Guid.NewGuid().ToString("N") + ".tmp");
-        await using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.Asynchronous | FileOptions.WriteThrough))
+        try
         {
-            await stream.WriteAsync(manifestBytes, cancellationToken).ConfigureAwait(false);
-            stream.Flush(true);
-        }
+            await using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.Asynchronous | FileOptions.WriteThrough))
+            {
+                await stream.WriteAsync(manifestBytes, cancellationToken).ConfigureAwait(false);
+                stream.Flush(true);
+            }
 
-        File.Move(temp, Path.Combine(directory, "manifest.json"));
+            File.Move(temp, Path.Combine(directory, "manifest.json"));
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(temp))
+                {
+                    File.Delete(temp);
+                }
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
+        }
     }
 
     /// <summary>解析快照内存储路径：必须相对且不得越出快照目录（防路径穿越）。</summary>

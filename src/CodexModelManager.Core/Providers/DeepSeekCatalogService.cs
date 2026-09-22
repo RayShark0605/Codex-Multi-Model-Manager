@@ -326,21 +326,40 @@ public sealed partial class DeepSeekCatalogService : IModelCatalogService
         }
 
         string temp = path + ".tmp-" + Guid.NewGuid().ToString("N");
-        await using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 64 * 1024, FileOptions.Asynchronous | FileOptions.WriteThrough))
+        try
         {
-            await stream.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
-            stream.Flush(true);
-        }
+            await using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 64 * 1024, FileOptions.Asynchronous | FileOptions.WriteThrough))
+            {
+                await stream.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
+                stream.Flush(true);
+            }
 
-        if (File.Exists(path))
-        {
-            string rollback = path + ".rollback-" + Guid.NewGuid().ToString("N");
-            File.Replace(temp, path, rollback, true);
-            File.Delete(rollback);
+            if (File.Exists(path))
+            {
+                string rollback = path + ".rollback-" + Guid.NewGuid().ToString("N");
+                File.Replace(temp, path, rollback, true);
+                File.Delete(rollback);
+            }
+            else
+            {
+                File.Move(temp, path);
+            }
         }
-        else
+        finally
         {
-            File.Move(temp, path);
+            try
+            {
+                if (File.Exists(temp))
+                {
+                    File.Delete(temp);
+                }
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
         }
     }
 
@@ -357,14 +376,33 @@ public sealed partial class DeepSeekCatalogService : IModelCatalogService
         string path = catalogPath + ".provenance.json";
         byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(data, IndentedJson);
         string temp = path + ".tmp-" + Guid.NewGuid().ToString("N");
-        await File.WriteAllBytesAsync(temp, bytes, cancellationToken).ConfigureAwait(false);
-        if (File.Exists(path))
+        try
         {
-            File.Replace(temp, path, null, true);
+            await File.WriteAllBytesAsync(temp, bytes, cancellationToken).ConfigureAwait(false);
+            if (File.Exists(path))
+            {
+                File.Replace(temp, path, null, true);
+            }
+            else
+            {
+                File.Move(temp, path);
+            }
         }
-        else
+        finally
         {
-            File.Move(temp, path);
+            try
+            {
+                if (File.Exists(temp))
+                {
+                    File.Delete(temp);
+                }
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
         }
     }
 

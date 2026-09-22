@@ -93,7 +93,7 @@ public sealed class GlmProviderTests
     [Fact]
     public async Task ExistingOfficialGlmBearerTableIsReusedVerbatim()
     {
-        const string providerTable = "[model_providers.ZAI]\n# official guide spacing\nname  =  \"ZAI\"\nbase_url = \"https://open.bigmodel.cn/api/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"glm-fixture-secret\"\n";
+        const string providerTable = "[model_providers.ZAI]\n# official guide spacing\nname  =  \"ZAI\"\nbase_url = \"https://open.bigmodel.cn/api/v1\" # official endpoint\nwire_api = \"responses\"\nexperimental_bearer_token = \"glm-fixture-secret\"\n";
         string original = "model = \"glm-5.3\"\nmodel_provider = \"ZAI\"\n\n" + providerTable;
         using var harness = new SwitchHarness(original);
 
@@ -103,6 +103,19 @@ public sealed class GlmProviderTests
         Assert.Contains(providerTable, candidate, StringComparison.Ordinal);
         Assert.DoesNotContain("[model_providers.ZAI.auth]", candidate, StringComparison.Ordinal);
         Assert.Contains(plan.Warnings, warning => warning.Contains("GLM 官方明文 bearer", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task OfficialGlmBearerTableWithDifferentPlatformEndpointIsRejected()
+    {
+        const string providerTable = "[model_providers.ZAI]\nname = \"ZAI\"\nbase_url = \"https://open.bigmodel.cn/api/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"glm-fixture-secret\"\n";
+        string original = "model = \"glm-5.3\"\nmodel_provider = \"ZAI\"\n\n" + providerTable;
+        using var harness = new SwitchHarness(original);
+
+        InvalidOperationException error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            harness.Service.CreatePlanAsync(harness.Request(ProviderKind.GLM) with { GlmPlatform = GlmPlatform.Zai }));
+
+        Assert.Contains("GLM 官方 bearer provider table 的 base_url", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]

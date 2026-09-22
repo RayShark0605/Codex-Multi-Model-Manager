@@ -1,6 +1,28 @@
 # Final Verification
 
-主验证日期：2026-08-22；最新增量验证：2026-09-11（Asia/Shanghai）。
+主验证日期：2026-08-22；最新增量验证：2026-09-22（Asia/Shanghai）。
+
+## 2026-09-22：二次全量复核、原子写清理、catalog 读集与 GLM 平台边界
+
+### 本轮范围与结论
+
+本轮全量审阅后确认，主切换事务、LM Studio 生命周期状态机和现有 fail-closed 门禁没有需要扩大修改面的新回归；新增缺陷集中在若干隔离原子写辅助函数和确认边界：最终 `File.Move`/`File.Replace` 失败时，设置、DeepSeek/GLM catalog cache/provenance、备份 manifest 和 WinForms helper copy 可能遗留临时文件；Provider catalog 未纳入 Preview/Commit 读集；GLM 官方 bearer 表跨国内/国际平台复用时可能静默指向错误 endpoint；GLM 平台控件未参与事务输入冻结。修复统一采用最小 `try/finally` 精确删除本次生成的 temp path，不吞主异常、不改变成功路径或回滚语义；catalog 现在做稳定指纹确认，官方 bearer endpoint 跨平台时 fail closed，GLM 平台选择纳入冻结控件。
+
+同时同步 `docs/KNOWN-LIMITATIONS.md` 与 `docs/OFFICIAL-COMPATIBILITY-NOTES.md`：当前实现的真实版本策略是本机 loopback LM Studio `>=0.4.21`，拒绝 prerelease/非法或缺失版本证据，并以 per-model defaults 严格结构校验作为最终兼容性兜底；0.4.24+ 的真实 unload/load、重载后四阶段和 Codex 端到端行为仍未现场验收。
+
+本轮未写入真实 Codex 配置、LM Studio defaults、凭据或用户目录，也未调用真实 `/load`、`/unload`、Provider API 或可见 GUI。
+
+### 自动化验证
+
+| 检查 | 结果 |
+|---|---|
+| Core Release 全量 | **521 PASS / 0 FAIL / 8 现场 opt-in SKIP**（新增 8 个二次复核回归） |
+| App Release 隔离 STA | **28 PASS / 0 FAIL / 0 SKIP**（新增 helper copy 清理回归） |
+| Debug / Release build | **均 PASS，0 warning / 0 error** |
+| `dotnet format --verify-no-changes --no-restore` | **PASS** |
+| `git diff --check` | **PASS** |
+
+新增回归覆盖：`AppSettingsRepository.SaveAsync`、DeepSeek/GLM cache 与 provenance promotion、`BackupService` manifest promotion、`MainController` helper copy promotion、Provider catalog preview/commit drift、GLM 官方 bearer endpoint 跨平台复用、GLM 平台事务输入冻结；所有失败场景均使用随机隔离目录并确认主异常仍传播、temp 文件不残留。
 
 ## 2026-09-11：LM Studio 流韧性键（一律 lmstudio_local_cmm + 三键注入）
 
@@ -260,7 +282,7 @@ TRX、构建/格式/发布日志、按测试 outcome 汇总的 `test-summary.jso
 - 当前重载形态的 `lms ps --json` 已重新确认：`identifier=qwen3.8-27b-nvfp4-mtp` 是 native loaded instance ID；`modelKey=esatapedico/qwen3.8-27b-nvfp4-mtp-gguf/qwen3.8-27b-nvfp4-mtp-highest.gguf` 是 source/load key。定位器现在严格区分两种职责，同时仍兼容旧形态 `modelKey=loaded ID`；任何第三种值、空字段或其他身份/配置冲突均阻断。
 - locator 只从 `lms ps` 已验证的精确物理路径产生 concrete model identifier。正式修复只支持本机 loopback LM Studio `0.4.21.x`，目标为：
 
-  `C:\Users\xr\.lmstudio\.internal\user-concrete-model-default-config\esatapedico\Qwen3.8-27B-NVFP4-MTP-GGUF\Qwen3.8-27B-NVFP4-MTP-HIGHEST.gguf.json`
+  `%USERPROFILE%\.lmstudio\.internal\user-concrete-model-default-config\esatapedico\Qwen3.8-27B-NVFP4-MTP-GGUF\Qwen3.8-27B-NVFP4-MTP-HIGHEST.gguf.json`
 
 - 新 `LmStudioPerModelDefaultsStore` 对 concrete 路径、models/defaults root、reparse point、JSON 大小/深度/结构、字段重复和未知自定义模板全部 fail closed。它只新增精确 v3、升级具有 completed provenance 的精确 v2，或对精确 v3 No-op；除 `llm.load.promptTemplate` 外的 JSON 语义保持不变。
 - schema-v4 流程按 `Prepared journal → CurrentUser DPAPI 备份并回读校验 → 原子 defaults 写入/复核 → 再次漂移检查 → 精确 unload → 不含 REST prompt_template 的 load → 完整配置复核 → 四阶段 PASS → defaults 再复核 → Codex Commit → Completed/PersistentDefaultVerified` 执行。回滚先恢复持久字段，再处理实例；外部替换 Prompt Template 时进入 `RecoveryBlocked`，不会覆盖用户内容或继续 unload/load。
@@ -296,7 +318,7 @@ LM Studio 官方文档确认 per-model defaults 会用于从应用及 `lms load`
 | CLI path / indexed identity | `esatapedico/Qwen3.8-27B-NVFP4-MTP-GGUF/Qwen3.8-27B-NVFP4-MTP-HIGHEST.gguf` / 同值 |
 | type / format / architecture / quantization | `llm` / `gguf` / `qwen35` / native 与 CLI 均缺失 |
 | loaded / max context | `262144` / `262144` |
-| 精确 GGUF | `J:\LM Studio Models\esatapedico\Qwen3.8-27B-NVFP4-MTP-GGUF\Qwen3.8-27B-NVFP4-MTP-HIGHEST.gguf` |
+| 精确 GGUF | `<LM-STUDIO-MODELS-ROOT>\esatapedico\Qwen3.8-27B-NVFP4-MTP-GGUF\Qwen3.8-27B-NVFP4-MTP-HIGHEST.gguf` |
 | 原模板 / v3 SHA-256 | `12827F24B742EA4E80CDC12DBCF9622227056B9F797252A3149263D4F9AAADCE` / `9DC0DA000D1DF280BE9F6F64D314EB52879C0DF5C3C951F74105964136592F85` |
 | 当前 defaults | 1,067 bytes / `E94F602B80ADC475C4BAE1896D1C7246738E37CA191FB4CDA78E91C9B9CCA8D0` / Prompt Template 字段 0 / Preview=`Add` |
 | 当前 Codex config | 5,627 bytes / `7C27544E22001F108EF7B6C81166B5FB8B9E1C6AB61841E803E6BC21ED63B4DF` / implicit OpenAI / `gpt-5.6-sol` |
@@ -351,7 +373,7 @@ LM Studio 官方文档确认 per-model defaults 会用于从应用及 `lms load`
 | type / architecture / format | `llm` / `qwen35` / `gguf` |
 | native / CLI quantization | `null` / 缺失 |
 | loaded context / max context | `262144` / `262144` |
-| 精确文件 | `J:\LM Studio Models\esatapedico\Qwen3.8-27B-NVFP4-MTP-GGUF\Qwen3.8-27B-NVFP4-MTP-HIGHEST.gguf` |
+| 精确文件 | `<LM-STUDIO-MODELS-ROOT>\esatapedico\Qwen3.8-27B-NVFP4-MTP-GGUF\Qwen3.8-27B-NVFP4-MTP-HIGHEST.gguf` |
 | locator provenance | `lms ps --json` |
 
 - live locator + GGUF test：2 PASS / 0 FAIL，`artifacts\test-results\nvfp4-fix\nvfp4-live-readonly-final.trx`。
@@ -369,7 +391,7 @@ before、after、final、模板、hierarchy 和不变量证据分别保存在：
 - `artifacts\test-results\nvfp4-fix\nvfp4-final-invariants.json`
 - `artifacts\test-results\nvfp4-fix\transaction-state-final.json`
 
-最终不变量全部为 `true`：`C:\Users\xr\.codex\config.toml` 前后均为 5545 bytes、SHA-256 `95B7CFCE62289B54AD0C8AAE1BDC91F4E52C18E84DD0E74A46B6A836D2FC643A`、模型 `gpt-5.6-sol`、隐式 OpenAI Provider；loaded instance/source/context、CLI identity/path 和 GGUF 长度/时间戳也均未变化。现有 17 个 transaction journal 全部为 `Completed` 或 `RolledBack`，未完成数为 0，本次只读验证没有创建新事务。
+最终不变量全部为 `true`：`%USERPROFILE%\.codex\config.toml` 前后均为 5545 bytes、SHA-256 `95B7CFCE62289B54AD0C8AAE1BDC91F4E52C18E84DD0E74A46B6A836D2FC643A`、模型 `gpt-5.6-sol`、隐式 OpenAI Provider；loaded instance/source/context、CLI identity/path 和 GGUF 长度/时间戳也均未变化。现有 17 个 transaction journal 全部为 `Completed` 或 `RolledBack`，未完成数为 0，本次只读验证没有创建新事务。
 
 ### 发布版 GUI smoke
 
@@ -395,7 +417,7 @@ before、after、final、模板、hierarchy 和不变量证据分别保存在：
 
 - 没有调用 LM Studio `/load` 或 `/unload`；
 - 没有把兼容 Prompt Template 应用到正在运行的实例；
-- 没有写入 `C:\Users\xr\.codex\config.toml`；
+- 没有写入 `%USERPROFILE%\.codex\config.toml`；
 - 没有切换真实 Codex Provider；
 - 没有修改 GGUF、LM Studio settings、Credential Manager 或既有 transaction journal；
 - 现场验证仅包括 native/CLI 状态读取、GGUF metadata 读取、临时目录模板导出和文件指纹比较。
@@ -481,7 +503,7 @@ native `/api/v1/models` 仍是 loaded instance 和实际 context 的权威来源
 
 `lms ps --json --host 127.0.0.1 --port 1234` 唯一解析到：
 
-`J:\LM Studio Models\unsloth\Qwen3.8-27B-GGUF\Qwen3.8-27B-UD-Q6_K_XL.gguf`
+`<LM-STUDIO-MODELS-ROOT>\unsloth\Qwen3.8-27B-GGUF\Qwen3.8-27B-UD-Q6_K_XL.gguf`
 
 解析 provenance 为 `lms ps --json`。`lms ls --json --variants` 没有当前 Unsloth 文件，但仍保留为 Hub variant 数据面。
 
@@ -528,7 +550,7 @@ native `/api/v1/models` 仍是 loaded instance 和实际 context 的权威来源
 
 发布目录：
 
-`D:\MyProjects\Codex Multi-Model Manager\artifacts\publish\win-x64`
+`<repo-root>\artifacts\publish\win-x64`
 
 | 文件 | Bytes | SHA-256 | File version |
 |---|---:|---|---|
@@ -563,8 +585,8 @@ native `/api/v1/models` 仍是 loaded instance 和实际 context 的权威来源
 
 本轮交叉核对了以下现场工件：
 
-- `C:\Users\xr\.lmstudio\server-logs\2026-08\2026-08-23.1.log`
-- `C:\Users\xr\.codex\sessions\2026\08\22\rollout-2026-08-22T21-59-05-01a029c4-9993-7393-9f7e-b92a7fb0d722.jsonl`
+- `%USERPROFILE%\.lmstudio\server-logs\2026-08\2026-08-23.1.log`
+- `%USERPROFILE%\.codex\sessions\2026\08\22\rollout-2026-08-22T21-59-05-01a029c4-9993-7393-9f7e-b92a7fb0d722.jsonl`
 
 失败链已确认为：模型生成到 `n_tokens=120063`、`truncated=1`，正在生成的 tool-call arguments JSON 在 `120064` 硬窗口处被截断，LM Studio 的 `handleToolCallGenerationFailed` 随后报告 `Unterminated string in JSON`。Codex UI 的 `stream disconnected before completion` 是 `response.failed` 的上层包装；提高 stream retry/timeout 不会修复已被截断的 JSON。
 
@@ -589,9 +611,9 @@ native `/api/v1/models` 仍是 loaded instance 和实际 context 的权威来源
 
 测试工件：
 
-- `D:\MyProjects\Codex Multi-Model Manager\artifacts\test-results\context-overflow-debug-final.trx`
-- `D:\MyProjects\Codex Multi-Model Manager\artifacts\test-results\context-overflow-release.trx`
-- `D:\MyProjects\Codex Multi-Model Manager\artifacts\test-results\context-overflow-isolated-roundtrip.trx`
+- `<repo-root>\artifacts\test-results\context-overflow-debug-final.trx`
+- `<repo-root>\artifacts\test-results\context-overflow-release.trx`
+- `<repo-root>\artifacts\test-results\context-overflow-isolated-roundtrip.trx`
 
 ### 真实状态零写入预览
 
@@ -606,17 +628,17 @@ model_auto_compact_token_limit_scope = "total"
 tool_output_token_limit = 2401
 ```
 
-验证程序从未调用 `CommitAsync`。真实 `C:\Users\xr\.codex\config.toml` 在预览前后均为 5,542 bytes，SHA-256 均为 `969B94165B0DF735FBE1D769DB12C06D14557DE5D5011B97D94548E6EA63F48D`；provider 仍是隐式 `openai`，model 仍是 `gpt-5.6-sol`。结构化证据：
+验证程序从未调用 `CommitAsync`。真实 `%USERPROFILE%\.codex\config.toml` 在预览前后均为 5,542 bytes，SHA-256 均为 `969B94165B0DF735FBE1D769DB12C06D14557DE5D5011B97D94548E6EA63F48D`；provider 仍是隐式 `openai`，model 仍是 `gpt-5.6-sol`。结构化证据：
 
-`D:\MyProjects\Codex Multi-Model Manager\artifacts\test-results\context-overflow-readonly-preview.json`
+`<repo-root>\artifacts\test-results\context-overflow-readonly-preview.json`
 
 ### 发布工件
 
 | 文件 | Bytes | SHA-256 |
 |---|---:|---|
-| `D:\MyProjects\Codex Multi-Model Manager\artifacts\publish\win-x64\CodexModelManager.exe` | 71,988,411 | `C8915E37A685598E22596C4585D411B2936CE56BE876D154D3A3D6EB3D3AFDB4` |
-| `D:\MyProjects\Codex Multi-Model Manager\artifacts\publish\win-x64\helpers\credential\CodexModelManager.CredentialHelper.exe` | 35,441,726 | `23D7473F2ABC48D515664D3C87028125CB8DE9D888D8030FA7667148819D4187` |
-| `D:\MyProjects\Codex Multi-Model Manager\artifacts\publish\win-x64\helpers\mcp\CodexModelManager.TestMcpServer.exe` | 35,092,605 | `2549EA8F0AEF26FA82822925D34E4EC4CEA326D64069440D3413459FB14C9A9C` |
+| `<repo-root>\artifacts\publish\win-x64\CodexModelManager.exe` | 71,988,411 | `C8915E37A685598E22596C4585D411B2936CE56BE876D154D3A3D6EB3D3AFDB4` |
+| `<repo-root>\artifacts\publish\win-x64\helpers\credential\CodexModelManager.CredentialHelper.exe` | 35,441,726 | `23D7473F2ABC48D515664D3C87028125CB8DE9D888D8030FA7667148819D4187` |
+| `<repo-root>\artifacts\publish\win-x64\helpers\mcp\CodexModelManager.TestMcpServer.exe` | 35,092,605 | `2549EA8F0AEF26FA82822925D34E4EC4CEA326D64069440D3413459FB14C9A9C` |
 
 ### 尚未验证的运行时边界
 
@@ -643,15 +665,15 @@ tool_output_token_limit = 2401
 | 差异空白 | `git diff --check` | **PASS** |
 | 发布脚本 | `.\publish.ps1` | **PASS**；脚本内重新执行 Release build、Core 与 App tests 后发布三个 self-contained win-x64 single-file 产物 |
 
-七个 skipped 仍全部是既有显式 opt-in live 用例；普通验证没有隐式执行真实 LM Studio 生命周期或真实 Codex Agent 请求。既有未跟踪文件 `D:\MyProjects\Codex Multi-Model Manager\nul` 保持原样，没有删除或纳入修复内容。
+七个 skipped 仍全部是既有显式 opt-in live 用例；普通验证没有隐式执行真实 LM Studio 生命周期或真实 Codex Agent 请求。既有未跟踪文件 `<repo-root>\nul` 保持原样，没有删除或纳入修复内容。
 
 ### 发布工件
 
 | 文件 | Bytes | SHA-256 |
 |---|---:|---|
-| `D:\MyProjects\Codex Multi-Model Manager\artifacts\publish\win-x64\CodexModelManager.exe` | 72,011,518 | `C3D1A8C427885FF89D9EB43EE498D7F9380F620CCE6E0F451317BB0D21D1E97C` |
-| `D:\MyProjects\Codex Multi-Model Manager\artifacts\publish\win-x64\helpers\credential\CodexModelManager.CredentialHelper.exe` | 35,460,715 | `70C7044182C451DC2A7B3285BA49DD0AB71AC879221B76F006617C7724D5FD0B` |
-| `D:\MyProjects\Codex Multi-Model Manager\artifacts\publish\win-x64\helpers\mcp\CodexModelManager.TestMcpServer.exe` | 35,092,926 | `C1E9641256BE9E0C91142706DD3000EDF78E59775079A59C42EAB2B1E1E7E000` |
+| `<repo-root>\artifacts\publish\win-x64\CodexModelManager.exe` | 72,011,518 | `C3D1A8C427885FF89D9EB43EE498D7F9380F620CCE6E0F451317BB0D21D1E97C` |
+| `<repo-root>\artifacts\publish\win-x64\helpers\credential\CodexModelManager.CredentialHelper.exe` | 35,460,715 | `70C7044182C451DC2A7B3285BA49DD0AB71AC879221B76F006617C7724D5FD0B` |
+| `<repo-root>\artifacts\publish\win-x64\helpers\mcp\CodexModelManager.TestMcpServer.exe` | 35,092,926 | `C1E9641256BE9E0C91142706DD3000EDF78E59775079A59C42EAB2B1E1E7E000` |
 
 ### 尚未验证的运行时边界
 

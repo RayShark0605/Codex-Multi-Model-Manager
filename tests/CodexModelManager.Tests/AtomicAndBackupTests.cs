@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Text;
 using CodexModelManager.Core.Abstractions;
 using CodexModelManager.Core.Backup;
@@ -222,5 +223,20 @@ public sealed class AtomicAndBackupTests
         await File.WriteAllTextAsync(Path.Combine(baseline, "content.toml"), "corrupt");
 
         await Assert.ThrowsAsync<InvalidDataException>(() => backups.EnsureSupplementalBaselinesAsync([external]));
+    }
+
+    [Fact]
+    public async Task BackupManifestPromotionLeavesNoTempFileWhenFinalMoveFails()
+    {
+        using var root = new TemporaryDirectory();
+        string directory = Path.Combine(root.Path, "snapshot");
+        Directory.CreateDirectory(directory);
+        Directory.CreateDirectory(Path.Combine(directory, "manifest.json"));
+        MethodInfo method = typeof(BackupService).GetMethod("WriteManifestAsync", BindingFlags.NonPublic | BindingFlags.Static)!;
+        var task = (Task)method.Invoke(null, [directory, new BackupManifest(), CancellationToken.None])!;
+
+        await Assert.ThrowsAsync<IOException>(async () => await task);
+
+        Assert.Empty(Directory.EnumerateFiles(directory, ".manifest-*.tmp"));
     }
 }

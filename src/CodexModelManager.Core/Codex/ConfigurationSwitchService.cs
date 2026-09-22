@@ -150,6 +150,15 @@ public sealed class ConfigurationSwitchService
             [Path.GetFullPath(configPath)] = source.Fingerprint,
             [settingsPath] = settingsFingerprint,
         };
+        string? catalogPath = request.TargetProvider switch
+        {
+            ProviderKind.DeepSeek => request.DeepSeekCatalogPath,
+            ProviderKind.GLM => request.GlmCatalogPath,
+            _ => null,
+        };
+        FileFingerprint? catalogFingerprint = string.IsNullOrWhiteSpace(catalogPath)
+            ? null
+            : await FileFingerprintService.CaptureAsync(Path.GetFullPath(catalogPath), cancellationToken).ConfigureAwait(false);
         List<string> warnings = [];
         IReadOnlyList<SecondaryModelOverride> overrides = await overrideScanner.ScanAsync(configPath, cancellationToken).ConfigureAwait(false);
 
@@ -172,6 +181,18 @@ public sealed class ConfigurationSwitchService
                 break;
             default:
                 throw new InvalidOperationException("unknown provider：已拒绝生成切换计划。");
+        }
+
+        if (catalogPath is not null && catalogFingerprint is FileFingerprint expectedCatalogFingerprint)
+        {
+            string fullCatalogPath = Path.GetFullPath(catalogPath);
+            FileFingerprint actualCatalogFingerprint = await FileFingerprintService.CaptureAsync(fullCatalogPath, cancellationToken).ConfigureAwait(false);
+            if (!FileFingerprintService.Matches(expectedCatalogFingerprint, actualCatalogFingerprint))
+            {
+                throw new IOException("Provider catalog 在生成预览期间发生变化，请重新加载并再次预览。");
+            }
+
+            readFingerprints[fullCatalogPath] = expectedCatalogFingerprint;
         }
 
         ConfigPatchResult patch = patchEngine.Apply(source.Text, new ConfigPatchRequest(roots, tables, removeTables));
@@ -575,6 +596,12 @@ public sealed class ConfigurationSwitchService
 
         if (HasExperimentalBearerTable(read, GlmPlatforms.ProviderTableName))
         {
+            string? existingBaseUrl = GetTableStringValue(read, GlmPlatforms.ProviderTableName, "base_url");
+            if (!AreEquivalentProviderUrls(existingBaseUrl, GlmPlatforms.BaseUrl(platform)))
+            {
+                throw new InvalidOperationException("GLM 官方 bearer provider table 的 base_url 与当前选择的平台不一致；为避免把请求静默发送到错误平台，请先在官方配置中切换 endpoint 或删除该表后重新预览。");
+            }
+
             // 该表归官方 GLM 指南/助手所有：保留其原始字节/注释/顺序，
             // 而不是删除后重建一个携带 token 的表。
             removeTables.RemoveAll(table => table == GlmPlatforms.ProviderTableName);
@@ -718,6 +745,43 @@ public sealed class ConfigurationSwitchService
     /// <summary>判断指定表（含子表）原文中是否含 experimental_bearer_token。</summary>
     private static bool HasExperimentalBearerTable(ConfigReadResult read, string tablePath) =>
         ComposeTableTree(read, tablePath)?.Contains("experimental_bearer_token", StringComparison.Ordinal) == true;
+
+    /// <summary>读取指定 Provider 父表中的简单字符串键（用于验证官方 bearer 表的平台 endpoint）。</summary>
+    private static string? GetTableStringValue(ConfigReadResult read, string tablePath, string key)
+    {
+        if (!read.TableBodies.TryGetValue(tablePath, out string? body))
+        {
+            return null;
+        }
+
+        try
+        {
+            TomlSourceDocument document = TomlSourceDocument.Parse($"[{tablePath}]\n{body}");
+            TomlSourceAssignment? assignment = document.Assignments.SingleOrDefault(item =>
+                item.Segments.Count == tablePath.Split('.').Length + 1 &&
+                item.Segments[^1].Equals(key, StringComparison.Ordinal));
+            return assignment?.StringValue ?? CodexRuntimeProbe.Unquote(assignment?.RawValue);
+        }
+        catch (InvalidDataException)
+        {
+            // 官方表体若已不再是可解析 TOML，继续 fail closed，不能猜测 endpoint。
+            return null;
+        }
+    }
+
+    /// <summary>比较 Provider endpoint，允许官方配置尾随斜杠但不允许跨平台或其他 authority。</summary>
+    private static bool AreEquivalentProviderUrls(string? actual, string expected)
+    {
+        if (!Uri.TryCreate(actual, UriKind.Absolute, out Uri? actualUri) || !Uri.TryCreate(expected, UriKind.Absolute, out Uri? expectedUri))
+        {
+            return false;
+        }
+
+        return actualUri.Scheme.Equals(expectedUri.Scheme, StringComparison.OrdinalIgnoreCase) &&
+            actualUri.Host.Equals(expectedUri.Host, StringComparison.OrdinalIgnoreCase) &&
+            actualUri.Port == expectedUri.Port &&
+            actualUri.AbsolutePath.TrimEnd('/').Equals(expectedUri.AbsolutePath.TrimEnd('/'), StringComparison.Ordinal);
+    }
 
     /// <summary>
     /// 清理纳管 Provider 表，但保留调用方刚配置的表：
