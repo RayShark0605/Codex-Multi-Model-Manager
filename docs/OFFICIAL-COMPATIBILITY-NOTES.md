@@ -62,6 +62,31 @@
 - 管理器只复用带相邻 provenance 的 home catalog：`source` 必须精确匹配所选官方 Codex 指南 URL，`catalogSha256` 必须匹配本次读取的字节；无 provenance、跨平台来源或 SHA 漂移均切换到平台专用缓存/在线指南/内嵌快照。
 - 该门禁避免把 BigModel-only 模型（例如当前国内快照中的 `glm-5-turbo`）展示给 Z.ai endpoint；它不修改用户的 `models.json`，也不把 catalog provenance 写入真实 Codex home。
 
+## Codex reasoning 实时显示与 LM Studio（2026-09-26 核对）
+
+核对对象：codex-rs 当前 main 源码、官方 Configuration Reference、本机 LM Studio `0.4.x` 实测。结论链：
+
+- 请求侧：`build_responses_request` 恒发送 `reasoning` 对象；`summary` 仅当模型 metadata `supports_reasoning_summary_parameter` 且配置值非 `none` 时携带。未知/本地模型走 `model_info_from_slug` fallback：`supports_reasoning_summary_parameter = true`、`default_reasoning_summary = Auto`——因此 Codex 对 LM Studio 模型默认已请求 summary。`include: ["reasoning.encrypted_content"]` 恒发送，本机实测 LM Studio 对该字段不报错。
+- 流式侧：codex-rs SSE 解析处理三类 reasoning 事件：`response.reasoning_summary_text.delta`（→ summary 增量）、`response.reasoning_summary_part.added`（分段）、`response.reasoning_text.delta`（→ raw reasoning 增量，要求 payload 同时含 `delta` 与 `content_index`）。
+- 显示侧：summary 增量无条件渲染；**raw 增量的实时渲染由 `show_raw_agent_reasoning`（config.toml 根键，官方默认 false）门控**；Codex CLI `--oss` 本地模型模式官方默认把它设为 true。`hide_agent_reasoning`（默认 false）可抑制全部思考显示，属用户自设键、不在本工具纳管范围。
+- LM Studio 侧（本机 0.4.x 对已加载 `qwen3.8-flash-next-uncensored` 实测，两种 Codex 形态各一次流式请求）：
+  - `reasoning: {effort:"low", summary:"auto"}` + `include` 形态：HTTP 200，SSE 含 54 个 `response.reasoning_text.delta`、`response.reasoning_text.done`、`output_item.added/done`（`type:"reasoning"`，`content:[{type:"reasoning_text"}]`）。
+  - 无 effort（fallback 默认形态）+ `summary:"auto"`：HTTP 200，19 个 `response.reasoning_text.delta`。
+  - 两种形态均**未出现** `response.reasoning_summary_text.delta`：LM Studio 不生成摘要，原始思考是唯一通道。
+  - 事件 payload 含 `item_id`/`output_index`/`content_index`/`delta`/`sequence_number`，满足 codex-rs 解析要求。
+- 因此本工具在切换到 LM Studio 时写入 `show_raw_agent_reasoning = true`；切离时按 Provider 快照恢复（OpenAI 走既有 restore 循环，DeepSeek/GLM 与 `tool_output_token_limit` 同一 `GetSavedProviderRoot` 语义），候选语义校验要求 LM Studio 目标该键为 `true`。
+
+依据：
+
+- [Configuration Reference](https://developers.openai.com/codex/config-reference)（`show_raw_agent_reasoning`、`hide_agent_reasoning`、`model_reasoning_summary`、`model_reasoning_effort`）
+- [codex-rs client.rs build_reasoning/build_responses_request](https://github.com/openai/codex/blob/main/codex-rs/core/src/client.rs)（reasoning 参数组装与 `include`）
+- [codex-rs models-manager model_info.rs](https://github.com/openai/codex/blob/main/codex-rs/models-manager/src/model_info.rs)（未知模型 fallback metadata）
+- [codex-rs sse responses.rs](https://github.com/openai/codex/blob/main/codex-rs/codex-api/src/sse/responses.rs)（reasoning 事件解析）
+- [codex-rs session turn.rs](https://github.com/openai/codex/blob/main/codex-rs/core/src/session/turn.rs)（事件→AgentReasoning 通道分流）
+- [codex-rs tui chatwidget protocol.rs](https://github.com/openai/codex/blob/main/codex-rs/tui/src/chatwidget/protocol.rs)（`show_raw_agent_reasoning` 实时渲染门控）
+- [codex-rs cli main.rs](https://github.com/openai/codex/blob/main/codex-rs/cli/src/main.rs)（`--oss` 默认开启该键）
+- LM Studio 官方文档未详述 `/v1/responses` 的 reasoning 事件面；本节 LM Studio 行为以本机实测为准（探针工件见 `docs/VERIFICATION.md` 2026-09-26 节）。
+
 ## LM Studio
 
 - native `/api/v1/models` 返回 `key`、display name、quantization object、size、architecture、max context、capabilities 与 loaded instances。

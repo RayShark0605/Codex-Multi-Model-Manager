@@ -32,6 +32,9 @@ public static class ManagedConfigKeys
         "preferred_auth_method",
         "forced_login_method",
         "openai_base_url",
+        // LM Studio 本地模型的思考只经 response.reasoning_text.delta（raw reasoning）流式输出，
+        // Codex 渲染该通道的唯一门控即本键（默认 false）；切离 LM Studio 时按 Provider 快照恢复原值
+        "show_raw_agent_reasoning",
     };
 
     /// <summary>纳管的 Provider 表（含其子表路径）。</summary>

@@ -2,6 +2,13 @@
 
 ## 已确认
 
+1. **`show_raw_agent_reasoning = true` 只解锁渲染通道，真实显示效果仍待端到端验收。**
+   - 依据为 codex-rs 源码（fallback metadata 默认请求 summary、raw 通道由该键门控、`--oss` 默认开启）与本机 LM Studio 0.4.x 流式探针（`response.reasoning_text.delta` 实测出现、summary 事件实测不出现）；未启动真实 Codex CLI/Desktop 会话验证屏幕上的思考渲染。
+   - Codex Desktop 前端为闭源组件；本工具只能证明 app-server 会把 raw reasoning 增量转发给前端（源码证据），桌面端与 TUI 的渲染行为对齐性未实测。
+   - LM Studio 若某模型 reasoning capability 为 off 或模型不产生思考，该键无害但也没有内容可显示；管理器不据此伪造能力声明。
+   - `hide_agent_reasoning`（用户自设键，默认 false）会抑制全部思考显示；该键不在纳管范围，冲突时以用户配置为准。
+   - 本轮未写入真实 `~/.codex/config.toml`；用户下次经管理器切换到 LM Studio 时才会落地该键，届时以真实会话验收为准。
+
 1. **Qwen 内置模板以及旧 `qwen-leading-instructions-v2` 都不能由单轮成功推导完整 Codex 兼容。**
    - 内置模板的差分请求证明 `instructions + user` 返回 200，只增加独立 developer 消息便返回 `System message must be at the beginning`。
    - 旧 v2 可让 Basic、Leading Developer、无后置 developer 的多轮 Conversation Control 三项返回 200，但 Plan→Default 会在历史后追加 developer，随后精确返回 `System and developer messages must precede conversation messages.`。当前 Unsloth prefix-merged-system 内置模板同样只收集开头连续指令，现场四阶段形状为 200/200/200/500，但 Continuation 错误仍是 `System message must be at the beginning.`；planner 仅把这一完整形状识别为 BuiltIn provenance。

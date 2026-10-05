@@ -213,6 +213,56 @@ public sealed class SwitchMatrixTests
     }
 
     [Fact]
+    public async Task LmStudioPlanEnablesShowRawAgentReasoningForLiveThinking()
+    {
+        using var harness = new SwitchHarness(SwitchHarness.BaseConfig);
+        SwitchPlan plan = await harness.Service.CreatePlanAsync(harness.Request(ProviderKind.LmStudio));
+        string text = Encoding.UTF8.GetString(Assert.Single(plan.Files).CandidateBytes!);
+
+        Assert.Contains("show_raw_agent_reasoning = true", text, StringComparison.Ordinal);
+        Assert.Contains(plan.Mutations, mutation => mutation.KeyPath == "show_raw_agent_reasoning" && mutation.Kind == ConfigMutationKind.Add);
+        Assert.Contains(plan.Warnings, warning => warning.Contains("show_raw_agent_reasoning", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ExistingShowRawAgentReasoningTrueIsLeftUntouched()
+    {
+        string config = SwitchHarness.BaseConfig.Replace("model_reasoning_effort = \"max\"", "model_reasoning_effort = \"max\"\nshow_raw_agent_reasoning = true", StringComparison.Ordinal);
+        using var harness = new SwitchHarness(config);
+        SwitchPlan plan = await harness.Service.CreatePlanAsync(harness.Request(ProviderKind.LmStudio));
+        string text = Encoding.UTF8.GetString(Assert.Single(plan.Files).CandidateBytes!);
+
+        Assert.Contains("show_raw_agent_reasoning = true", text, StringComparison.Ordinal);
+        Assert.DoesNotContain(plan.Mutations, mutation => mutation.KeyPath == "show_raw_agent_reasoning");
+    }
+
+    [Theory]
+    [InlineData(ProviderKind.DeepSeek)]
+    [InlineData(ProviderKind.GLM)]
+    public async Task SwitchingAwayFromLmStudioRemovesShowRawAgentReasoning(ProviderKind target)
+    {
+        using var harness = new SwitchHarness(SourceConfig(ProviderKind.LmStudio).Replace("model_auto_compact_token_limit = 57344", "model_auto_compact_token_limit = 57344\nshow_raw_agent_reasoning = true", StringComparison.Ordinal));
+        SwitchPlan plan = await harness.Service.CreatePlanAsync(harness.Request(target));
+        string text = Encoding.UTF8.GetString(Assert.Single(plan.Files).CandidateBytes!);
+
+        Assert.DoesNotContain("show_raw_agent_reasoning", text, StringComparison.Ordinal);
+        Assert.Contains(plan.Mutations, mutation => mutation.KeyPath == "show_raw_agent_reasoning" && mutation.Kind == ConfigMutationKind.Remove);
+    }
+
+    [Fact]
+    public async Task OpenAiShowRawAgentReasoningValueRoundTripsThroughLmStudio()
+    {
+        string config = SwitchHarness.BaseConfig.Replace("model_reasoning_effort = \"max\"", "model_reasoning_effort = \"max\"\nshow_raw_agent_reasoning = false", StringComparison.Ordinal);
+        using var harness = new SwitchHarness(config);
+
+        await harness.Service.CommitAsync(await harness.Service.CreatePlanAsync(harness.Request(ProviderKind.LmStudio)));
+        Assert.Contains("show_raw_agent_reasoning = true", harness.ReadConfig(), StringComparison.Ordinal);
+
+        await harness.Service.CommitAsync(await harness.Service.CreatePlanAsync(harness.Request(ProviderKind.OpenAI)));
+        Assert.Contains("show_raw_agent_reasoning = false", harness.ReadConfig(), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task FutureGlmWithoutReasoningMetadataLeavesReasoningUnset()
     {
         using var harness = new SwitchHarness(SwitchHarness.BaseConfig);

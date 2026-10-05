@@ -159,9 +159,13 @@ public sealed partial class CodexRuntimeProbe : ICodexRuntimeProbe
         return snapshots;
     }
 
-    /// <summary>筛出运行中的 Codex/ChatGPT 进程（排除本管理器自身），去重排序后格式化为“名称 (PID)”。</summary>
-    private static string[] DetectProcesses(IEnumerable<ProcessSnapshot> snapshots) => snapshots
+    /// <summary>桌面版安装的常驻沙箱辅助服务进程名：开机自启且不持有会话状态，不计入“Codex 正在运行”。</summary>
+    internal const string SandboxServiceProcessName = "codex-windows-sandbox-service";
+
+    /// <summary>筛出运行中的 Codex/ChatGPT 进程（排除本管理器自身与桌面版常驻沙箱服务），去重排序后格式化为“名称 (PID)”。</summary>
+    internal static string[] DetectProcesses(IEnumerable<ProcessSnapshot> snapshots) => snapshots
         .Where(snapshot => !snapshot.Name.StartsWith("CodexModelManager", StringComparison.OrdinalIgnoreCase))
+        .Where(snapshot => !string.Equals(snapshot.Name, SandboxServiceProcessName, StringComparison.OrdinalIgnoreCase))
         .Where(snapshot => IsCodexProcess(snapshot) || IsChatGptProcess(snapshot))
         .Select(snapshot => $"{snapshot.Name} (PID {snapshot.Id})")
         .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -212,7 +216,7 @@ public sealed partial class CodexRuntimeProbe : ICodexRuntimeProbe
     private static partial Regex DesktopVersionRegex();
 
     /// <summary>单个进程的快照信息。</summary>
-    private sealed record ProcessSnapshot(
+    internal sealed record ProcessSnapshot(
         int Id,
         string Name,
         string? Path,

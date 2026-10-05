@@ -6,6 +6,8 @@
 
 ## 当前交付状态
 
+- 2026-09-26 LM Studio 思考过程实时显示：切换到 LM Studio 时现在会写入 `show_raw_agent_reasoning = true`（新增纳管根键），使 Codex 实时渲染本地模型经 `response.reasoning_text.delta` 流式输出的原始思考。依据链：codex-rs 对未知/本地模型 fallback metadata 默认发送 `reasoning.summary`，但 LM Studio 实测不产生 summary 事件、思考仅走 raw 通道；Codex 端渲染 raw 通道由该键门控（默认 false，CLI `--oss` 官方默认 true）。切离 LM Studio 时按 OpenAI/DeepSeek/GLM 各自 Provider 快照恢复原值（无记录则删除）。本机对已加载 `qwen3.8-flash-next-uncensored` 的两种 Codex 形态流式探针均返回 200 且含思考流事件；未写入真实 `config.toml`，桌面端实际渲染效果待用户下次切换验收。隔离回归 **Core 537 PASS / App 28 PASS / 0 FAIL / 8 现场 opt-in SKIP**。
+- 2026-09-25 Codex 状态误报修复：Codex 桌面版安装的常驻沙箱辅助服务 `codex-windows-sandbox-service`（服务名 `CodexSandboxService.OpenAI.Codex`，开机自启、显示名 "ChatGPT"）此前被进程检测判为“Codex 正在运行”，导致用户未打开 Codex 时状态永远显示 Running 且切换按钮被禁用。现按精确进程名排除该服务（不影响桌面版版本号探测；未知变体仍保守报 Running）。隔离回归 **Core 532 PASS / App 28 PASS / 0 FAIL / 8 现场 opt-in SKIP**。
 - 2026-09-22 再次全量审阅：修复 GLM 共享 `models.json` 无平台 provenance 时跨 BigModel/Z.ai 复用的缺陷；同时保留未来 slug 与可选 reasoning metadata 兼容修复。隔离回归 **Core 528 PASS / App 28 PASS / 0 FAIL / 8 现场 opt-in SKIP**；真实 Provider/LM Studio 生命周期仍未执行。
 - 2026-09-22 再次全量复核：修复设置、DeepSeek/GLM catalog cache/provenance、备份 manifest 与 WinForms helper copy 在原子 promotion 失败时遗留 `.tmp-*` 的资源清理缺陷；把 DeepSeek/GLM catalog 纳入 Preview/Commit 读集，拒绝跨平台复用错误的 GLM 官方 bearer endpoint，并冻结 GLM 平台选择控件参与事务确认；同步 LM Studio `>=0.4.21 + 严格 defaults 结构校验` 的兼容性文档。隔离回归 **Core 521 PASS / App 28 PASS / 0 FAIL / 8 现场 opt-in SKIP**；真实 Provider/LM Studio 生命周期仍未执行。
 - 2026-09-11 LM Studio 流韧性键：切换到 LM Studio 时一律使用 `lmstudio_local_cmm` custom provider（含默认 1234、无认证场景），表内固定写入 `stream_idle_timeout_ms = 2000000`、`stream_max_retries = 2`、`request_max_retries = 2`——修复本地大模型长 prefill（如自动压缩）超过 Codex 默认 5 分钟 SSE 空闲超时被断流并重发 sampling request 的问题。依据：官方配置参考确认三键只在 `[model_providers.*]` 表内生效，而 Codex 源码 `merge_configured_model_providers` 对非 Bedrock 内置 ID 一律 `or_insert`（用户写入的 `[model_providers.lmstudio]` 被静默忽略），因此放弃内置路由。附带：Preview/semantic diff 对非敏感 Provider 表体直出真实键值（含 token 的表体继续掩码）；删除位于文件末尾的纳管表时收敛残留分隔空行。隔离回归 **Core 513 PASS / App 27 PASS / 0 FAIL / 8 现场 opt-in SKIP**。
@@ -75,6 +77,7 @@ Codex 可能在运行期间缓存配置、更新模型 cache 或自行写回 `co
 - `lms server status` 用于窄范围发现当前端口；否则使用已保存 endpoint 或默认 `127.0.0.1:1234`，不进行广泛端口扫描。
 - 一律使用 `lmstudio_local_cmm` custom provider（含默认 1234、无认证场景）：Codex 源码 `merge_configured_model_providers` 对非 Bedrock 内置 ID（openai/ollama/lmstudio）一律 `or_insert`，用户写入的 `[model_providers.lmstudio]` 会被静默忽略，因此流韧性键只能放进自建表；内置 lmstudio 的定义（`http://localhost:1234/v1` + Responses + 无认证）与该表内容等价，无功能损失。用户手写的 `[model_providers.lmstudio]` 同样对 Codex 无效；该表不属于管理器纳管范围，切换时原样保留、不做清理。
 - 表内固定携带 SSE/请求流韧性键：`stream_idle_timeout_ms = 2000000`、`stream_max_retries = 2`、`request_max_retries = 2`（官方默认 300000/5/4），避免本地大模型长 prefill（如自动压缩）超过默认 5 分钟空闲超时被判流失活并重发 sampling request；切离 LM Studio 时随 Provider 表清理，Preview/semantic diff 直接展示非敏感 Provider 表体内容。
+- 思考过程实时显示：切换到 LM Studio 时写入根键 `show_raw_agent_reasoning = true`。LM Studio 的 `/v1/responses` 不生成 reasoning summary（本机 0.4.x 实测无 `response.reasoning_summary_text.delta`），思考只经 `response.reasoning_text.delta` 原始通道流式到达 Codex；Codex 对该通道的实时渲染由 `show_raw_agent_reasoning` 门控（官方默认 false，CLI `--oss` 本地模式官方默认 true）。切离时按各 Provider 快照恢复原值、无记录则删除；键已为 `true` 时切换为无变更 no-op。
 - 非 loopback endpoint 必须是 HTTPS；401 会提示 Token，Token 输入框使用系统密码字符。
 - 常规发现、刷新、兼容性测试与 Preview 不改变模型生命周期或任何 defaults 文件。自动 GGUF 定位把 `lms ps.identifier` 固定解释为 loaded instance ID，必须严格等于 native loaded ID；`modelKey` 必须非空，且只能等于 loaded ID（旧 CLI/旧加载形态）或规范化后的 native source/load key（当前重载形态）。publisher/source、type、format、architecture、context 同样严格匹配；quantization 按“双方都缺失或双方非空且相等”精确比较，单边缺失或值冲突仍会阻断。当 native source 是完整 `.gguf` 相对路径时，所有存在的 `path`/`indexedModelIdentifier` 都必须与其规范化后相等，且至少存在一个；普通 Hub source 继续使用 publisher/source 规则，并避免对已经完全限定的 `publisher/model` 重复拼接 publisher。最终路径必须唯一、真实、为 `.gguf` 且位于配置的 downloads/models 根目录；不从显示名、用户手选文件或文件名猜测 concrete identity/`NVFP4`，也不把进程 size 与单个文件长度强行等同。两数据面冲突、非法 JSON、CLI 失败/超时、歧义或非本机 endpoint 均 fail closed 并保留只读手工选择。只有三个已识别的模板失败码（含 v2 后置 developer 顺序错误）、精确 GGUF 和 concrete identity 均可证明且用户确认后，Switch 流程才修改 defaults 并调用原生 `/api/v1/models/unload` 与 `/load`；请求保留 native API 捕获的 context、batch、parallel、flash attention、KV cache、speculative decoding 等可观察参数，并在不一致时回滚。发现、刷新、Preview 和普通 Provider 请求仍使用 3 分钟客户端预算，四阶段推理各自使用 45 秒预算；仅精确 unload/load、状态复核和恢复使用独立 30 分钟生命周期客户端，自动回滚也有独立 30 分钟预算，因此大型模型加载不会在 3/5 分钟旧门槛处被误取消。
 - LM Studio 仅报告 reasoning `on/off` 时，不会把它猜成 Codex 的 `low/medium/high`；此时本地配置明确删除 `model_reasoning_effort`。只有 Provider 返回值与 Codex 支持 effort 的精确交集才允许写入。
@@ -168,6 +171,7 @@ toolOutputLimit = clamp(floor(loadedContext / 50), 2048, 4096)
 - `model_auto_compact_token_limit_scope`（Local 建议值按当前官方 `total` 语义计算；切回 OpenAI 时恢复原状态）
 - `tool_output_token_limit`（Local 写入自适应值；切回 OpenAI/DeepSeek 时恢复原值或删除原先不存在的键）
 - `model_reasoning_effort`
+- `show_raw_agent_reasoning`（Local 写入 `true` 以实时显示本地模型思考；切回 OpenAI/DeepSeek/GLM 时恢复各自 Provider 快照原值）
 - `preferred_auth_method`（只用于识别/清理 legacy 冲突）
 - `forced_login_method`
 - `openai_base_url`

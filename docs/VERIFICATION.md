@@ -1,6 +1,93 @@
 # Final Verification
 
-主验证日期：2026-08-22；最新增量验证：2026-09-22（Asia/Shanghai）。
+主验证日期：2026-08-22；最新增量验证：2026-09-26（Asia/Shanghai）。
+
+## 2026-09-26：LM Studio 思考过程实时显示（show_raw_agent_reasoning）
+
+### 本轮范围与结论
+
+起因：用户希望切换到 LM Studio 本地模型后能在 Codex 中实时看到思考过程，评估能否由本切换器完成。结论为**可以**：Codex 与 LM Studio 两端的思考流通道均已就绪，唯一缺口是 Codex 端渲染原始思考的根键 `show_raw_agent_reasoning`（官方默认 false）。
+
+依据链（一手来源 + 本机实测）：
+
+- codex-rs `build_responses_request` 恒发送 `reasoning` 对象（`summary` 视模型 metadata 而定）与 `include: ["reasoning.encrypted_content"]`；未知/本地模型 fallback metadata（`model_info_from_slug`）为 `supports_reasoning_summary_parameter = true`、`default_reasoning_summary = Auto`。
+- codex-rs SSE 解析处理 `response.reasoning_text.delta`（raw 思考增量，要求 payload 含 `delta` + `content_index`）；`turn.rs` 将其转为 `ReasoningRawContentDelta` 事件；app-server 无条件转发给前端；TUI 实时渲染的唯一门控是 `show_raw_agent_reasoning`（`tui/src/chatwidget/protocol.rs`）；Codex CLI `--oss` 模式官方默认开启该键。
+- 本机 LM Studio（loopback 1234，loaded `qwen3.8-flash-next-uncensored`，context 262144，reasoning 默认 on）两种 Codex 形态流式探针：带 `effort=low` 形态 HTTP 200、54 个 `response.reasoning_text.delta`；无 effort（fallback 默认形态）HTTP 200、19 个。两种形态均无 `response.reasoning_summary_text.delta`——LM Studio 不生成摘要，原始思考是唯一通道。事件 payload 含 `item_id`/`content_index`/`delta`，满足 codex-rs 解析要求。
+
+实现：`show_raw_agent_reasoning` 纳入 `ManagedConfigKeys.Root`；`ConfigureLmStudio` 写入 `true`（附中文说明 warning）；切回 OpenAI 走既有 ProviderState restore 循环，切到 DeepSeek/GLM 与 `tool_output_token_limit` 同一 `GetSavedProviderRoot` 恢复语义（无记录则删除）；LM Studio 候选语义校验要求该键为 `true`。键已为 `true` 时为 no-op（无 mutation）。本轮**没有写入真实 `~/.codex/config.toml`**，没有执行 load/unload、模板事务或真实 Codex 会话；live LM Studio 集成测试仍 opt-in SKIP。
+
+### 本机只读探针证据
+
+工件目录：`artifacts/test-results/raw-reasoning-2026-09-26/`（`live-probe-summary.json` + 两次请求/响应原文）。探针前后未修改任何 LM Studio 模型生命周期、defaults 或 Codex 配置。
+
+### 自动化验证
+
+| 检查 | 结果 |
+|---|---|
+| Core Debug 全量 | **537 PASS / 0 FAIL / 8 现场 opt-in SKIP**（相对 2026-09-25 基线 +5） |
+| App Debug 隔离 STA | **28 PASS / 0 FAIL / 0 SKIP** |
+| Core Release 全量 | **537 PASS / 0 FAIL / 8 现场 opt-in SKIP** |
+| App Release 隔离 STA | **28 PASS / 0 FAIL / 0 SKIP** |
+| Debug / Release build | **均 PASS，0 warning / 0 error** |
+| `dotnet format --verify-no-changes --no-restore` | **PASS** |
+| `git diff --check` | **PASS** |
+
+新增回归：`LmStudioPlanEnablesShowRawAgentReasoningForLiveThinking`（写入 true + Add mutation + warning）、`ExistingShowRawAgentReasoningTrueIsLeftUntouched`（已存在 true 为 no-op）、`SwitchingAwayFromLmStudioRemovesShowRawAgentReasoning`（DeepSeek/GLM 双参数化：删除 + Remove mutation）、`OpenAiShowRawAgentReasoningValueRoundTripsThroughLmStudio`（用户原值 false 经 LM Studio 往返后精确恢复）。
+
+### 发布工件
+
+ProductVersion/SourceIdentity：`b2709c2f64498453ea8514165635712ed5061487.content-6f07578003326b6f5d2733b801268804d0d9857041f983bc882de0da86a8871d`（完整值见 `source-manifest.json`；旧版保留为 `artifacts/publish/win-x64.previous-1764f6c01f3a4e6292ae466232ca2161`）。工作树说明：本次发布包含上一会话遗留的未提交沙箱服务排除改动（`CodexRuntimeProbe.cs` + `CodexRuntimeProbeTests.cs`）与本轮全部改动；二者均通过 SourceIdentity 的 `.content-` 哈希在 `source-manifest.json` 留痕。
+
+| 文件（相对仓库根目录） | Bytes | SHA-256 |
+|---|---:|---|
+| `artifacts/publish/win-x64/CodexModelManager.exe` | 72,074,234 | `A23D679096CD94936FA2778A69A45F83ADD79E096C97100B4658569F6D090C29` |
+| `artifacts/publish/win-x64/helpers/credential/CodexModelManager.CredentialHelper.exe` | 35,510,603 | `19AD761D2D59BFCE16D29CD2FEBA0143AC2D62D65B6B914B761ADF5F47DEC3B8` |
+| `artifacts/publish/win-x64/helpers/mcp/CodexModelManager.TestMcpServer.exe` | 35,096,752 | `842617D5822D139F9B69B44C66D7E1731821095F99FF51FC4AAAA868535C7DFD` |
+
+### 未验证边界
+
+- 未启动真实 Codex CLI/Desktop 会话确认屏幕上的思考渲染（含闭源桌面前端与 TUI 行为对齐性）；用户下次经管理器切换到 LM Studio 后以真实会话验收。
+- `response.reasoning_summary_text.delta` 通道在 LM Studio 上不存在属本机 0.4.x 单一版本观测；未来版本若实现 summary，`show_raw_agent_reasoning = true` 仍然无害。
+- `hide_agent_reasoning` 为用户自设键，不在纳管范围；若用户设为 true 将抑制思考显示。
+- 本轮探针使用了两次对本地模型的小型推理请求（max_output_tokens 256/64），无云 API 调用、无凭据使用。
+
+## 2026-09-25：Codex 运行状态误报修复（桌面版沙箱服务排除）
+
+### 本轮范围与结论
+
+起因：用户未运行 Codex 时启动管理器，“Codex状态”仍显示 `Running — 请完全关闭后再切换` 且切换按钮被禁用。按 `CodexRuntimeProbe` 同款规则现场扫描本机进程，唯一命中项为 Codex 桌面版（OpenAI.Codex 26.917.9434.0）安装的常驻沙箱辅助服务 `CodexSandboxService.OpenAI.Codex`（服务显示名 "ChatGPT"，`LocalSystem`，开机自启）——其进程名 `codex-windows-sandbox-service` 含 "codex"，被进程检测判为 Codex 正在运行；只要桌面版安装，该服务即常驻，导致管理器永久误报并禁用切换。
+
+修复：`DetectProcesses` 在“本管理器自身”排除之外，新增对 `codex-windows-sandbox-service` 的**精确进程名**排除（`string.Equals` OrdinalIgnoreCase，不做宽泛模式匹配——未知变体仍按 Running 报，宁可保守阻断）。该服务只是桌面版的特权辅助服务，不持有 `config.toml` 会话状态，切换配置时其运行无害。排除只作用于 IsRunning/RunningProcesses 判定；`CodexExecutableLocator.FindInvocation` 的输入保持原样，桌面版版本号探测（`OpenAI.Codex_x.y.z` 路径特征）不受影响。
+
+本轮未写入真实 Codex 配置、凭据或用户目录，未调用真实 Provider API、LM Studio 生命周期或可见 GUI。
+
+### 自动化验证
+
+| 检查 | 结果 |
+|---|---|
+| 新增进程检测回归（`CodexRuntimeProbeTests`） | **4 PASS / 0 FAIL** |
+| Core Debug 全量（`dotnet test -c Debug --no-build`） | **532 PASS / 0 FAIL / 8 现场 opt-in SKIP** |
+| App Debug 隔离 STA（同上） | **28 PASS / 0 FAIL / 0 SKIP** |
+| Debug / Release build | **均 PASS，0 warning / 0 error** |
+| `dotnet format --verify-no-changes --no-restore` | **PASS** |
+| `git diff --check` | **PASS** |
+
+新增回归锁定四项行为：沙箱服务进程（含 WindowsApps 路径与 "ChatGPT" 描述证据）不计入 Running；排除按进程名精确匹配（`codex-windows-sandbox-service-helper` 仍被检测）；真实 `codex` CLI 与 `ChatGPT` 桌面进程仍正常检测；管理器自身进程仍被排除。
+
+### 发布工件
+
+ProductVersion/SourceIdentity：`b2709c2f64498453ea8514165635712ed5061487.content-924ec00eced4075f1e8b185bcd1e9a78be3b475f1438f260e9a92246e4bd27bb`（完整值见 `source-manifest.json`；旧版保留为 `artifacts/publish/win-x64.previous-41c86e1f5de74111b354bcc9f42167a4`）。
+
+| 文件（相对仓库根目录） | Bytes | SHA-256 |
+|---|---:|---|
+| `artifacts/publish/win-x64/CodexModelManager.exe` | 72,074,012 | `7C5785EABB4C0E8181763A47277C271F5A67A9F433459CD07E18BE69F867F5E6` |
+| `artifacts/publish/win-x64/helpers/credential/CodexModelManager.CredentialHelper.exe` | 35,510,383 | `2E8C43C6E33353D750FD01D419C5873AE08F03891EF60361452061B5E39920CB` |
+| `artifacts/publish/win-x64/helpers/mcp/CodexModelManager.TestMcpServer.exe` | 35,096,754 | `4327AF563BA734B30226755ADF1F2652EB0F00164525449336EDEC17407C08A9` |
+
+### 未验证边界
+
+- 修复后未启动可见 GUI 现场确认 “Closed” 显示；已用与管理器同规则的进程扫描确认本机当前唯一命中项即该沙箱服务（修复后检测结果为空 → Closed、切换按钮恢复可用）。
+- 排除名单仅含 `codex-windows-sandbox-service` 一个精确进程名；Codex 桌面版未来若新增其他常驻辅助进程，仍可能再次误报（届时按同一模式扩充精确名单）。
 
 ## 2026-09-22：GLM 双平台 catalog provenance 隔离修复
 

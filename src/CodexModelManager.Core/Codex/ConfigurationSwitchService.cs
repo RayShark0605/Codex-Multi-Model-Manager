@@ -505,6 +505,7 @@ public sealed class ConfigurationSwitchService
         roots["model_context_window"] = null;
         roots["model_auto_compact_token_limit"] = null;
         roots["tool_output_token_limit"] = GetSavedProviderRoot(settings, ProviderKind.DeepSeek, "tool_output_token_limit");
+        roots["show_raw_agent_reasoning"] = GetSavedProviderRoot(settings, ProviderKind.DeepSeek, "show_raw_agent_reasoning");
         string effort = request.ReasoningEffort ?? GetDefaultReasoning(selected.Value) ?? "high";
         HashSet<string> allowed = GetReasoningLevels(selected.Value);
         if (!allowed.Contains(effort))
@@ -585,6 +586,7 @@ public sealed class ConfigurationSwitchService
         roots["model_context_window"] = null;
         roots["model_auto_compact_token_limit"] = null;
         roots["tool_output_token_limit"] = GetSavedProviderRoot(settings, ProviderKind.GLM, "tool_output_token_limit");
+        roots["show_raw_agent_reasoning"] = GetSavedProviderRoot(settings, ProviderKind.GLM, "show_raw_agent_reasoning");
         string? effort = request.ReasoningEffort ?? GetDefaultReasoning(selected.Value);
         HashSet<string> allowed = GetReasoningLevels(selected.Value);
         if (effort is not null && allowed.Count > 0 && !allowed.Contains(effort))
@@ -695,6 +697,11 @@ public sealed class ConfigurationSwitchService
         roots["forced_login_method"] = null;
         roots["preferred_auth_method"] = null;
         roots["openai_base_url"] = null;
+        // LM Studio 不生成 reasoning summary（实测无 response.reasoning_summary_text.delta），
+        // 本地模型思考只经 response.reasoning_text.delta 原始通道流式到达 Codex；
+        // Codex 端渲染该通道由 show_raw_agent_reasoning 门控（默认 false，CLI --oss 模式官方默认 true），
+        // 因此切换到 LM Studio 时必须写 true 才能在 Codex 中实时看到思考过程
+        roots["show_raw_agent_reasoning"] = "true";
         string lmStudioTablePath = "model_providers." + providerId;
         RemoveOrPreserveOfficialBearerTables(read, tables, removeTables, [lmStudioTablePath], warnings, "切换到 LM Studio 时");
 
@@ -723,6 +730,7 @@ public sealed class ConfigurationSwitchService
         removeTables.RemoveAll(table => table == lmStudioTablePath);
 
         warnings.Add("本地模型未生成或复制 GPT/DeepSeek metadata；未被实测的 Plan/Goal/MCP 等能力保持 Untested。Auto Compact 为管理器安全建议值。");
+        warnings.Add("已写入 show_raw_agent_reasoning = true：LM Studio 的思考仅经原始 reasoning 流（response.reasoning_text.delta）输出，Codex 需要此键才会实时显示；切离 LM Studio 时按各 Provider 快照恢复原值。");
         if (request.TargetSupportsToolUse == false)
         {
             warnings.Add("所选模型由 LM Studio 声明为未针对 Tool Use 训练，Codex Agent 能力很可能受限。");
@@ -1046,6 +1054,11 @@ public sealed class ConfigurationSwitchService
                 !string.Equals(compactScope, "total", StringComparison.Ordinal))
             {
                 throw new InvalidDataException("候选配置语义检查失败：Local context/compaction/tool output 不一致。");
+            }
+
+            if (!string.Equals(read.RootValues.GetValueOrDefault("show_raw_agent_reasoning"), "true", StringComparison.Ordinal))
+            {
+                throw new InvalidDataException("候选配置语义检查失败：show_raw_agent_reasoning 必须为 true，否则本地模型思考不会在 Codex 中显示。");
             }
         }
 
